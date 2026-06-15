@@ -1,0 +1,8 @@
+{
+    "model_path": "/mnt/e/VTES/yolov8m.onnx",
+    "confidence": 50,
+    "frame_width": 1280,
+    "frame_height": 720,
+    "fps": 30,
+    "enable_detection": true
+}

@@ -1,0 +1,81 @@
+# Build outputs
+build_*/
+build_x64/
+build_linux/
+build_test/
+build_x86_64/
+release/
+
+# Dependencies downloaded by CMake FetchContent
+.deps/
+
+# Model data (too large for git — downloaded separately)
+data/per_type/
+data/per_type_manifest.json
+data/embeddings_*.bin
+data/embeddings_*_meta.json
+*.pth
+*.pt
+
+# Large dataset files
+data/vtes.json
+data/card-hash-index.json
+vtes.json
+
+# Old scripts (replaced by vtes-grimoire.ps1)
+build-windows.ps1
+build.ps1
+build-yolo26.cmd
+deploy-windows.ps1
+deploy.bat
+vtes-tui.py
+test_isolated.ps1
+test_minimal.ps1
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!cmake/**/*.cmake
+
+# Visual Studio / MSBuild
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.vcxproj.user
+*.vcxproj.filters
+*.vcxproj
+*.sln
+*.db
+*.db-wal
+*.db-shm
+*.idb
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exp
+*.tlog
+*.log
+*.lastbuildstate
+ipch/
+.vs/
+
+# macOS
+.DS_Store
+*.dSYM
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+.vscode/

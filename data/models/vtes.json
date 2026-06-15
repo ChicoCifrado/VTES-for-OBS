@@ -1,0 +1,14 @@
+{
+  "names": [
+    "vtes_card"
+  ],
+  "output_shape": {
+    "shape": [
+      "1",
+      "300",
+      "7"
+    ]
+  },
+  "one_to_one": true,
+  "nms_free": true
+}
