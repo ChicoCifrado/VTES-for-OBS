@@ -31,10 +31,9 @@ if(USE_PREDEFINED_ONNXRUNTIME)
     set(Onnxruntime_URL "${Onnxruntime_BASEURL}/onnxruntime-osx-universal2-${Onnxruntime_VERSION}.tgz")
     set(Onnxruntime_HASH SHA256=9FA57FA6F202A373599377EF75064AE568FDA8DA838632B26A86024C7378D306)
   elseif(MSVC)
-    # DirectML package (works on any GPU, no CUDA required)
-    set(Onnxruntime_URL "${Onnxruntime_WINDOWS_BASEURL}/onnxruntime-win-x64-dml-${Onnxruntime_VERSION}.zip")
-    # Hash will need to be updated for the new URL - disable for now
-    # set(Onnxruntime_HASH SHA256=...)
+    # Standard Windows CPU package — DML provider is in onnxruntime_providers_shared.dll
+    # (DirectML.dll ships with Windows 10 1903+ and is not bundled here)
+    set(Onnxruntime_URL "${Onnxruntime_WINDOWS_BASEURL}/onnxruntime-win-x64-${Onnxruntime_VERSION}.zip")
   else()
     if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
       set(Onnxruntime_URL "${Onnxruntime_BASEURL}/onnxruntime-linux-aarch64-${Onnxruntime_VERSION}.tgz")
@@ -104,21 +103,7 @@ elseif(MSVC)
     endif()
   endforeach()
 
-  # DML provider — check both lib/ and bin/ (location varies by ORT version)
-  set(DML_DLL_PATH "")
-  if(EXISTS "${onnxruntime_SOURCE_DIR}/bin/DirectML.dll")
-    set(DML_DLL_PATH "${onnxruntime_SOURCE_DIR}/bin/DirectML.dll")
-  elseif(EXISTS "${onnxruntime_SOURCE_DIR}/lib/DirectML.dll")
-    set(DML_DLL_PATH "${onnxruntime_SOURCE_DIR}/lib/DirectML.dll")
-  endif()
-  if(DML_DLL_PATH)
-    add_library(Ort::DirectML SHARED IMPORTED)
-    set_target_properties(Ort::DirectML PROPERTIES
-      IMPORTED_LOCATION ${DML_DLL_PATH}
-      IMPORTED_IMPLIB ${onnxruntime_SOURCE_DIR}/lib/DirectML.lib)
-    target_link_libraries(Ort INTERFACE Ort::DirectML d3d12.lib dxgi.lib dxguid.lib Dxcore.lib)
-    install(IMPORTED_RUNTIME_ARTIFACTS Ort::DirectML DESTINATION "obs-plugins/64bit")
-  endif()
+  # DirectML.dll ships with Windows 10 1903+ — not bundled in the CPU package
 
   # Install ONNX Runtime DLLs (main runtime and providers)
   # These are in lib/ for the official Microsoft Windows release

@@ -281,10 +281,13 @@ function Invoke-Deploy {
     $copied = 0
     foreach ($dir in $onnxDirs) {
         if (Test-Path $dir) {
-            Get-ChildItem "$dir\*.dll" -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName "$dstDll\" -Force -ErrorAction SilentlyContinue; $copied++ }
+            Get-ChildItem "$dir\*.dll" -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne "DirectML.dll" } | ForEach-Object { Copy-Item $_.FullName "$dstDll\" -Force -ErrorAction SilentlyContinue; $copied++ }
         }
     }
     if ($copied -gt 0) { Write-Success ("ONNX Runtime DLLs: " + $copied + " copiadas") }
+    # DirectML.dll ships with Windows 10 1903+ — only copy if system has it
+    $sysDml = "$env:SystemRoot\System32\DirectML.dll"
+    if (Test-Path $sysDml) { Copy-Item $sysDml "$dstDll\" -Force -ErrorAction SilentlyContinue; Write-Success "DirectML.dll: copiada desde System32" }
     $cvDll = Get-ChildItem "C:\opencv\build\x64\vc16\bin\opencv_world5*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $cvDll) { $cvDll = Get-ChildItem "C:\opencv\build\x64\vc16\bin\opencv_world4*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1 }
     if ($cvDll) { Copy-Item $cvDll.FullName "$dstDll\" -Force; Write-Success ("OpenCV DLL: " + $cvDll.Name) }
@@ -355,6 +358,152 @@ function Invoke-InstallTesseract {
     return $true
 }
 
+$SCRIPT:NSIS_PATH = "C:\Program Files (x86)\NSIS"
+
+function Test-NsisReady {
+    $null = Get-Command "makensis" -ErrorAction SilentlyContinue
+    if ($?) { return $true }
+    $nsisExe = Join-Path $SCRIPT:NSIS_PATH "makensis.exe"
+    return (Test-Path $nsisExe)
+}
+
+function Invoke-Package {
+    param([string]$Config = "RelWithDebInfo")
+    Clear-Host
+    Write-FrameTop
+    Write-FrameMid ("  " + $C.BOLD + $C.CRIMSON + "RITUAL DE EMPAQUETADO - NSIS Installer" + $C.RESET)
+    Write-FrameSep
+    Write-Host ""
+    # ── 1. Find makensis ────────────────────────────────────────────
+    $nsisExe = $null
+    $null = Get-Command "makensis" -ErrorAction SilentlyContinue
+    if ($?) { $nsisExe = (Get-Command "makensis").Source }
+    else {
+        $alt = Join-Path $SCRIPT:NSIS_PATH "makensis.exe"
+        if (Test-Path $alt) { $nsisExe = $alt }
+    }
+    if (-not $nsisExe) {
+        Write-Error "NSIS (makensis.exe) no encontrado."
+        Write-Info "Busca en: $SCRIPT:NSIS_PATH"
+        Write-Info "Descarga: https://nsis.sourceforge.io/Download"
+        return $false
+    }
+    Write-Info "NSIS encontrado: $nsisExe"
+    # ── 2. Verify build output exists ──────────────────────────────
+    $releaseDir = Join-Path $SCRIPT:RELEASE_DIR $Config
+    $dllPath = Join-Path $releaseDir "obs-plugins\64bit\vtes-card-scanner.dll"
+    if (-not (Test-Path $dllPath)) {
+        Write-Error "Build output no encontrado en: $releaseDir"
+        Write-Info "Ejecuta BUILD primero"
+        return $false
+    }
+    Write-Info "Build output: $releaseDir"
+    # ── 3. Generate NSIS script ────────────────────────────────────
+    $nsiPath = Join-Path $SCRIPT:PROJECT_ROOT "build_installer.nsi"
+    $outFileName = "vtes-card-scanner-Installer-$Config-x64.exe"
+    $outPath = Join-Path $SCRIPT:RELEASE_DIR $outFileName
+    $nsiContent = @'
+; VTES Card Scanner - NSIS Installer
+SetCompressor lzma
+!include "MUI2.nsh"
+!define MUI_ABORTWARNING
+!define MUI_FINISHPAGE_RUN_TEXT "Launch OBS Studio"
+!define MUI_FINISHPAGE_RUN "$INSTDIR\bin\64bit\obs64.exe"
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_LICENSE "__PROJECT_ROOT__\LICENSE"
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_LANGUAGE "English"
+Name "VTES Card Scanner"
+OutFile "__OUT_PATH__"
+InstallDir "$PROGRAMFILES64\obs-studio"
+Section "Plugin" SEC_PLUGIN
+  SectionIn RO
+  SetOutPath "$INSTDIR\obs-plugins\64bit"
+  File "__RELEASE_DIR__\obs-plugins\64bit\vtes-card-scanner.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\vtes-card-scanner.pdb"
+  SetOutPath "$INSTDIR\data\obs-plugins\vtes-card-scanner"
+  File /r "__RELEASE_DIR__\data\obs-plugins\vtes-card-scanner\*.*"
+SectionEnd
+Section "ONNX Runtime" SEC_ONNX
+  SectionIn RO
+  SetOutPath "$INSTDIR\obs-plugins\64bit"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime_providers_shared.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\DirectML.dll"
+SectionEnd
+Section "OpenCV Runtime" SEC_OPENCV
+  SectionIn RO
+  SetOutPath "$INSTDIR\obs-plugins\64bit"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\opencv_world*.dll"
+SectionEnd
+Section -Post
+  WriteUninstaller "$INSTDIR\obs-plugins\64bit\uninstall-vtes-card-scanner.exe"
+  WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner" "DisplayName" "VTES Card Scanner OBS Plugin"
+  WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner" "UninstallString" "$INSTDIR\obs-plugins\64bit\uninstall-vtes-card-scanner.exe"
+  WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner" "DisplayVersion" "__CONFIG__"
+  WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner" "Publisher" "VTES Card Scanner"
+SectionEnd
+Section Uninstall
+  Delete "$INSTDIR\obs-plugins\64bit\vtes-card-scanner.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\vtes-card-scanner.pdb"
+  Delete "$INSTDIR\obs-plugins\64bit\onnxruntime.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_shared.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\DirectML.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\opencv_world*.dll"
+  RMDir /r "$INSTDIR\data\obs-plugins\vtes-card-scanner"
+  Delete "$INSTDIR\obs-plugins\64bit\uninstall-vtes-card-scanner.exe"
+  DeleteRegKey HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner"
+SectionEnd
+'@
+    $nsiContent = $nsiContent.Replace("__RELEASE_DIR__", $releaseDir)
+    $nsiContent = $nsiContent.Replace("__PROJECT_ROOT__", $SCRIPT:PROJECT_ROOT)
+    $nsiContent = $nsiContent.Replace("__OUT_PATH__", $outPath)
+    $nsiContent = $nsiContent.Replace("__CONFIG__", $Config)
+    [System.IO.File]::WriteAllText($nsiPath, $nsiContent, [System.Text.Encoding]::UTF8)
+    Write-Info "Script NSIS generado: $nsiPath"
+    # ── 4. Compile installer ──────────────────────────────────────
+    Push-Location $SCRIPT:PROJECT_ROOT
+    Write-Info "Compilando instalador..."
+    $outLog = Join-Path $SCRIPT:PROJECT_ROOT "build_installer_out.log"
+    $errLog = Join-Path $SCRIPT:PROJECT_ROOT "build_installer_err.log"
+    $proc = Start-Process -FilePath $nsisExe -ArgumentList "/V4", $nsiPath -NoNewWindow -RedirectStandardOutput $outLog -RedirectStandardError $errLog -Wait -PassThru
+    $exitCode = $proc.ExitCode
+    Pop-Location
+    if (Test-Path $outLog) {
+        $c = Get-Content $outLog -Raw
+        if ($c -and $c.Trim()) { Write-Host ($C.DIM + $C.SILVER + $c + $C.RESET) }
+        Remove-Item $outLog -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $errLog) {
+        $c = Get-Content $errLog -Raw
+        if ($c -and $c.Trim()) { Write-Host ($C.DIM + $C.CRIMSON + $c + $C.RESET) }
+        Remove-Item $errLog -ErrorAction SilentlyContinue
+    }
+    # Clean up temp .nsi
+    Remove-Item $nsiPath -ErrorAction SilentlyContinue
+    if ($exitCode -ne 0) {
+        Write-Error "NSIS FALLO (exit code: $exitCode)"
+        return $false
+    }
+    if (-not (Test-Path $outPath)) {
+        Write-Error "Instalador no generado en: $outPath"
+        return $false
+    }
+    $size = [math]::Round((Get-Item $outPath).Length / 1MB, 0)
+    Write-Host ""
+    Write-Success "Instalador generado:"
+    Write-Info "  $outPath"
+    Write-Info "  Tamaño: $size MB"
+    Write-Host ""
+    Write-DimGrim "  El instalador detecta OBS desde el registro de Windows"
+    Write-DimGrim "  Por defecto: C:\Program Files\obs-studio"
+    return $true
+}
+
 function Invoke-DeployAll {
     param([string]$Config = "RelWithDebInfo")
     Clear-Host
@@ -398,6 +547,7 @@ function Show-Menu {
         Write-FrameSep
         Write-FrameMid ("  " + $C.BOLD + $C.CRIMSON + " 5" + $C.RESET + "  " + $C.BOLD + "VERIFY STATUS" + $C.RESET + "     " + $C.DIM + $C.SILVER + "Diagnostico completo" + $C.RESET)
         Write-FrameMid ("  " + $C.BOLD + $C.CRIMSON + " 6" + $C.RESET + "  " + $C.BOLD + "DEPLOY ALL" + $C.RESET + "        " + $C.DIM + $C.SILVER + "Build + Deploy en un solo paso" + $C.RESET)
+        Write-FrameMid ("  " + $C.BOLD + $C.CRIMSON + " 7" + $C.RESET + "  " + $C.BOLD + "PACKAGE INSTALLER" + $C.RESET + " " + $C.DIM + $C.SILVER + "Genera .exe (NSIS) para distribuir" + $C.RESET)
         Write-FrameSep
         Write-FrameMid ("  " + $C.DIM + $C.SILVER + " Q" + $C.RESET + "  " + $C.RESET + "QUIT" + $C.RESET + "              " + $C.DIM + $C.SILVER + "Abandonar el grimorio" + $C.RESET)
         Write-FrameBot
@@ -412,6 +562,7 @@ function Show-Menu {
             "4" { Invoke-InstallTesseract; Write-Host ""; Write-DimGrim "  Presiona cualquier tecla..."; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") 2>$null }
             "5" { Invoke-Verify }
             "6" { Invoke-DeployAll; Write-Host ""; Write-DimGrim "  Presiona cualquier tecla..."; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") 2>$null }
+            "7" { Invoke-Package; Write-Host ""; Write-DimGrim "  Presiona cualquier tecla..."; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") 2>$null }
             "q" { $running = $false }
             "Q" { $running = $false }
         }
@@ -443,6 +594,7 @@ function Main {
             "sync"      { Invoke-CopyPerType; return }
             "tesseract" { Invoke-InstallTesseract; return }
             "all"       { Invoke-DeployAll; return }
+            "package"   { Invoke-Package; return }
         }
     }
     Show-Menu

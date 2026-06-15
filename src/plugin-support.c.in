@@ -31,7 +31,7 @@ void obs_log(int log_level, const char *format, ...)
 
 	snprintf(template, length, "[%s] %s", PLUGIN_NAME, format);
 
-	va_list(args);
+	va_list args;
 
 	va_start(args, format);
 	blogva(log_level, template, args);

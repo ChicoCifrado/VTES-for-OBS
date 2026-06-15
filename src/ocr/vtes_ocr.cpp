@@ -119,9 +119,9 @@ cv::Mat VtesOcrReader::extractNameRegion(const cv::Mat& card_bgr)
     int h = card_bgr.rows;
     int w = card_bgr.cols;
 
-    // Card name is in the top ~10% of the card
-    int name_top = (int)(h * 0.01f);
-    int name_bottom = (int)(h * 0.10f);
+    // Card name is in the top ~20% of the card
+    int name_top = (int)(h * 0.02f);
+    int name_bottom = (int)(h * 0.20f);
     int name_h = name_bottom - name_top;
     if (name_h < 8) return {};
 

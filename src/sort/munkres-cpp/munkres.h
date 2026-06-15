@@ -181,7 +181,7 @@ template<typename T, template<typename> class M> int Munkres<T, M>::step4()
 			// We have to find these two pairs: z1 and z2n.
 			seq.push_front({dim[0], dim[1]});
 			i = (i + 1) & 1; // Switch dimension.
-			dim[i] = -1;     // After increment this value becames zero.
+			dim[i] = size - 1;
 		}
 	}
 

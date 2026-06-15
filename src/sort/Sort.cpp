@@ -33,7 +33,16 @@ void Sort::initializeKalmanFilter(cv::KalmanFilter &kf, const cv::Rect_<float> &
 	kf.statePre.at<float>(3) = bbox.height;
 
 	// Transition matrix
-	float tm_data[] = {1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+	float tm_data[64] = {
+		1,0,0,0,1,0,0,0,
+		0,1,0,0,0,1,0,0,
+		0,0,1,0,0,0,1,0,
+		0,0,0,1,0,0,0,1,
+		0,0,0,0,1,0,0,0,
+		0,0,0,0,0,1,0,0,
+		0,0,0,0,0,0,1,0,
+		0,0,0,0,0,0,0,1
+	};
 	kf.transitionMatrix = cv::Mat(8, 8, CV_32F, tm_data).clone();
 
 	// Measurement matrix

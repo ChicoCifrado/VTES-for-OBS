@@ -1,3 +1,6 @@
+#ifndef DETECT_FILTER_H
+#define DETECT_FILTER_H
+
 #include <obs-module.h>
 
 #ifdef __cplusplus
@@ -18,3 +21,5 @@ void detect_filter_video_render(void *data, gs_effect_t *_effect);
 #ifdef __cplusplus
 }
 #endif
+
+#endif // DETECT_FILTER_H

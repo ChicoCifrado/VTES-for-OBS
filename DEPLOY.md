@@ -4,89 +4,55 @@
 
 Run from **Developer Command Prompt for VS 2022** (or any terminal with MSBuild in PATH):
 
-```cmd
-deploy.bat
+```powershell
+.\vtes-grimoire.ps1 build
+.\vtes-grimoire.ps1 deploy
 ```
 
-Or directly with PowerShell:
+Or use the interactive menu:
 
 ```powershell
-.\deploy-windows.ps1
+.\vtes-grimoire.ps1
 ```
 
-## Common Options
+## Build + Deploy in one step
 
-| Option | Description |
-|--------|-------------|
-| `-Configuration Release` | Build configuration (default: Release) |
-| `-ObsInstallPath "C:\Program Files\obs-studio"` | OBS installation directory |
-| `-ServerDeployPath "C:\VTES\vtes-server"` | Where to copy server files |
-| `-SkipBuild` | Skip building, only deploy existing artifacts |
-| `-SkipObsRestart` | Don't restart OBS after deployment |
-| `-StartServer` | Auto-start vtes-server.exe after deployment |
-| `-RunAsAdmin` | Force re-launch as Administrator |
-
-## Examples
-
-**Full deployment (build + deploy + restart OBS + start server):**
 ```powershell
-.\deploy-windows.ps1 -StartServer
+.\vtes-grimoire.ps1 all
 ```
 
-**Deploy only (skip build, use existing release artifacts):**
+## Package an installer (.exe)
+
 ```powershell
-.\deploy-windows.ps1 -SkipBuild
+.\vtes-grimoire.ps1 build
+.\vtes-grimoire.ps1 package
 ```
 
-**Custom paths:**
-```powershell
-.\deploy-windows.ps1 -ObsInstallPath "D:\OBS" -ServerDeployPath "D:\VTES\server"
-```
-
-**CI/CD friendly (no restart, no server start):**
-```powershell
-.\deploy-windows.ps1 -SkipObsRestart
-```
+Requires [NSIS](https://nsis.sourceforge.io/Download) installed. Output in `release/`.
 
 ## What It Does
 
-1. **Builds** the project via `build-windows.ps1` (CMake + MSBuild)
+1. **Builds** the project via `cmake --preset windows-x64` (CMake + MSBuild)
 2. **Copies** plugin DLLs to `C:\Program Files\obs-studio\obs-plugins\64bit\`
 3. **Copies** plugin data to `C:\Program Files\obs-studio\data\obs-plugins\vtes-card-scanner\`
-4. **Copies** `vtes-server.exe`, `data\`, `public\` to deploy folder
+4. **Copies** ONNX Runtime + OpenCV DLLs alongside the plugin
 5. **Restarts** OBS (if running)
-6. **Starts** vtes-server.exe (with `-StartServer`)
 
 ## Requirements
 
 - Windows 10/11
-- Visual Studio 2022 with C++ workload
-- CMake 3.20+
-- OBS Studio installed
+- Visual Studio 2022+ with C++ workload
+- CMake 3.22+
+- OBS Studio installed (64-bit)
+- [NSIS](https://nsis.sourceforge.io/Download) (optional, for installer)
 - Administrator privileges (for OBS Program Files access)
-
-## Folder Structure Expected
-
-```
-project-root/
-├── build-windows.ps1
-├── deploy-windows.ps1
-├── deploy.bat
-├── CMakeLists.txt
-├── src/                 # Plugin source
-├── data/                # Plugin data (obs-plugins/vtes-card-scanner/)
-├── public/              # Web assets for server
-└── vtes-server/         # Server source
-```
 
 ## Troubleshooting
 
-**"Access denied" copying to OBS folder** → Run as Administrator
+**"Access denied" copying to OBS folder** → Run PowerShell as Administrator
 
 **"MSBuild not found"** → Open "Developer Command Prompt for VS 2022"
 
 **"CMake not found"** → Install CMake and add to PATH
 
 **OBS doesn't see plugin** → Verify DLL architecture matches OBS (64-bit)
-
-**Server fails to start** → Check `data/` and `public/` copied correctly

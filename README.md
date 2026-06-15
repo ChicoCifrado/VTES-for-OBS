@@ -118,7 +118,7 @@ Place in `data/per_type/` or use `Invoke-CopyPerType` (option 3 in the grimorie)
 
 ## License
 
-MIT License — see [LICENSE](LICENSE)
+GNU General Public License v2.0 — see [LICENSE](LICENSE)
 
 ---
 

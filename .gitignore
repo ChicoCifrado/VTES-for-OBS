@@ -1,6 +1,11 @@
 # Build outputs
 build_*/
 build_x64/
+
+# NSIS generated files
+build_installer.nsi
+build_installer.exe
+build_installer_*.log
 build_linux/
 build_test/
 build_x86_64/
@@ -14,6 +19,7 @@ data/per_type/
 data/per_type_manifest.json
 data/embeddings_*.bin
 data/embeddings_*_meta.json
+data/models/*.onnx
 *.pth
 *.pt
 
