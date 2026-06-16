@@ -155,7 +155,7 @@ private:
         nlohmann::json status;
         status["db_loaded"] = db_ && !db_->is_empty();
         status["db_size"] = db_ ? (int)db_->size() : 0;
-        status["server_running"] = running_;
+        status["server_running"] = (bool)running_;
         status["server_port"] = port_;
         std::string body = status.dump(2);
         std::string header =

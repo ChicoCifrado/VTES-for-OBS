@@ -54,10 +54,18 @@ public:
                     for (const auto& d : card["disciplines"])
                         entry.disciplines.push_back(d.get<std::string>());
                 }
-                if (card.contains("capacity") && !card["capacity"].is_null())
-                    entry.capacity = card["capacity"];
-                if (card.contains("group") && !card["group"].is_null())
-                    entry.group = card["group"];
+                if (card.contains("capacity") && !card["capacity"].is_null()) {
+                    if (card["capacity"].is_number_integer())
+                        entry.capacity = card["capacity"];
+                }
+                if (card.contains("group") && !card["group"].is_null()) {
+                    if (card["group"].is_number_integer())
+                        entry.group = card["group"];
+                    else if (card["group"].is_string()) {
+                        try { entry.group = std::stoi(card["group"].get<std::string>()); }
+                        catch (...) {}
+                    }
+                }
 
                 std::string id_str = std::to_string(entry.id);
                 by_id_[id_str] = entry;
