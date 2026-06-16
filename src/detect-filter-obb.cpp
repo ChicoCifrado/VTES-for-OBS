@@ -5,6 +5,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 #undef WIN32_LEAN_AND_MEAN
 #include <wchar.h>
 #endif
@@ -641,6 +642,26 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	obs_properties_add_int_slider(vtes_group_props, "vtes_cooldown", "Cooldown (seconds)",
 				      1, 30, 1);
 
+	// Card Search Web Server
+	obs_properties_add_button(props, "card_search_btn", "Open Card Search",
+		[](obs_properties_t *, obs_property_t *, void *data) {
+			struct detect_filter_obb *tf = reinterpret_cast<detect_filter_obb *>(data);
+			if (!tf->web_server || !tf->web_server->is_running()) {
+				tf->web_server = std::make_unique<WebServer>();
+				tf->web_server->start(tf->web_server_port, &tf->vtes_db);
+			}
+			if (tf->web_server && tf->web_server->is_running()) {
+				std::string url = "http://localhost:" + std::to_string(tf->web_server->port());
+#ifdef _WIN32
+				ShellExecuteA(NULL, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+#else
+				std::string cmd = "xdg-open " + url;
+				std::thread([cmd]() { system(cmd.c_str()); }).detach();
+#endif
+			}
+			return true;
+		});
+
 	std::string basic_info =
 		std::regex_replace(PLUGIN_INFO_TEMPLATE, std::regex("%1"), PLUGIN_VERSION);
 	obs_properties_add_text(props, "info", basic_info.c_str(), OBS_TEXT_INFO);
@@ -982,6 +1003,10 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 		initOcrReader(tf);
 	}
 
+	// Start embedded web server
+	tf->web_server = std::make_unique<WebServer>();
+	tf->web_server->start(tf->web_server_port, &tf->vtes_db);
+
 	char *kawaseBlurEffectPath = obs_module_file(KAWASE_BLUR_EFFECT_PATH);
 	if (!kawaseBlurEffectPath) {
 		obs_log(LOG_ERROR, "Failed to get Kawase Blur effect path");
@@ -1027,6 +1052,12 @@ void detect_filter_obb_destroy(void *data)
 
 	if (tf) {
 		tf->isDisabled = true;
+
+		// VTES: stop web server
+		if (tf->web_server) {
+			tf->web_server->stop();
+			tf->web_server.reset();
+		}
 
 		// VTES: disconnect WebSocket
 		if (tf->wsClient.is_connected()) {

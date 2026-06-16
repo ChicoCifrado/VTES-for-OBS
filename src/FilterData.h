@@ -9,6 +9,7 @@
 #include "embedding_matcher.h"
 #include "vtes_database.hpp"
 #include "ocr/vtes_ocr.hpp"
+#include "web_server.h"
 #include <chrono>
 #include <atomic>
 #include <deque>
@@ -166,6 +167,10 @@ struct filter_data {
 	std::unique_ptr<VtesOcrReader> ocr_reader;
 	std::vector<VTESCardNameEntry> card_name_entries;  // built from vtes_db for fuzzy matching
 	bool ocr_enabled = false;
+
+	// --- Embedded web server for card search UI ---
+	std::unique_ptr<WebServer> web_server;
+	int web_server_port = 8080;
 
 };
 #endif /* FILTERDATA_H */

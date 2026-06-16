@@ -103,6 +103,11 @@ endif()
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE vendor)
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE src)
 
+# cpp-httplib needs WinSock on Windows; NO OpenSSL (leave CPPHTTPLIB_OPENSSL_SUPPORT undefined)
+if(WIN32)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32)
+endif()
+
 # Link plugin-support for version constants and include propagation
 if(TARGET plugin-support)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE plugin-support)
