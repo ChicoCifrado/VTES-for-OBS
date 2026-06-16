@@ -199,24 +199,120 @@ private:
         sendAll(client, body);
     }
 
+    struct SearchFilter {
+        std::vector<std::string> text_terms;
+        std::string type_filter;
+        std::string clan_filter;
+        std::string disc_filter;
+        int cap_min = -1;
+        int cap_max = -1;
+        int group_val = -1;
+        std::string text_search;
+    };
+
+    static SearchFilter parseQuery(const std::string &q) {
+        SearchFilter f;
+        std::vector<std::string> tokens = split(q, ' ');
+        for (const auto &t : tokens) {
+            if (t.size() > 5 && t.substr(0, 5) == "type:") {
+                f.type_filter = toLower(t.substr(5));
+            } else if (t.size() > 5 && t.substr(0, 5) == "clan:") {
+                f.clan_filter = toLower(t.substr(5));
+            } else if (t.size() > 5 && t.substr(0, 5) == "disc:") {
+                f.disc_filter = toLower(t.substr(5));
+            } else if (t.size() > 5 && t.substr(0, 5) == "text:") {
+                f.text_search = toLower(t.substr(5));
+            } else if (t.size() > 6 && t.substr(0, 6) == "group:") {
+                try { f.group_val = std::stoi(t.substr(6)); } catch (...) {}
+            } else if (t.size() > 4 && t.substr(0, 4) == "cap:") {
+                try {
+                    int v = std::stoi(t.substr(4));
+                    f.cap_min = v; f.cap_max = v;
+                } catch (...) {}
+            } else if (t.size() > 4 && t.substr(0, 4) == "cap>") {
+                try { f.cap_min = std::stoi(t.substr(4)) + 1; } catch (...) {}
+            } else if (t.size() > 4 && t.substr(0, 4) == "cap<") {
+                try { f.cap_max = std::stoi(t.substr(4)) - 1; } catch (...) {}
+            } else if (!t.empty()) {
+                f.text_terms.push_back(toLower(t));
+            }
+        }
+        return f;
+    }
+
+    static bool matchesCard(const VTESCardEntry &e, const SearchFilter &f) {
+        // Check type filter
+        if (!f.type_filter.empty()) {
+            bool found = false;
+            for (const auto &t : e.types)
+                if (toLower(t).find(f.type_filter) != std::string::npos) { found = true; break; }
+            if (!found) return false;
+        }
+        // Check clan filter
+        if (!f.clan_filter.empty()) {
+            bool found = false;
+            for (const auto &c : e.clans)
+                if (toLower(c).find(f.clan_filter) != std::string::npos) { found = true; break; }
+            if (!found) return false;
+        }
+        // Check discipline filter
+        if (!f.disc_filter.empty()) {
+            bool found = false;
+            for (const auto &d : e.disciplines)
+                if (toLower(d).find(f.disc_filter) != std::string::npos) { found = true; break; }
+            if (!found) return false;
+        }
+        // Check capacity range
+        if (f.cap_min >= 0 && e.capacity < f.cap_min) return false;
+        if (f.cap_max >= 0 && e.capacity > f.cap_max) return false;
+        // Check group
+        if (f.group_val >= 0 && e.group != f.group_val) return false;
+        // Check text search
+        if (!f.text_search.empty())
+            if (toLower(e.card_text).find(f.text_search) == std::string::npos) return false;
+        // Check plain text terms (AND) — match any name field
+        if (!f.text_terms.empty()) {
+            for (const auto &term : f.text_terms) {
+                bool found = false;
+                // Check all name fields
+                if (toLower(e.name).find(term) != std::string::npos) found = true;
+                else if (toLower(e.printed_name).find(term) != std::string::npos) found = true;
+                else if (toLower(e.name_es).find(term) != std::string::npos) found = true;
+                else if (toLower(e.name_fr).find(term) != std::string::npos) found = true;
+                else {
+                    for (const auto &v : e.name_variants)
+                        if (toLower(v).find(term) != std::string::npos) { found = true; break; }
+                }
+                if (!found) return false;
+            }
+        }
+        return true;
+    }
+
+    void toJson(nlohmann::json &j, const VTESCardEntry &entry) const {
+        nlohmann::json card;
+        card["id"] = entry.id;
+        card["name"] = entry.name;
+        card["printed_name"] = entry.printed_name;
+        card["types"] = entry.types;
+        card["clans"] = entry.clans;
+        card["disciplines"] = entry.disciplines;
+        card["capacity"] = entry.capacity;
+        card["group"] = entry.group;
+        card["card_text"] = entry.card_text;
+        card["url"] = entry.url;
+        if (!entry.name_es.empty()) card["name_es"] = entry.name_es;
+        if (!entry.name_fr.empty()) card["name_fr"] = entry.name_fr;
+        j.push_back(std::move(card));
+    }
+
     void serveJson(SOCKET client, const std::string &q) {
         nlohmann::json j = nlohmann::json::array();
         if (!q.empty() && db_) {
-            std::string lower = toLower(q);
+            SearchFilter f = parseQuery(q);
             for (const auto &[id, entry] : db_->all_entries()) {
-                if (toLower(entry.name).find(lower) != std::string::npos) {
-                    nlohmann::json card;
-                    card["id"] = entry.id;
-                    card["name"] = entry.name;
-                    card["printed_name"] = entry.printed_name;
-                    card["types"] = entry.types;
-                    card["clans"] = entry.clans;
-                    card["disciplines"] = entry.disciplines;
-                    card["capacity"] = entry.capacity;
-                    card["group"] = entry.group;
-                    card["card_text"] = entry.card_text;
-                    card["url"] = entry.url;
-                    j.push_back(card);
+                if (matchesCard(entry, f)) {
+                    toJson(j, entry);
                     if ((int)j.size() >= 50) break;
                 }
             }
@@ -270,7 +366,7 @@ private:
           << "</style></head><body><div class=\"container\">"
           << "<h1>VTES Card Search</h1>"
           << "<form class=\"search-box\" action=\"/search\" method=\"get\">"
-          << "<input type=\"text\" name=\"q\" placeholder=\"Search by card name...\" autofocus>"
+          << "<input type=\"text\" name=\"q\" placeholder=\"e.g. Aabbt or type:Vampire clan:Ventrue cap>5\" autofocus>"
           << "<button type=\"submit\">Search</button></form>"
           << "<div class=\"status-bar\">Database: <span class=\"status-" << dbStatus << "\">"
           << dbStatus << "</span>"
@@ -278,6 +374,18 @@ private:
           << " | <a href=\"/api/status\">/api/status</a>"
           << " | <a href=\"/api/search?q=\">/api/search?q=</a>"
           << "</div>"
+          << "<div class=\"legend\">"
+          << "<h3>Search tips</h3>"
+          << "<table><tr><td><code>Aabbt</code></td><td>by name (EN / ES / FR / variants)</td></tr>"
+          << "<tr><td><code>type:Vampire</code></td><td>card type: Vampire, Master, Combat, etc.</td></tr>"
+          << "<tr><td><code>clan:Ventrue</code></td><td>clan</td></tr>"
+          << "<tr><td><code>disc:aus</code></td><td>discipline abbreviation</td></tr>"
+          << "<tr><td><code>cap:5</code></td><td>exact capacity</td></tr>"
+          << "<tr><td><code>cap>5</code> <code>cap&lt;4</code></td><td>capacity range</td></tr>"
+          << "<tr><td><code>group:4</code></td><td>group number</td></tr>"
+          << "<tr><td><code>text:bleed</code></td><td>search card text</td></tr>"
+          << "<tr><td colspan=\"2\">Combine terms: <code>type:Vampire clan:Nosferatu disc:obf cap>4</code></td></tr>"
+          << "</table></div>"
           << "<div class=\"footer\">VTES Card Scanner</div></div></body></html>";
         return h.str();
     }
@@ -297,6 +405,7 @@ private:
           << "<div class=\"status-bar\">Database: <span class=\"status-" << dbStatus << "\">"
           << dbStatus << "</span>"
           << (dbSize > 0 ? " (" + std::to_string(dbSize) + " cards)" : "")
+          << " | <a href=\"/\">search tips</a>"
           << "</div>"
           << "<div id=\"results\">";
 
@@ -307,13 +416,22 @@ private:
             return h.str();
         }
 
-        std::string lower = toLower(q);
+        SearchFilter f = parseQuery(q);
         int count = 0;
         for (const auto &[id, entry] : db_->all_entries()) {
-            if (toLower(entry.name).find(lower) != std::string::npos) {
+            if (matchesCard(entry, f)) {
+                // Determine display name — show localised name as subtitle
+                std::string display_name = entry.printed_name.empty() ? entry.name : entry.printed_name;
                 h << "<div class=\"result\">"
-                  << "<h2>" << escapeHtml(entry.printed_name.empty() ? entry.name : entry.printed_name)
-                  << "</h2><div>";
+                  << "<h2>" << escapeHtml(display_name) << "</h2>";
+                if (!entry.name_es.empty() || !entry.name_fr.empty()) {
+                    h << "<div class=\"i18n\">";
+                    if (!entry.name_es.empty()) h << "ES: " << escapeHtml(entry.name_es);
+                    if (!entry.name_es.empty() && !entry.name_fr.empty()) h << " &middot; ";
+                    if (!entry.name_fr.empty()) h << "FR: " << escapeHtml(entry.name_fr);
+                    h << "</div>";
+                }
+                h << "<div>";
                 for (const auto &t : entry.types)
                     h << "<span class=\"type\">" << escapeHtml(t) << "</span>";
                 h << "</div><div class=\"detail\">";
@@ -346,10 +464,21 @@ private:
         }
 
         if (count == 0)
-            h << "<div class=\"empty\">No cards found for \"" << escapeHtml(q) << "\"</div>";
+            h << "<div class=\"empty\">No cards found</div>";
 
         h << "</div><div class=\"footer\">VTES Card Scanner</div></div></body></html>";
         return h.str();
+    }
+
+    static std::vector<std::string> split(const std::string &s, char delim) {
+        std::vector<std::string> out;
+        size_t start = 0, end;
+        while ((end = s.find(delim, start)) != std::string::npos) {
+            if (end > start) out.push_back(s.substr(start, end - start));
+            start = end + 1;
+        }
+        if (start < s.size()) out.push_back(s.substr(start));
+        return out;
     }
 
     static std::string toLower(const std::string &s) {
@@ -412,8 +541,15 @@ private:
         ".status-bar a:hover{text-decoration:underline}"
         ".status-ready{color:#4caf50;font-weight:600}"
         ".status-empty{color:#ff5722;font-weight:600}"
+        ".legend{margin-top:20px;padding:16px;background:#0d1b3e;border-radius:6px;font-size:.85rem}"
+        ".legend h3{color:#c9a84c;font-size:.95rem;margin-bottom:10px}"
+        ".legend table{width:100%}"
+        ".legend td{padding:3px 8px;vertical-align:top}"
+        ".legend td:first-child{white-space:nowrap;color:#aaa}"
+        ".legend code{color:#c9a84c;background:#1a1a2e;padding:1px 5px;border-radius:3px;font-size:.8rem}"
         ".result{border:1px solid #333;border-radius:6px;padding:16px;margin-bottom:12px;background:#16213e}"
-        ".result h2{font-size:1rem;color:#c9a84c;margin-bottom:6px}"
+        ".result h2{font-size:1rem;color:#c9a84c;margin-bottom:4px}"
+        ".result .i18n{font-size:.8rem;color:#888;margin-bottom:4px}"
         ".result .type{display:inline-block;background:#0f3460;color:#aaa;font-size:.75rem;padding:2px 8px;border-radius:3px;margin-right:4px}"
         ".result .detail{font-size:.85rem;color:#999;margin-top:4px}"
         ".result img{max-width:200px;margin-top:8px;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.4)}"

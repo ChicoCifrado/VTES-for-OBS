@@ -8,18 +8,22 @@
 #include <fstream>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 
 struct VTESCardEntry {
     int id = 0;
     std::string name;
     std::string printed_name;
+    std::string card_text;
+    std::string url;
+    std::string name_es;
+    std::string name_fr;
     std::vector<std::string> types;
     std::vector<std::string> clans;
     std::vector<std::string> disciplines;
+    std::vector<std::string> name_variants;
     int capacity = 0;
     int group = 0;
-    std::string card_text;
-    std::string url;
 };
 
 class VTESCardDatabase {
@@ -54,6 +58,18 @@ public:
                     for (const auto& d : card["disciplines"])
                         entry.disciplines.push_back(d.get<std::string>());
                 }
+                if (card.contains("name_variants")) {
+                    for (const auto& v : card["name_variants"])
+                        entry.name_variants.push_back(v.get<std::string>());
+                }
+                if (card.contains("_i18n") && card["_i18n"].is_object()) {
+                    auto &i18n = card["_i18n"];
+                    if (i18n.contains("es") && i18n["es"].is_object())
+                        entry.name_es = i18n["es"].value("name", "");
+                    if (i18n.contains("fr") && i18n["fr"].is_object())
+                        entry.name_fr = i18n["fr"].value("name", "");
+                }
+
                 if (card.contains("capacity") && !card["capacity"].is_null()) {
                     if (card["capacity"].is_number_integer())
                         entry.capacity = card["capacity"];
