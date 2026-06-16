@@ -108,7 +108,6 @@ private:
     }
 
     void handleRequest(SOCKET client, const char *request) {
-        // Parse the first line: GET /path HTTP/1.1
         char method[16], path[1024];
         path[0] = '\0';
         if (sscanf(request, "%15s %1023s", method, path) < 2) {
@@ -120,7 +119,6 @@ private:
             return;
         }
 
-        // Extract query parameter "q" from path
         std::string uri, query;
         const char *qp = strchr(path, '?');
         if (qp) {
@@ -131,24 +129,45 @@ private:
         }
 
         std::string q;
-        // Parse query string for "q=" param
         if (!query.empty()) {
             size_t pos = query.find("q=");
             if (pos != std::string::npos) {
                 q = urlDecode(query.substr(pos + 2));
-               
                 size_t amp = q.find('&');
                 if (amp != std::string::npos) q.resize(amp);
             }
         }
 
-        if (uri == "/api/search") {
+        if (uri == "/api/status") {
+            serveStatus(client);
+        } else if (uri == "/api/search") {
             serveJson(client, q);
         } else if (uri == "/search") {
             serveHtmlResult(client, q);
+        } else if (uri == "/favicon.ico") {
+            send204(client);
         } else {
             serveForm(client);
         }
+    }
+
+    void serveStatus(SOCKET client) {
+        nlohmann::json status;
+        status["db_loaded"] = db_ && !db_->is_empty();
+        status["db_size"] = db_ ? (int)db_->size() : 0;
+        status["server_running"] = running_;
+        status["server_port"] = port_;
+        std::string body = status.dump(2);
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+        fprintf(stderr, "[WebServer] /api/status: db_loaded=%d db_size=%d\n",
+            (db_ && !db_->is_empty()) ? 1 : 0, db_ ? (int)db_->size() : 0);
     }
 
     void serveForm(SOCKET client) {
@@ -227,6 +246,11 @@ private:
         sendAll(client, resp);
     }
 
+    void send204(SOCKET client) {
+        std::string resp = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+        sendAll(client, resp);
+    }
+
     void sendAll(SOCKET client, const std::string &data) {
 #ifdef _WIN32
         send(client, data.data(), (int)data.size(), 0);
@@ -237,6 +261,8 @@ private:
 
     std::string buildFormPage() {
         std::ostringstream h;
+        size_t dbSize = (db_ && !db_->is_empty()) ? db_->size() : 0;
+        const char *dbStatus = (db_ && !db_->is_empty()) ? "ready" : "empty";
         h << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
           << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
           << "<title>VTES Card Search</title><style>"
@@ -246,13 +272,20 @@ private:
           << "<form class=\"search-box\" action=\"/search\" method=\"get\">"
           << "<input type=\"text\" name=\"q\" placeholder=\"Search by card name...\" autofocus>"
           << "<button type=\"submit\">Search</button></form>"
-          << "<div id=\"results\"></div>"
+          << "<div class=\"status-bar\">Database: <span class=\"status-" << dbStatus << "\">"
+          << dbStatus << "</span>"
+          << (dbSize > 0 ? " (" + std::to_string(dbSize) + " cards)" : "")
+          << " | <a href=\"/api/status\">/api/status</a>"
+          << " | <a href=\"/api/search?q=\">/api/search?q=</a>"
+          << "</div>"
           << "<div class=\"footer\">VTES Card Scanner</div></div></body></html>";
         return h.str();
     }
 
     std::string buildResultPage(const std::string &q) {
         std::ostringstream h;
+        size_t dbSize = (db_ && !db_->is_empty()) ? db_->size() : 0;
+        const char *dbStatus = (db_ && !db_->is_empty()) ? "ready" : "empty";
         h << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
           << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
           << "<title>VTES Card Search</title><style>" << PAGE_CSS
@@ -260,10 +293,17 @@ private:
           << "<h1>VTES Card Search</h1>"
           << "<form class=\"search-box\" action=\"/search\" method=\"get\">"
           << "<input type=\"text\" name=\"q\" value=\"" << escapeHtml(q) << "\" autofocus>"
-          << "<button type=\"submit\">Search</button></form><div id=\"results\">";
+          << "<button type=\"submit\">Search</button></form>"
+          << "<div class=\"status-bar\">Database: <span class=\"status-" << dbStatus << "\">"
+          << dbStatus << "</span>"
+          << (dbSize > 0 ? " (" + std::to_string(dbSize) + " cards)" : "")
+          << "</div>"
+          << "<div id=\"results\">";
 
-        if (!db_) {
-            h << "<div class=\"error\">Database not loaded</div></div></div></body></html>";
+        if (!db_ || db_->is_empty()) {
+            h << "<div class=\"error\">Database not loaded or empty"
+              << (db_ ? ". Check OBS log for details." : "")
+              << "</div></div></div></body></html>";
             return h.str();
         }
 
@@ -367,6 +407,11 @@ private:
         ".search-box input:focus{border-color:#c9a84c}"
         ".search-box button{padding:10px 20px;background:#c9a84c;color:#1a1a2e;border:none;border-radius:6px;font-size:1rem;font-weight:600;cursor:pointer}"
         ".search-box button:hover{background:#dbb58c}"
+        ".status-bar{margin-bottom:20px;font-size:.85rem;color:#888;padding:8px 12px;background:#0d1b3e;border-radius:4px}"
+        ".status-bar a{color:#c9a84c;text-decoration:none}"
+        ".status-bar a:hover{text-decoration:underline}"
+        ".status-ready{color:#4caf50;font-weight:600}"
+        ".status-empty{color:#ff5722;font-weight:600}"
         ".result{border:1px solid #333;border-radius:6px;padding:16px;margin-bottom:12px;background:#16213e}"
         ".result h2{font-size:1rem;color:#c9a84c;margin-bottom:6px}"
         ".result .type{display:inline-block;background:#0f3460;color:#aaa;font-size:.75rem;padding:2px 8px;border-radius:3px;margin-right:4px}"
@@ -375,6 +420,7 @@ private:
         ".result a{color:#c9a84c;text-decoration:none}"
         ".result a:hover{text-decoration:underline}"
         ".empty{text-align:center;color:#666;padding:40px;font-size:1.1rem}"
+        ".error{text-align:center;color:#ff5722;padding:40px;font-size:1.1rem}"
         ".footer{text-align:center;color:#444;font-size:.75rem;margin-top:40px}";
 
     std::atomic<bool> running_;
