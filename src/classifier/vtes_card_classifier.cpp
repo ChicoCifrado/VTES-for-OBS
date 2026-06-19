@@ -1,23 +1,16 @@
 // /mnt/c/Users/JackSuicide/VTES/vtes_obs_detect/src/classifier/vtes_card_classifier.cpp
 
 #include "vtes_card_classifier.hpp"
+#include "plugin-support.h"
+#include <obs.h>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/geometry.hpp>
 #include <opencv2/dnn.hpp>
-#include <onnxruntime_cxx_api.h>
 #include <algorithm>
 #include <cmath>
 #include <numeric>
-
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#undef WIN32_LEAN_AND_MEAN
-#undef NOMINMAX
-#endif
 
 namespace vtes_classifier {
 
@@ -93,7 +86,7 @@ std::vector<cv::Point2f> CardCropExtractor::orderPoints(const std::vector<cv::Po
 // ============================================================
 
 VTESCardClassifier::VTESCardClassifier(const Config& config, ContourCallback contourCb)
-    : config_(config), contourCb_(std::move(contourCb)), onnxEnv_(nullptr), onnxSession_(nullptr) {
+    : config_(config), contourCb_(std::move(contourCb)) {
     if (config_.useOnnxClassifier && !config_.onnxModelPath.empty()) {
         initializeOnnxSession();
     }
@@ -113,18 +106,17 @@ CardType VTESCardClassifier::classify(const cv::Mat& crop, float& outConfidence,
     float contour = signalContour(crop);
 
     outSignals = {oval, color, contour};
-    CardType mainType = fuse(oval, color, contour, crop, outConfidence);
 
-    // For library cards, use ONNX classifier to determine subtype
-    if (mainType == CardType::LibraryAction && config_.useOnnxClassifier && onnxSession_) {
-        float subtypeConf = 0.0f;
-        CardType subtype = classifyLibrarySubtype(crop, subtypeConf);
-        if (subtype != CardType::Unknown && subtype != CardType::LibraryAction) {
-            outConfidence = subtypeConf;
-            return subtype;
+    // ONNX classifier first (primary)
+    if (config_.useOnnxClassifier && !onnxNet_.empty()) {
+        CardType onnxType = classifyLibrarySubtype(crop, outConfidence);
+        if (onnxType != CardType::Unknown) {
+            return onnxType;
         }
     }
-    return mainType;
+
+    // Fallback to heuristic
+    return fuse(oval, color, contour, crop, outConfidence);
 }
 
 float VTESCardClassifier::signalOval(const cv::Mat& crop) const {
@@ -308,7 +300,7 @@ CardType VTESCardClassifier::fuse(float oval, float color, float contour, const 
 }
 
 CardType VTESCardClassifier::classifyLibrarySubtype(const cv::Mat& crop, float& outConfidence) const {
-    if (!onnxSession_) {
+    if (onnxNet_.empty()) {
         outConfidence = 0.40f;
         return CardType::LibraryAction;
     }
@@ -316,6 +308,12 @@ CardType VTESCardClassifier::classifyLibrarySubtype(const cv::Mat& crop, float& 
     try {
         cv::Mat inputTensor = preprocessForOnnx(crop);
         std::vector<float> logits = runOnnxInference(inputTensor);
+
+        // Debug: log all logits
+        if (logits.size() >= 7) {
+            obs_log(LOG_INFO, "[TypeClassifier] Logits: v=%.2f m=%.2f eq=%.2f co=%.2f la=%.2f re=%.2f po=%.2f",
+                    logits[0], logits[1], logits[2], logits[3], logits[4], logits[5], logits[6]);
+        }
 
         // Find max logit (7 classes: vampire, master, equipment, combat, library_action, reaction, political)
         auto maxIt = std::max_element(logits.begin(), logits.end());
@@ -356,33 +354,24 @@ CardType VTESCardClassifier::classifyLibrarySubtype(const cv::Mat& crop, float& 
 
 bool VTESCardClassifier::initializeOnnxSession() {
     try {
-        onnxEnv_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "VTESCardClassifier");
+        onnxNet_ = cv::dnn::readNetFromONNX(config_.onnxModelPath);
+        if (onnxNet_.empty()) return false;
 
-        Ort::SessionOptions sessionOptions;
-        sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-        sessionOptions.SetIntraOpNumThreads(1);
+        onnxNet_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+        onnxNet_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
 
-        // On Windows, ONNX Runtime expects wide string path
-#ifdef _WIN32
-        int wlen = MultiByteToWideChar(CP_UTF8, 0, config_.onnxModelPath.c_str(), -1, nullptr, 0);
-        std::wstring wpath(wlen, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, config_.onnxModelPath.c_str(), -1, wpath.data(), wlen);
-        onnxSession_ = std::make_unique<Ort::Session>(*onnxEnv_, wpath.c_str(), sessionOptions);
-#else
-        onnxSession_ = std::make_unique<Ort::Session>(*onnxEnv_, config_.onnxModelPath.c_str(), sessionOptions);
-#endif
-
-        // Get input name and shape
-        Ort::AllocatorWithDefaultOptions allocator;
-        onnxInputName_ = onnxSession_->GetInputNameAllocated(0, allocator).get();
-
-        auto inputTypeInfo = onnxSession_->GetInputTypeInfo(0);
-        auto inputTensorInfo = inputTypeInfo.GetTensorTypeAndShapeInfo();
-        onnxInputShape_ = inputTensorInfo.GetShape();
+        // Get input name from the model
+        std::vector<cv::String> in_names = onnxNet_.getUnconnectedOutLayersNames();
+        // Use a dummy forward pass to discover input name
+        cv::Mat dummy(224, 224, CV_8UC3);
+        cv::Mat blob = cv::dnn::blobFromImage(dummy, 1.0, cv::Size(224, 224),
+                                               cv::Scalar(), true, false);
+        onnxNet_.setInput(blob);
+        // The input layer name can be obtained from the net
+        onnxInputName_ = ""; // will be resolved at runtime by setInput
 
         return true;
-    } catch (const Ort::Exception&) {
-        // Log error but don't crash
+    } catch (const std::exception&) {
         return false;
     }
 }
@@ -422,41 +411,16 @@ std::vector<float> VTESCardClassifier::runOnnxInference(const cv::Mat& inputTens
     std::vector<float> output;
 
     try {
-        // Prepare input tensor
-        auto memoryInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-        std::vector<int64_t> inputShape = {1, 3, 224, 224};
+        onnxNet_.setInput(inputTensor);
+        cv::Mat result = onnxNet_.forward();
 
-        Ort::Value inputTensorValue = Ort::Value::CreateTensor<float>(
-            memoryInfo,
-            const_cast<float*>(inputTensor.ptr<float>()),
-            inputTensor.total(),
-            inputShape.data(),
-            inputShape.size()
-        );
+        if (result.empty()) return output;
 
-        // Run inference
-        const char* inputNames[] = {onnxInputName_.c_str()};
-        const char* outputNames[] = {onnxSession_->GetOutputNameAllocated(0, Ort::AllocatorWithDefaultOptions()).get()};
-
-        auto outputTensors = onnxSession_->Run(
-            Ort::RunOptions{nullptr},
-            inputNames,
-            &inputTensorValue,
-            1,
-            outputNames,
-            1
-        );
-
-        // Extract output
-        float* outputData = outputTensors[0].GetTensorMutableData<float>();
-        auto outputShape = outputTensors[0].GetTensorTypeAndShapeInfo().GetShape();
-        size_t outputSize = 1;
-        for (auto dim : outputShape) outputSize *= dim;
-
+        size_t outputSize = result.total();
         output.resize(outputSize);
-        std::copy(outputData, outputData + outputSize, output.begin());
+        std::copy(result.ptr<float>(), result.ptr<float>() + outputSize, output.begin());
 
-    } catch (const Ort::Exception&) {
+    } catch (const std::exception&) {
         // Return empty on error
     }
 

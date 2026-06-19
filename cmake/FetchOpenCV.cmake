@@ -1,87 +1,208 @@
 include(FetchContent)
 
-set(CUSTOM_OPENCV_URL
-    ""
-    CACHE STRING "URL of a downloaded OpenCV static library tarball")
+set(OpenCV_VERSION "5.0.0")
 
-set(CUSTOM_OPENCV_HASH
-    ""
-    CACHE STRING "Hash of a downloaded OpenCV staitc library tarball")
+# ── Force OpenCV to use its own 3rd-party libs ─────────────────────────
+set(OPENCV_FORCE_3RDPARTY_BUILD ON CACHE BOOL "" FORCE)
+set(OPENCV_DOWNLOAD_EXTERNAL_MODULES OFF CACHE BOOL "" FORCE)
+set(OPENCV_ENABLE_NONFREE OFF CACHE BOOL "" FORCE)
+set(BUILD_PROTOBUF ON CACHE BOOL "" FORCE)
 
-if(CUSTOM_OPENCV_URL STREQUAL "")
-  set(USE_PREDEFINED_OPENCV ON)
-else()
-  if(CUSTOM_OPENCV_HASH STREQUAL "")
-    message(FATAL_ERROR "Both of CUSTOM_OPENCV_URL and CUSTOM_OPENCV_HASH must be present!")
-  else()
-    set(USE_PREDEFINED_OPENCV OFF)
-  endif()
-endif()
+# ── Static build, no shared ────────────────────────────────────────────
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
-if(USE_PREDEFINED_OPENCV)
-  set(OpenCV_VERSION "v5.0.0-1")
-  set(OpenCV_BASEURL "https://github.com/obs-ai/obs-backgroundremoval-dep-opencv/releases/download/${OpenCV_VERSION}")
+# ── Disable tests, docs, apps, packages ────────────────────────────────
+set(BUILD_opencv_apps OFF CACHE BOOL "" FORCE)
+set(BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BUILD_PACKAGE OFF CACHE BOOL "" FORCE)
+set(BUILD_PERF_TESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(INSTALL_CREATE_DISTRIB OFF CACHE BOOL "" FORCE)
+set(INSTALL_BIN_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(INSTALL_C_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(INSTALL_PYTHON_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(INSTALL_ANDROID_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(INSTALL_TO_MANGLED_PATHS OFF CACHE BOOL "" FORCE)
+set(INSTALL_TESTS OFF CACHE BOOL "" FORCE)
 
-  if(${CMAKE_BUILD_TYPE} STREQUAL Release OR ${CMAKE_BUILD_TYPE} STREQUAL RelWithDebInfo)
-    set(OpenCV_BUILD_TYPE Release)
-  else()
-    set(OpenCV_BUILD_TYPE Debug)
-  endif()
+# ── Disable language bindings ─────────────────────────────────────────
+set(BUILD_JAVA OFF CACHE BOOL "" FORCE)
+set(BUILD_opencv_python3 OFF CACHE BOOL "" FORCE)
+set(BUILD_opencv_python2 OFF CACHE BOOL "" FORCE)
+set(PYTHON_EXECUTABLE "" CACHE FILEPATH "" FORCE)
+set(PYTHON_INCLUDE_DIR "" CACHE FILEPATH "" FORCE)
+set(PYTHON_LIBRARY "" CACHE FILEPATH "" FORCE)
+set(BUILD_opencv_js OFF CACHE BOOL "" FORCE)
+set(BUILD_ANDROID_PROJECTS OFF CACHE BOOL "" FORCE)
+set(BUILD_ANDROID_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(BUILD_ANDROID_SERVICE OFF CACHE BOOL "" FORCE)
+set(BUILD_CUDA_STUBS OFF CACHE BOOL "" FORCE)
+set(BUILD_FAT_JAVA_LIB OFF CACHE BOOL "" FORCE)
+set(BUILD_OBJC OFF CACHE BOOL "" FORCE)
 
-  if(APPLE)
-    if(OpenCV_BUILD_TYPE STREQUAL Debug)
-      set(OpenCV_URL "${OpenCV_BASEURL}/opencv-macos-${OpenCV_VERSION}-Debug.tar.gz")
-      set(OpenCV_HASH SHA256=BE85C8224F71C52162955BEE4EC9FFBE41CBED636D7989843CA75AD42657B121)
-    else()
-      set(OpenCV_URL "${OpenCV_BASEURL}/opencv-macos-${OpenCV_VERSION}-Release.tar.gz")
-      set(OpenCV_HASH SHA256=5DB4FCFBD8C7CDBA136657B4D149821A670DF9A7C71120F5A4D34FA35A58D07B)
-    endif()
-  elseif(MSVC)
-    if(OpenCV_BUILD_TYPE STREQUAL Debug)
-      set(OpenCV_URL "${OpenCV_BASEURL}/opencv-windows-${OpenCV_VERSION}-Debug.zip")
-      set(OpenCV_HASH SHA256=0A1BBC898DCE5F193427586DA84D7A34BBB783127957633236344E9CCD61B9CE)
-    else()
-      set(OpenCV_URL "${OpenCV_BASEURL}/opencv-windows-${OpenCV_VERSION}-Release.zip")
-      set(OpenCV_HASH SHA256=56A5E042F490B8390B1C1819B2B48C858F10CD64E613BABBF11925A57269C3FA)
-    endif()
-  else()
-    if(OpenCV_BUILD_TYPE STREQUAL Debug)
-      set(OpenCV_URL "${OpenCV_BASEURL}/opencv-linux-${OpenCV_VERSION}-Debug.tar.gz")
-      set(OpenCV_HASH SHA256=840A7D80B661CFF7B7300272A2A2992D539672ECECA01836B85F68BD8CAF07F5)
-    else()
-      set(OpenCV_URL "${OpenCV_BASEURL}/opencv-linux-${OpenCV_VERSION}-Release.tar.gz")
-      set(OpenCV_HASH SHA256=73652C2155B477B5FD95FCD8EA7CE35D313543ECE17BDFA3A2B217A0239D74C6)
-    endif()
-  endif()
-else()
-  set(OpenCV_URL "${CUSTOM_OPENCV_URL}")
-  set(OpenCV_HASH "${CUSTOM_OPENCV_HASH}")
-endif()
+# ── Disable hardware features / backends ───────────────────────────────
+set(WITH_1394 OFF CACHE BOOL "" FORCE)
+set(WITH_ADE OFF CACHE BOOL "" FORCE)
+set(WITH_ARAVIS OFF CACHE BOOL "" FORCE)
+set(WITH_CLP OFF CACHE BOOL "" FORCE)
+set(WITH_CUDA OFF CACHE BOOL "" FORCE)
+set(WITH_CUFFT OFF CACHE BOOL "" FORCE)
+set(WITH_CUBLAS OFF CACHE BOOL "" FORCE)
+set(WITH_EIGEN OFF CACHE BOOL "" FORCE)
+set(WITH_FFMPEG OFF CACHE BOOL "" FORCE)
+set(WITH_FLATBUFFERS OFF CACHE BOOL "" FORCE)
+set(WITH_GDAL OFF CACHE BOOL "" FORCE)
+set(WITH_GRAPHICSAPI OFF CACHE BOOL "" FORCE)
+set(WITH_GSTREAMER OFF CACHE BOOL "" FORCE)
+set(WITH_GTK OFF CACHE BOOL "" FORCE)
+set(WITH_HALIDE OFF CACHE BOOL "" FORCE)
+set(WITH_HPX OFF CACHE BOOL "" FORCE)
+set(WITH_IMGCODEC_HDR OFF CACHE BOOL "" FORCE)
+set(WITH_IMGCODEC_PFM OFF CACHE BOOL "" FORCE)
+set(WITH_IMGCODEC_PXM OFF CACHE BOOL "" FORCE)
+set(WITH_IMGCODEC_SUNRASTER OFF CACHE BOOL "" FORCE)
+set(WITH_INF_ENGINE OFF CACHE BOOL "" FORCE)
+set(WITH_IPP OFF CACHE BOOL "" FORCE)
+set(WITH_ITT OFF CACHE BOOL "" FORCE)
+set(WITH_JASPER OFF CACHE BOOL "" FORCE)
+set(WITH_LAPACK OFF CACHE BOOL "" FORCE)
+set(WITH_MATLAB OFF CACHE BOOL "" FORCE)
+set(WITH_MSMF OFF CACHE BOOL "" FORCE)
+set(WITH_NGRAPH OFF CACHE BOOL "" FORCE)
+set(WITH_NVCUVID OFF CACHE BOOL "" FORCE)
+set(WITH_OAK OFF CACHE BOOL "" FORCE)
+set(WITH_OPENCL OFF CACHE BOOL "" FORCE)
+set(WITH_OPENCLAMDBLAS OFF CACHE BOOL "" FORCE)
+set(WITH_OPENCLAMDFFT OFF CACHE BOOL "" FORCE)
+set(WITH_OPENCL_SVM OFF CACHE BOOL "" FORCE)
+set(WITH_ONNXRUNTIME ON CACHE BOOL "" FORCE)
+set(DOWNLOAD_ONNXRUNTIME ON CACHE BOOL "" FORCE)
+set(DOWNLOAD_ONNXRUNTIME_GPU ON CACHE BOOL "" FORCE)
+set(OPENCV_DNN_CUDA OFF CACHE BOOL "" FORCE)
+set(WITH_OPENEXR OFF CACHE BOOL "" FORCE)
+set(WITH_OPENGL OFF CACHE BOOL "" FORCE)
+set(WITH_OPENJPEG OFF CACHE BOOL "" FORCE)
+set(WITH_OPENMP OFF CACHE BOOL "" FORCE)
+set(WITH_OPENNI OFF CACHE BOOL "" FORCE)
+set(WITH_OPENNI2 OFF CACHE BOOL "" FORCE)
+set(WITH_OPENVX OFF CACHE BOOL "" FORCE)
+set(WITH_PTHREADS_PF OFF CACHE BOOL "" FORCE)
+set(WITH_PVAPI OFF CACHE BOOL "" FORCE)
+set(WITH_QT OFF CACHE BOOL "" FORCE)
+set(WITH_QUIRC OFF CACHE BOOL "" FORCE)
+set(WITH_TBB OFF CACHE BOOL "" FORCE)
+set(WITH_TIFF OFF CACHE BOOL "" FORCE)
+set(WITH_TIMVX OFF CACHE BOOL "" FORCE)
+set(WITH_V4L OFF CACHE BOOL "" FORCE)
+set(WITH_VA OFF CACHE BOOL "" FORCE)
+set(WITH_VA_INTEL OFF CACHE BOOL "" FORCE)
+set(WITH_VTK OFF CACHE BOOL "" FORCE)
+set(WITH_VULKAN OFF CACHE BOOL "" FORCE)
+set(WITH_WEBP OFF CACHE BOOL "" FORCE)
+set(WITH_XIMEA OFF CACHE BOOL "" FORCE)
 
+# ── Enable image codecs ────────────────────────────────────────────────
+# JPEG for cv::imencode(".jpg", ...), PNG for cv::imread generic support
+set(WITH_JPEG ON CACHE BOOL "" FORCE)
+set(WITH_PNG ON CACHE BOOL "" FORCE)
+
+# ── Enable only the modules we actually use ────────────────────────────
+set(BUILD_opencv_core ON CACHE BOOL "" FORCE)
+set(BUILD_opencv_imgproc ON CACHE BOOL "" FORCE)
+set(BUILD_opencv_imgcodecs ON CACHE BOOL "" FORCE)
+set(BUILD_opencv_video ON CACHE BOOL "" FORCE)       # cv::KalmanFilter
+set(BUILD_opencv_geometry ON CACHE BOOL "" FORCE)     # getPerspectiveTransform, warpPerspective
+set(BUILD_opencv_dnn ON CACHE BOOL "" FORCE)          # blobFromImage
+set(BUILD_opencv_flann ON CACHE BOOL "" FORCE)        # required by geometry
+set(BUILD_opencv_features ON CACHE BOOL "" FORCE)     # opencv2/features.hpp (umbrella)
+set(BUILD_opencv_features2d ON CACHE BOOL "" FORCE)   # opencv2/features2d.hpp (umbrella)
+
+# ── Disable every other module ─────────────────────────────────────────
+set(BUILD_opencv_calib3d OFF CACHE BOOL "" FORCE)
+
+set(BUILD_opencv_gapi OFF CACHE BOOL "" FORCE)
+set(BUILD_opencv_highgui OFF CACHE BOOL "" FORCE)
+set(BUILD_opencv_ml OFF CACHE BOOL "" FORCE)
+set(BUILD_opencv_objdetect OFF CACHE BOOL "" FORCE)
+set(BUILD_opencv_photo OFF CACHE BOOL "" FORCE)
+set(BUILD_opencv_stitching OFF CACHE BOOL "" FORCE)
+set(BUILD_opencv_videoio OFF CACHE BOOL "" FORCE)
+set(BUILD_opencv_calib OFF CACHE BOOL "" FORCE)
+set(BUILD_opencv_stereo OFF CACHE BOOL "" FORCE)
+set(BUILD_opencv_world OFF CACHE BOOL "" FORCE)
+
+# ── Fetch and build OpenCV 5.0.0 from source ──────────────────────────
 FetchContent_Declare(
   opencv
-  URL ${OpenCV_URL}
-  URL_HASH ${OpenCV_HASH})
-FetchContent_MakeAvailable(opencv)
+  GIT_REPOSITORY https://github.com/opencv/opencv.git
+  GIT_TAG ${OpenCV_VERSION}
+  GIT_SHALLOW TRUE
+  GIT_PROGRESS TRUE
+)
 
-add_library(OpenCV INTERFACE)
-if(MSVC)
-  target_link_libraries(
-    OpenCV
-    INTERFACE ${opencv_SOURCE_DIR}/x64/vc17/staticlib/opencv_imgproc500.lib
-              ${opencv_SOURCE_DIR}/x64/vc17/staticlib/opencv_core500.lib
-              ${opencv_SOURCE_DIR}/x64/vc17/staticlib/opencv_video500.lib
-              ${opencv_SOURCE_DIR}/x64/vc17/staticlib/opencv_imgcodecs500.lib
-              ${opencv_SOURCE_DIR}/x64/vc17/staticlib/opencv_calib500.lib
-              ${opencv_SOURCE_DIR}/x64/vc17/staticlib/opencv_geometry500.lib
-              ${opencv_SOURCE_DIR}/x64/vc17/staticlib/opencv_stereo500.lib
-              ${opencv_SOURCE_DIR}/x64/vc17/staticlib/zlib.lib)
-  target_include_directories(OpenCV SYSTEM INTERFACE ${opencv_SOURCE_DIR}/include)
-else()
-  target_link_libraries(
-    OpenCV INTERFACE ${opencv_SOURCE_DIR}/lib/libopencv_imgproc.a ${opencv_SOURCE_DIR}/lib/libopencv_core.a
-                     ${opencv_SOURCE_DIR}/lib/libopencv_video.a ${opencv_SOURCE_DIR}/lib/libopencv_calib.a
-                     ${opencv_SOURCE_DIR}/lib/libopencv_geometry.a ${opencv_SOURCE_DIR}/lib/libopencv_stereo.a
-                     ${opencv_SOURCE_DIR}/lib/opencv4/3rdparty/libzlib.a)
-  target_include_directories(OpenCV SYSTEM INTERFACE ${opencv_SOURCE_DIR}/include/opencv4)
+FetchContent_GetProperties(opencv)
+if(NOT opencv_POPULATED)
+  FetchContent_Populate(opencv)
+
+  # ── Patch GetTempPathW → GetTempPathA for modern WinSDK (UNICODE conflict) ─
+  set(_fs_cpp "${opencv_SOURCE_DIR}/modules/core/src/utils/filesystem.cpp")
+  file(READ "${_fs_cpp}" _fs_text)
+  string(REPLACE "GetTempPath(" "GetTempPathA(" _fs_text "${_fs_text}")
+  file(WRITE "${_fs_cpp}" "${_fs_text}")
+  unset(_fs_cpp)
+  unset(_fs_text)
+
+  # ── Patch EnableProfiling(char*) → EnableProfiling(wchar_t*) for ORT 1.25+ ─
+  set(_ort_cpp "${opencv_SOURCE_DIR}/modules/dnn/src/net_impl_backend.cpp")
+  file(READ "${_ort_cpp}" _ort_text)
+  string(REPLACE
+    "opts.EnableProfiling(ort_profile_path_prefix.c_str());"
+    "#ifdef _WIN32\n        std::wstring wprofile(ort_profile_path_prefix.begin(), ort_profile_path_prefix.end());\n        opts.EnableProfiling(wprofile.c_str());\n#else\n        opts.EnableProfiling(ort_profile_path_prefix.c_str());\n#endif"
+    _ort_text "${_ort_text}")
+  file(WRITE "${_ort_cpp}" "${_ort_text}")
+  unset(_ort_cpp)
+  unset(_ort_text)
+
+  # Force dynamic CRT (/MD) to match the rest of the project.
+  # OpenCV sets BUILD_WITH_STATIC_CRT=ON by default for static builds,
+  # which overrides CMAKE_MSVC_RUNTIME_LIBRARY to "MultiThreaded".
+  if(MSVC)
+    set(BUILD_WITH_STATIC_CRT OFF CACHE BOOL "" FORCE)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL" CACHE STRING "" FORCE)
+  endif()
+
+  # Disable Unicode font download — the download/copy logic in OpenCV 5.0.0
+  # fails when the build tree is freshly populated (dest dir doesn't exist yet).
+  # Only affects cv::putText with Unicode strings (we only need ASCII/Hershey).
+  set(WITH_UNIFONT OFF CACHE BOOL "" FORCE)
+
+  add_subdirectory(${opencv_SOURCE_DIR} ${opencv_BINARY_DIR})
+endif()
+
+# ── Wrap OpenCV CMake targets as the "OpenCV" interface the parent expects ──
+if(NOT TARGET OpenCV)
+  add_library(OpenCV INTERFACE)
+  target_link_libraries(OpenCV INTERFACE
+    opencv_core
+    opencv_imgproc
+    opencv_imgcodecs
+    opencv_video
+    opencv_geometry
+    opencv_dnn
+    opencv_flann
+  )
+  target_include_directories(OpenCV SYSTEM INTERFACE
+    "${opencv_SOURCE_DIR}/include"
+    "${opencv_SOURCE_DIR}/modules/core/include"
+    "${opencv_SOURCE_DIR}/modules/imgproc/include"
+    "${opencv_SOURCE_DIR}/modules/imgcodecs/include"
+    "${opencv_SOURCE_DIR}/modules/video/include"
+    "${opencv_SOURCE_DIR}/modules/geometry/include"
+    "${opencv_SOURCE_DIR}/modules/dnn/include"
+    "${opencv_SOURCE_DIR}/modules/flann/include"
+    "${opencv_SOURCE_DIR}/modules/features/include"
+    "${opencv_SOURCE_DIR}/modules/features2d/include"
+    "${opencv_BINARY_DIR}"
+  )
 endif()

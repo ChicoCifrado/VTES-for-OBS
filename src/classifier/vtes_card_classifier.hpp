@@ -3,13 +3,15 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
-#include <onnxruntime_cxx_api.h>
+#include <opencv2/dnn.hpp>
 #include <vector>
 #include <string>
 #include <functional>
 #include <optional>
 #include <array>
 #include <memory>
+
+#include "detection/detection_types.hpp"
 
 namespace vtes_classifier {
 
@@ -97,6 +99,7 @@ public:
         float ovalRejectForMaster = 0.40f;
         std::string onnxModelPath = "";  // Path to classifier.onnx
         bool useOnnxClassifier = false;  // Enable ONNX classifier for library subtypes
+        InferenceDevice inference_device = InferenceDevice::CPU;
     };
 
     explicit VTESCardClassifier(const Config& config = {}, ContourCallback contourCb = nullptr);
@@ -114,9 +117,8 @@ private:
     Config config_;
     ContourCallback contourCb_;
 
-    // ONNX Runtime for library subtype classification
-    std::unique_ptr<Ort::Session> onnxSession_;
-    std::unique_ptr<Ort::Env> onnxEnv_;
+    // ONNX for library subtype classification
+    mutable cv::dnn::Net onnxNet_;
     std::string onnxInputName_;
     std::vector<int64_t> onnxInputShape_ = {1, 3, 224, 224};
 
@@ -150,8 +152,6 @@ public:
 
 private:
     Config config_;
-    void* session_ = nullptr;  // ONNX Runtime session (opaque)
-    std::string inputName_;
     CardCropExtractor extractor_;
     VTESCardClassifier classifier_;
 

@@ -336,9 +336,6 @@ def train():
         meta_path = os.path.join(args.output_dir, f"embeddings_{safe_name}_meta.json")
 
         # Compute embeddings for all cards of this type
-        ds_eval = PerTypeDataset(args.data, args.vtes_json, card_type, train=False)
-        eval_loader = DataLoader(ds_eval, args.batch_size, shuffle=False,
-                                  num_workers=0, pin_memory=False)
         embedder = None
         try:
             # Create embedder from trained backbone+embedding

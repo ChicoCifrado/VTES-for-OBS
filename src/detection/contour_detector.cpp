@@ -25,10 +25,10 @@ static int compute_block_size(int img_w, int img_h)
     return size;
 }
 
-std::vector<yolov8_obb_cpp::OBBObject> detect_by_contour(
+std::vector<OBBObject> detect_by_contour(
     const cv::Mat& bgr_frame, const ContourParams& params)
 {
-    std::vector<yolov8_obb_cpp::OBBObject> objects;
+    std::vector<OBBObject> objects;
     int w = bgr_frame.cols;
     int h = bgr_frame.rows;
     if (w <= 0 || h <= 0) return objects;
@@ -164,7 +164,7 @@ std::vector<yolov8_obb_cpp::OBBObject> detect_by_contour(
         y1 = std::min((float)(h - 1), y1);
         if (x1 <= x0 || y1 <= y0) continue;
 
-        yolov8_obb_cpp::OBBObject obj;
+        OBBObject obj;
         obj.rect.x = x0;
         obj.rect.y = y0;
         obj.rect.width = x1 - x0;

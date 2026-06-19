@@ -202,9 +202,9 @@ function Invoke-Verify {
     Write-Host ""
     Write-FrameSep
     Write-FrameMid ("  " + $C.BOLD + $C.CRIMSON + "RESUMEN" + $C.RESET)
-    Write-FrameMid ("  " + $C.DIM + $C.SILVER + "Pipeline: YOLO -> Type Classifier -> Per-Type Embedder -> Global Embedder" + $C.RESET)
+    Write-FrameMid ("  " + $C.DIM + $C.SILVER + "Pipeline: YOLO(Ort::Session) -> Type(Ort::Session) -> Per-Type(cv::dnn) -> Global" + $C.RESET)
     Write-FrameMid ("  " + $C.DIM + $C.SILVER + "          -> OCR Fallback (cuando confianza < 80%)" + $C.RESET)
-    Write-FrameMid ("  " + $C.DIM + $C.SILVER + "14 tipos - 4149 cartas - GPU CUDA requerida" + $C.RESET)
+    Write-FrameMid ("  " + $C.DIM + $C.SILVER + "14 tipos - 4149 cartas - GPU CUDA (ORT CUDA provider)" + $C.RESET)
     Write-Host ""
     try {
         $gpu = & nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>$null
@@ -228,7 +228,7 @@ function Invoke-Build {
         Write-Info "Purgando build anterior..."
         Remove-Item -Recurse -Force $SCRIPT:BUILD_DIR
     }
-    $cmakeArgs = @("--preset", "windows-x64", "-DUSE_SYSTEM_OPENCV=ON", "-DOpenCV_DIR=C:/opencv/build")
+    $cmakeArgs = @("--preset", "windows-x64")
     if ($WithTesseract) {
         $cmakeArgs += "-DUSE_SYSTEM_TESSERACT=ON"
         Write-Success "Tesseract OCR: HABILITADO"
@@ -248,6 +248,28 @@ function Invoke-Build {
     cmake --install $SCRIPT:BUILD_DIR --prefix $releaseDir --config $Config
     if ($LASTEXITCODE -ne 0) { Write-Error "Instalacion FALLO"; Pop-Location; return $false }
     Write-Success ("Plugin instalado en: " + $releaseDir)
+    # ── Copy CUDA runtime DLLs to release dir (for NSIS installer) ─
+    $cudaPaths = @(
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin",
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin",
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin",
+        "C:\Program Files\NVIDIA\CUDNN\v9.23\bin\12.9\x64"
+    )
+    $cudaDlls = @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll",
+                  "cufft64_11.dll", "cudnn64_9.dll")
+    $cudaCopied = 0
+    $releasePluginDir = "$releaseDir/obs-plugins/64bit"
+    foreach ($cudaPath in $cudaPaths) {
+        if (-not (Test-Path $cudaPath)) { continue }
+        foreach ($dll in $cudaDlls) {
+            $src = Join-Path $cudaPath $dll
+            if (Test-Path $src) {
+                Copy-Item $src "$releasePluginDir\" -Force -ErrorAction SilentlyContinue
+                $cudaCopied++
+            }
+        }
+    }
+    if ($cudaCopied -gt 0) { Write-Info ("CUDA runtime DLLs: " + $cudaCopied + " copiadas a release") }
     Pop-Location
     return $true
 }
@@ -261,15 +283,18 @@ function Invoke-Deploy {
     Write-Host ""
     $srcDll  = "$SCRIPT:RELEASE_DIR/$Config/obs-plugins/64bit/vtes-card-scanner.dll"
     $srcData = "$SCRIPT:RELEASE_DIR/$Config/data/obs-plugins/vtes-card-scanner"
+    $srcPluginDir = "$SCRIPT:RELEASE_DIR/$Config/obs-plugins/64bit"
     $dstDll  = $SCRIPT:OBS_PLUGIN_DIR
     $dstData = $SCRIPT:OBS_DATA_DIR
     $obsProc = Get-Process -Name "obs64" -ErrorAction SilentlyContinue
     if ($obsProc) { Write-Info "OBS esta ejecutandose - se cerrara..."; Stop-Process -Name "obs64" -Force; Start-Sleep -Seconds 2 }
-    if (Test-Path $srcDll) {
-        if (-not (Test-Path $dstDll)) { New-Item -ItemType Directory -Path $dstDll -Force | Out-Null }
-        Copy-Item $srcDll "$dstDll\" -Force
-        Write-Success ("DLL copiado: " + $srcDll + " -> " + $dstDll)
-    } else { Write-Error "DLL no encontrado en: $srcDll"; Write-Info "Ejecuta BUILD primero"; return $false }
+    if (-not (Test-Path $srcDll)) { Write-Error "DLL no encontrado en: $srcDll"; Write-Info "Ejecuta BUILD primero"; return $false }
+    if (-not (Test-Path $dstDll)) { New-Item -ItemType Directory -Path $dstDll -Force | Out-Null }
+    # ── Copy all DLLs from release dir (plugin + ORT + OpenCV) ─
+    Get-ChildItem "$srcPluginDir\*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
+        Copy-Item $_.FullName "$dstDll\" -Force -ErrorAction SilentlyContinue
+    }
+    Write-Success ("DLLs copiados: " + (Get-ChildItem "$srcPluginDir\*.dll" | Measure-Object | Select-Object -ExpandProperty Count) + " archivos")
     $srcPdb = "$SCRIPT:RELEASE_DIR/$Config/obs-plugins/64bit/vtes-card-scanner.pdb"
     if (Test-Path $srcPdb) { Copy-Item $srcPdb "$dstDll\" -Force }
     if (Test-Path $srcData) {
@@ -277,20 +302,47 @@ function Invoke-Deploy {
         Copy-Item $srcData $dstData -Recurse -Force
         Write-Success ("Data copiada: " + $srcData + " -> " + $dstData)
     } else { Write-Error "Data no encontrada en: $srcData" }
-    $onnxDirs = @("$SCRIPT:BUILD_DIR/_deps/onnxruntime-src/lib", "$SCRIPT:BUILD_DIR/_deps/onnxruntime-src/bin")
-    $copied = 0
-    foreach ($dir in $onnxDirs) {
-        if (Test-Path $dir) {
-            Get-ChildItem "$dir\*.dll" -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne "DirectML.dll" } | ForEach-Object { Copy-Item $_.FullName "$dstDll\" -Force -ErrorAction SilentlyContinue; $copied++ }
+    # ── CUDA Runtime DLLs ─
+    $cudaPaths = @(
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin",
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin",
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin",
+        "C:\Program Files\NVIDIA\CUDNN\v9.23\bin\12.9\x64"
+    )
+    $cudaDlls = @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll",
+                  "cufft64_11.dll", "cudnn64_9.dll")
+    $cudaCopied = 0
+    foreach ($cudaPath in $cudaPaths) {
+        if (-not (Test-Path $cudaPath)) { continue }
+        foreach ($dll in $cudaDlls) {
+            $src = Join-Path $cudaPath $dll
+            if (Test-Path $src) {
+                Copy-Item $src "$dstDll\" -Force -ErrorAction SilentlyContinue
+                $cudaCopied++
+            }
         }
     }
-    if ($copied -gt 0) { Write-Success ("ONNX Runtime DLLs: " + $copied + " copiadas") }
-    # DirectML.dll ships with Windows 10 1903+ — only copy if system has it
+    if ($cudaCopied -gt 0) {
+        Write-Success ("CUDA runtime DLLs: " + $cudaCopied + " copiadas a obs-plugins/64bit")
+        # Also copy to OBS bin/64bit/ so ORT provider can find them via LoadLibrary
+        $obsBin = "C:\Program Files\obs-studio\bin\64bit"
+        if (Test-Path $obsBin) {
+            foreach ($cudaPath in $cudaPaths) {
+                if (-not (Test-Path $cudaPath)) { continue }
+                foreach ($dll in $cudaDlls) {
+                    $src = Join-Path $cudaPath $dll
+                    if (Test-Path $src) {
+                        Copy-Item $src "$obsBin\" -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+            Write-Info "CUDA DLLs tambien copiadas a $obsBin"
+        }
+    }
+    # DirectML.dll ships with Windows 10 1903+ — copy as DirectML fallback
     $sysDml = "$env:SystemRoot\System32\DirectML.dll"
-    if (Test-Path $sysDml) { Copy-Item $sysDml "$dstDll\" -Force -ErrorAction SilentlyContinue; Write-Success "DirectML.dll: copiada desde System32" }
-    $cvDll = Get-ChildItem "C:\opencv\build\x64\vc16\bin\opencv_world5*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $cvDll) { $cvDll = Get-ChildItem "C:\opencv\build\x64\vc16\bin\opencv_world4*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1 }
-    if ($cvDll) { Copy-Item $cvDll.FullName "$dstDll\" -Force; Write-Success ("OpenCV DLL: " + $cvDll.Name) }
+    if (Test-Path $sysDml) { Copy-Item $sysDml "$dstDll\" -Force -ErrorAction SilentlyContinue; Write-Info "DirectML.dll: disponible como fallback" }
+    # OpenCV DLLs ya instalados por cmake --install en release dir
     Write-Host ""
     Write-Success "Invocacion completa. Abriendo OBS..."
     $obsExe = "C:\Program Files\obs-studio\bin\64bit\obs64.exe"
@@ -322,7 +374,7 @@ function Invoke-CopyPerType {
                 $f = $f.Trim()
                 if ([string]::IsNullOrWhiteSpace($f)) { continue }
                 Write-Info ("Copiando: " + (Split-Path -Leaf $f))
-                bash -c "cp \`"$f\`" ~/windows/C/.../" 2>$null
+                & wsl cp "$f" "$(wslpath "$SCRIPT:PER_TYPE_DIR")/" 2>$null
                 $count++
             }
         }
@@ -433,12 +485,17 @@ Section "ONNX Runtime" SEC_ONNX
   SetOutPath "$INSTDIR\obs-plugins\64bit"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime_providers_shared.dll"
-  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\DirectML.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime_providers_cuda.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cudart64_12.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cublas64_12.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cublasLt64_12.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cufft64_11.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cudnn64_9.dll"
 SectionEnd
 Section "OpenCV Runtime" SEC_OPENCV
   SectionIn RO
   SetOutPath "$INSTDIR\obs-plugins\64bit"
-  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\opencv_world*.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\opencv_*.dll"
 SectionEnd
 Section -Post
   WriteUninstaller "$INSTDIR\obs-plugins\64bit\uninstall-vtes-card-scanner.exe"
@@ -452,8 +509,13 @@ Section Uninstall
   Delete "$INSTDIR\obs-plugins\64bit\vtes-card-scanner.pdb"
   Delete "$INSTDIR\obs-plugins\64bit\onnxruntime.dll"
   Delete "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_shared.dll"
-  Delete "$INSTDIR\obs-plugins\64bit\DirectML.dll"
-  Delete "$INSTDIR\obs-plugins\64bit\opencv_world*.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_cuda.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\cudart64_12.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\cublas64_12.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\cublasLt64_12.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\cufft64_11.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\cudnn64_9.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\opencv_*.dll"
   RMDir /r "$INSTDIR\data\obs-plugins\vtes-card-scanner"
   Delete "$INSTDIR\obs-plugins\64bit\uninstall-vtes-card-scanner.exe"
   DeleteRegKey HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner"

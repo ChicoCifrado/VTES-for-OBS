@@ -7,6 +7,10 @@ const char *const USEGPU_DML = "dml";
 const char *const USEGPU_TENSORRT = "tensorrt";
 const char *const USEGPU_COREML = "coreml";
 
+const char *const INFERENCE_CPU = "cpu";
+const char *const INFERENCE_CUDA = "cuda";
+const char *const INFERENCE_DML = "directml";
+
 const char *const KAWASE_BLUR_EFFECT_PATH = "effects/kawase_blur.effect";
 const char *const MASKING_EFFECT_PATH = "effects/masking.effect";
 

@@ -40,11 +40,17 @@ public:
 
 #ifdef _WIN32
         WSADATA wsa;
-        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return false;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            blog(LOG_ERROR, "[WebServer] WSAStartup failed");
+            return false;
+        }
 #endif
 
         sock_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock_ == INVALID_SOCKET) return false;
+        if (sock_ == INVALID_SOCKET) {
+            blog(LOG_ERROR, "[WebServer] socket() failed");
+            return false;
+        }
 
         int opt = 1;
         setsockopt(sock_, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
@@ -56,16 +62,19 @@ public:
         addr.sin_addr.s_addr = INADDR_ANY;
 
         if (bind(sock_, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+            blog(LOG_ERROR, "[WebServer] bind() failed on port %d", port);
             closesocket(sock_); sock_ = INVALID_SOCKET;
             return false;
         }
         if (listen(sock_, 5) != 0) {
+            blog(LOG_ERROR, "[WebServer] listen() failed on port %d", port);
             closesocket(sock_); sock_ = INVALID_SOCKET;
             return false;
         }
 
         running_ = true;
         thread_ = std::thread([this]() { acceptLoop(); });
+        blog(LOG_INFO, "[WebServer] Started on port %d", port);
         return true;
     }
 

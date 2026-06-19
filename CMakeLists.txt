@@ -44,33 +44,6 @@ if(ENABLE_QT)
                AUTORCC ON)
 endif()
 
-set(USE_SYSTEM_ONNXRUNTIME
-    OFF
-    CACHE STRING "Use system ONNX Runtime")
-
-set(DISABLE_ONNXRUNTIME_GPU
-    OFF
-    CACHE STRING "Disables GPU support of ONNX Runtime (Only valid on Linux)")
-
-if(DISABLE_ONNXRUNTIME_GPU)
-  target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE DISABLE_ONNXRUNTIME_GPU)
-endif()
-
-if(USE_SYSTEM_ONNXRUNTIME)
-  if(OS_LINUX)
-    find_package(Onnxruntime 1.16.3 REQUIRED)
-    set(Onnxruntime_INCLUDE_PATH
-        ${Onnxruntime_INCLUDE_DIR} ${Onnxruntime_INCLUDE_DIR}/onnxruntime
-        ${Onnxruntime_INCLUDE_DIR}/onnxruntime/core/session ${Onnxruntime_INCLUDE_DIR}/onnxruntime/core/providers/cpu)
-    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE "${Onnxruntime_LIBRARIES}")
-    target_include_directories(${CMAKE_PROJECT_NAME} SYSTEM PUBLIC "${Onnxruntime_INCLUDE_PATH}")
-  else()
-    message(FATAL_ERROR "System ONNX Runtime is only supported on Linux!")
-  endif()
-else()
-  include(cmake/FetchOnnxruntime.cmake)
-endif()
-
 set(USE_SYSTEM_OPENCV
     OFF
     CACHE STRING "Use system OpenCV")
@@ -103,10 +76,39 @@ endif()
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE vendor)
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE src)
 
+# ─── ONNX Runtime (for YOLO model — OpenCV DNN parser doesn't support dynamic reshape) ─
+if(NOT USE_SYSTEM_OPENCV AND DEFINED opencv_BINARY_DIR)
+    set(_ort_root "${opencv_BINARY_DIR}/3rdparty/onnxruntime")
+    file(GLOB _ort_dirs "${_ort_root}/*")
+    if(_ort_dirs)
+        list(SORT _ort_dirs)
+        list(GET _ort_dirs -1 _ort_dir)
+        target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${_ort_dir}/include")
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE "${_ort_dir}/lib/onnxruntime.lib")
+        message(STATUS "ORT found: ${_ort_dir}")
+        # Install ORT DLLs alongside the plugin
+        install(FILES "${_ort_dir}/lib/onnxruntime.dll"
+                      "${_ort_dir}/lib/onnxruntime_providers_shared.dll"
+                DESTINATION "obs-plugins/64bit")
+        if(EXISTS "${_ort_dir}/lib/onnxruntime_providers_cuda.dll")
+            install(FILES "${_ort_dir}/lib/onnxruntime_providers_cuda.dll"
+                    DESTINATION "obs-plugins/64bit")
+        endif()
+    else()
+        message(WARNING "ORT directory not found under ${_ort_root}")
+    endif()
+    unset(_ort_root)
+    unset(_ort_dirs)
+endif()
+
 # cpp-httplib needs WinSock on Windows; NO OpenSSL (leave CPPHTTPLIB_OPENSSL_SUPPORT undefined)
 if(WIN32)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32)
 endif()
+
+# libcurl for OCR API lookup
+find_package(CURL REQUIRED)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE CURL::libcurl)
 
 # Link plugin-support for version constants and include propagation
 if(TARGET plugin-support)
@@ -126,23 +128,20 @@ if(USE_SYSTEM_TESSERACT)
   endif()
 endif()
 
-# ===== YOLO26 ACTIVE =====
+# ===== OpenCV DNN backend (ONNX models via cv::dnn::Net) =====
 target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE src/plugin-main.c
-          src/detect-filter.cpp
-          src/detect-filter-info.c
           src/detect-filter-obb.cpp
           src/detect-filter-obb-info.c
           src/detect-filter-utils.cpp
           src/obs-utils/obs-utils.cpp
-          src/ort-model/ONNXRuntimeModel.cpp
-          src/yolov8/yolov8_onnxruntime.cpp
-          src/yolov8/yolov8_obb_yolo26.cpp   # YOLO26 one-to-one (300 detections, NMS-free, shape [1,300,7])
-          src/detection/contour_detector.cpp   # Contour-based card detection (no ML)
+          src/detection/yolo_detector.cpp
+          src/detection/contour_detector.cpp
           src/sort/Sort.cpp
           src/classifier/vtes_card_classifier.cpp
-          src/ocr/vtes_ocr.cpp)
+          src/ocr/vtes_ocr.cpp
+          src/ocr/vtes_api_lookup.cpp)
 
 # Configure plugin target properties (install, resources, etc.)
 set_target_properties_plugin(${CMAKE_PROJECT_NAME})

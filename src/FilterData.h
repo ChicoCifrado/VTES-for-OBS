@@ -2,7 +2,9 @@
 #define FILTERDATA_H
 
 #include <obs-module.h>
-#include "ort-model/ONNXRuntimeModel.h"
+#include <opencv2/dnn.hpp>
+#include <onnxruntime_cxx_api.h>
+#include "detection/yolo_detector.hpp"
 #include "sort/Sort.h"
 #include "ws-client.h"
 #include "classifier/vtes_card_classifier.hpp"
@@ -38,7 +40,8 @@ struct CardInfo {
   * Base data for ORT filters + VTES-specific fields.
 */
 struct filter_data {
-	std::string useGPU;
+	std::string inference_device;
+	InferenceDevice inference_device_enum = InferenceDevice::CPU;
 	uint32_t numThreads;
 	float conf_threshold;
 	std::string modelSize;
@@ -84,7 +87,7 @@ struct filter_data {
 	std::mutex outputLock;
 	std::mutex modelMutex;
 
-	std::unique_ptr<ONNXRuntimeModel> onnxruntimemodel;
+	std::unique_ptr<vtes_detection::YOLODetector> yolo_detector;
 	std::vector<std::string> classNames;
 
 #if _WIN32
@@ -143,8 +146,8 @@ struct filter_data {
 	int temporal_min_stable = 3;          // require 3 consecutive detections
 
 	// --- Vision-based type classifier (vtes_type_classifier.onnx) ---
+	Ort::Env type_classifier_env{ORT_LOGGING_LEVEL_WARNING, "type-classifier"};
 	std::unique_ptr<Ort::Session> type_classifier_session;
-	Ort::Env type_classifier_env{ OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, "vtes-type-clf" };
 	std::vector<std::string> type_labels;  // from type_labels.json
 
 	// --- VTES Card Database (vtes.json in memory) ---

@@ -5,7 +5,7 @@
 #include <opencv2/imgproc.hpp>
 #include <vector>
 
-#include "yolov8/yolov8_obb_onnxruntime.hpp"
+#include "yolo_detector.hpp"
 
 namespace vtes_detection {
 
@@ -34,7 +34,7 @@ struct ContourCandidate {
     double aspect_ratio;
 };
 
-std::vector<yolov8_obb_cpp::OBBObject> detect_by_contour(
+std::vector<OBBObject> detect_by_contour(
     const cv::Mat& bgr_frame, const ContourParams& params);
 
 } // namespace vtes_detection

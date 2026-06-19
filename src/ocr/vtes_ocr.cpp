@@ -1,4 +1,5 @@
 #include "vtes_ocr.hpp"
+#include "vtes_api_lookup.hpp"
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
 #include <cctype>
@@ -98,7 +99,18 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
 
     if (ocr_text.empty()) return false;
 
-    // 4. Fuzzy match against card names
+    // 4. Try API lookup against local VTES API first
+    {
+        CardLookupResult api_result = lookup_card_by_ocr(ocr_text);
+        if (!api_result.printed_name.empty()) {
+            out_name = api_result.printed_name;
+            out_id = std::to_string(api_result.id);
+            out_confidence = 0.95f;
+            return true;
+        }
+    }
+
+    // 5. Fallback: fuzzy match against local card names
     auto [matched_id, matched_name, score] = fuzzyMatch(ocr_text);
     if (score < 0.3f) return false;
 

@@ -7,20 +7,21 @@
 #include <cmath>
 #include <algorithm>
 #include <unordered_map>
-#include <onnxruntime_cxx_api.h>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/dnn.hpp>
 #include <nlohmann/json.hpp>
+
+#include "detection/detection_types.hpp"
 
 class EmbeddingMatcher {
 public:
     EmbeddingMatcher()
-        : env_(OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, "vtes-embedding"),
-          threshold_(0.35f), embedding_dim_(0), num_cards_(0) {}
+        : threshold_(0.35f), embedding_dim_(0), num_cards_(0),
+          inference_device_(InferenceDevice::CPU) {}
 
-    // After load(), call this to enable type-based candidate filtering.
-    // Maps each embedding entry (by index) to its vtes.json type(s).
-    // `type_by_id` maps card_id → list of type strings (e.g. ["Vampire"])
+    void set_inference_device(InferenceDevice dev) { inference_device_ = dev; }
+
     void set_card_types(const std::unordered_map<std::string, std::vector<std::string>>& type_by_id) {
         card_types_.clear();
         card_types_.reserve(card_ids_.size());
@@ -29,7 +30,7 @@ public:
             if (it != type_by_id.end())
                 card_types_.push_back(it->second);
             else
-                card_types_.push_back({}); // unknown types — never filtered out
+                card_types_.push_back({});
         }
     }
 
@@ -39,19 +40,15 @@ public:
     {
         // 1. Load ONNX model
         try {
-            Ort::SessionOptions opts;
-            opts.SetIntraOpNumThreads(1);
-            opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
-#ifdef _WIN32
-            // Convert UTF-8 to wstring for Windows
-            int wlen = MultiByteToWideChar(CP_UTF8, 0, onnx_path.c_str(), -1, nullptr, 0);
-            std::wstring wpath(wlen, L'\0');
-            MultiByteToWideChar(CP_UTF8, 0, onnx_path.c_str(), -1, wpath.data(), wlen);
-            session_ = std::make_unique<Ort::Session>(env_, wpath.c_str(), opts);
-#else
-            session_ = std::make_unique<Ort::Session>(env_, onnx_path.c_str(), opts);
-#endif
-        } catch (const Ort::Exception& e) {
+            net_ = cv::dnn::readNetFromONNX(onnx_path);
+            if (net_.empty()) {
+                fprintf(stderr, "[EmbeddingMatcher] Failed to load ONNX model: %s\n", onnx_path.c_str());
+                return false;
+            }
+
+            net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+            net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+        } catch (const std::exception& e) {
             fprintf(stderr, "[EmbeddingMatcher] Failed to load ONNX model: %s\n", e.what());
             return false;
         }
@@ -130,7 +127,7 @@ public:
         out_id.clear();
         out_confidence = 0.0f;
 
-        if (!session_ || num_cards_ == 0) return false;
+        if (net_.empty() || num_cards_ == 0) return false;
 
         // 1. Preprocess card image
         std::vector<float> query_emb = compute_embedding(card_bgr);
@@ -146,7 +143,6 @@ public:
         const float* index_data = embeddings_.data();
 
         for (int i = 0; i < num_cards_; i++) {
-            // Skip non-matching types when filter is active
             if (has_filter) {
                 const auto& types = (i < (int)card_types_.size()) ? card_types_[i] : empty_types_;
                 bool type_match = false;
@@ -154,7 +150,6 @@ public:
                     if (t == type_filter) { type_match = true; break; }
                 }
                 if (!type_match) {
-                    // Still track best fallback (non-filtered) for later
                     float dot = 0.0f;
                     for (int j = 0; j < embedding_dim_; j++)
                         dot += query_emb[j] * index_data[i * embedding_dim_ + j];
@@ -173,7 +168,6 @@ public:
             }
         }
 
-        // If filter is active and we found a good match within the type, use it
         if (has_filter && best_idx >= 0 && best_sim >= threshold_ * 0.5f) {
             out_name = card_names_[best_idx];
             out_id = card_ids_[best_idx];
@@ -182,13 +176,11 @@ public:
             if (best_sim >= threshold_ * 0.5f) return true;
         }
 
-        // Fallback: if no good type-filtered match, or no filter, use the global best
         if (fallback_idx >= 0 && fallback_sim > best_sim) {
             best_sim = fallback_sim;
             best_idx = fallback_idx;
         }
 
-        // If filter was set but no good type match, also try unfiltered
         if (has_filter && (best_idx < 0 || best_sim < threshold_ * 0.5f)) {
             for (int i = 0; i < num_cards_; i++) {
                 float dot = 0.0f;
@@ -213,84 +205,55 @@ public:
         return false;
     }
 
-    bool is_loaded() const { return session_ != nullptr; }
+    bool is_loaded() const { return !net_.empty(); }
     int num_cards() const { return num_cards_; }
     int embedding_dim() const { return embedding_dim_; }
     float threshold() const { return threshold_; }
     void set_threshold(float t) { threshold_ = t; }
 
 private:
-    Ort::Env env_;
-    std::unique_ptr<Ort::Session> session_;
+    cv::dnn::Net net_;
     std::vector<float> embeddings_;
     std::vector<std::string> card_names_;
     std::vector<std::string> card_ids_;
-    std::vector<std::vector<std::string>> card_types_;  // parallel to card_ids_
-    std::vector<std::string> empty_types_;              // const ref for cards w/o type info
+    std::vector<std::vector<std::string>> card_types_;
+    std::vector<std::string> empty_types_;
     float threshold_;
     int embedding_dim_;
+    InferenceDevice inference_device_;
     int num_cards_;
 
     std::vector<float> compute_embedding(const cv::Mat& bgr)
     {
         if (bgr.empty()) return {};
 
-        // Resize to 224x224
         cv::Mat resized;
         cv::resize(bgr, resized, cv::Size(224, 224), 0, 0, cv::INTER_LINEAR);
 
-        // Convert to float and normalize
-        cv::Mat float_img;
-        resized.convertTo(float_img, CV_32FC3, 1.0 / 255.0);
+        // NCHW blob, RGB channel order, pixel values in [0,1]
+        cv::Mat blob = cv::dnn::blobFromImage(resized, 1.0 / 255.0, cv::Size(224, 224),
+                                               cv::Scalar(), true, false);
 
-        // ImageNet normalization
+        // Apply ImageNet normalization per channel: (x - mean) / std
         static const float mean[] = {0.485f, 0.456f, 0.406f};
-        static const float std[] = {0.229f, 0.224f, 0.225f};
-
-        // Prepare input blob: NCHW format
-        std::vector<float> input_tensor(1 * 3 * 224 * 224);
-        for (int y = 0; y < 224; y++) {
-            for (int x = 0; x < 224; x++) {
-                cv::Vec3f pixel = float_img.at<cv::Vec3f>(y, x);
-                // OpenCV is BGR, model expects RGB
-                input_tensor[0 * 224 * 224 + y * 224 + x] = (pixel[2] - mean[0]) / std[0];  // R
-                input_tensor[1 * 224 * 224 + y * 224 + x] = (pixel[1] - mean[1]) / std[1];  // G
-                input_tensor[2 * 224 * 224 + y * 224 + x] = (pixel[0] - mean[2]) / std[2];  // B
+        static const float stdv[] = {0.229f, 0.224f, 0.225f};
+        float* data = blob.ptr<float>();
+        size_t ch_size = 224 * 224;
+        for (int c = 0; c < 3; c++) {
+            for (size_t i = 0; i < ch_size; i++) {
+                data[c * ch_size + i] = (data[c * ch_size + i] - mean[c]) / stdv[c];
             }
         }
 
-        // Run inference
         try {
-            Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
-                OrtArenaAllocator, OrtMemTypeDefault);
+            net_.setInput(blob);
+            cv::Mat output = net_.forward();
 
-            std::vector<int64_t> input_shape = {1, 3, 224, 224};
-            Ort::Value input_val = Ort::Value::CreateTensor<float>(
-                mem_info, input_tensor.data(), input_tensor.size(),
-                input_shape.data(), input_shape.size());
+            if (output.empty()) return {};
 
-            const char* input_name = "input";
-            const char* output_name = "embedding";
-            Ort::AllocatorWithDefaultOptions allocator;
+            float* output_data = output.ptr<float>();
+            size_t output_size = output.total();
 
-            // Get actual input/output names from the model
-            Ort::AllocatedStringPtr in_name_ptr = session_->GetInputNameAllocated(0, allocator);
-            Ort::AllocatedStringPtr out_name_ptr = session_->GetOutputNameAllocated(0, allocator);
-            const char* actual_in = in_name_ptr.get();
-            const char* actual_out = out_name_ptr.get();
-
-            std::vector<Ort::Value> output = session_->Run(
-                Ort::RunOptions{nullptr},
-                &actual_in, &input_val, 1,
-                &actual_out, 1);
-
-            if (output.empty() || !output[0].IsTensor()) return {};
-
-            float* output_data = output[0].GetTensorMutableData<float>();
-            Ort::TensorTypeAndShapeInfo shape_info = output[0].GetTensorTypeAndShapeInfo();
-            size_t output_size = shape_info.GetElementCount();
-
-            // L2-normalize the output
             float norm = 0.0f;
             for (size_t i = 0; i < output_size; i++) norm += output_data[i] * output_data[i];
             norm = std::sqrt(norm);
@@ -300,7 +263,7 @@ private:
             for (size_t i = 0; i < output_size; i++) embedding[i] = output_data[i] / norm;
 
             return embedding;
-        } catch (const Ort::Exception& e) {
+        } catch (const std::exception& e) {
             fprintf(stderr, "[EmbeddingMatcher] Inference error: %s\n", e.what());
             return {};
         }

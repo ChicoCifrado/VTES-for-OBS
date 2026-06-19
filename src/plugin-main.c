@@ -18,6 +18,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <obs-module.h>
 #include <plugin-support.h>
+#include <curl/curl.h>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
@@ -27,12 +28,12 @@ MODULE_EXPORT const char *obs_module_description(void)
 	return obs_module_text("DetectFilterPlugin");
 }
 
-extern struct obs_source_info detect_filter_info;
 extern struct obs_source_info detect_filter_obb_info;
 
 bool obs_module_load(void)
 {
-	obs_register_source(&detect_filter_info);
+	curl_global_init(CURL_GLOBAL_DEFAULT);
+
 	obs_register_source(&detect_filter_obb_info);
 	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
 	return true;
@@ -40,5 +41,6 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+	curl_global_cleanup();
 	obs_log(LOG_INFO, "plugin unloaded");
 }

@@ -5,7 +5,7 @@
 #include <opencv2/video/tracking.hpp>
 #include <vector>
 
-#include "ort-model/types.hpp"
+#include "detection/detection_types.hpp"
 
 class Sort {
 public:

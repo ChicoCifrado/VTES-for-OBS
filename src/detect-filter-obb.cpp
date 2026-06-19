@@ -1,7 +1,5 @@
 #include "detect-filter-obb.h"
 
-#include <onnxruntime_cxx_api.h>
-
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -13,6 +11,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/geometry.hpp>
+#include <opencv2/dnn.hpp>
 
 static constexpr float kPI = 3.14159265358979323846f;
 
@@ -30,19 +29,25 @@ static constexpr float kPI = 3.14159265358979323846f;
 #include <cmath>
 
 #include <nlohmann/json.hpp>
+#include <curl/curl.h>
 
 #include <plugin-support.h>
 #include "FilterData.h"
 #include "consts.h"
 #include "obs-utils/obs-utils.h"
-#include "ort-model/utils.hpp"
 #include "detect-filter-utils.h"
-#include "yolov8/yolov8_obb_onnxruntime.hpp"
+#include "detection/yolo_detector.hpp"
 #include "detection/contour_detector.hpp"
 #include "classifier/vtes_card_classifier.hpp"
 #include "base64-utils.h"
 
 #define VTES_OBB_MODEL "!!!VTES_OBB_MODEL!!!"
+
+static InferenceDevice deviceStringToEnum(const std::string& s) {
+    if (s == INFERENCE_CUDA || s == "cuda") return InferenceDevice::CUDA;
+    if (s == INFERENCE_DML || s == "dml") return InferenceDevice::DirectML;
+    return InferenceDevice::CPU;
+}
 
 static const char *DETECT_MODE_CONTOUR = "contour";
 static const char *DETECT_MODE_ONNX = "onnx";
@@ -133,7 +138,6 @@ static void loadVisionTypeClassifier(struct filter_data *tf)
 		return;
 	}
 
-	// Load ONNX (Windows needs wchar_t* for UTF-16 paths)
 	try {
 		Ort::SessionOptions opts;
 		opts.SetIntraOpNumThreads(1);
@@ -215,8 +219,24 @@ static std::string runVisionTypeClassifier(struct filter_data *tf, const cv::Mat
 		auto shape_info = output[0].GetTensorTypeAndShapeInfo();
 		size_t num_classes = shape_info.GetElementCount();
 
+		if (num_classes == 0) return "";
+		if (num_classes > tf->type_labels.size())
+			num_classes = tf->type_labels.size();
+
+		// Debug log for first few inferences
+		static std::once_flag flag;
+		std::call_once(flag, [&]() {
+			std::string s;
+			for (size_t i = 0; i < num_classes; i++) {
+				if (i) s += " ";
+				s += tf->type_labels[i].substr(0, 6) + "=" +
+				     std::to_string(logits[i]);
+			}
+			obs_log(LOG_INFO, "[VisionClassifier] First inference logits: %s", s.c_str());
+		});
+
 		int best = 0;
-		for (size_t i = 1; i < num_classes && i < tf->type_labels.size(); i++) {
+		for (size_t i = 1; i < num_classes; i++) {
 			if (logits[i] > logits[best]) best = (int)i;
 		}
 
@@ -293,6 +313,7 @@ static void loadPerTypeEmbedders(struct filter_data *tf)
 		}
 
 		auto matcher = std::make_unique<EmbeddingMatcher>();
+		matcher->set_inference_device(tf->inference_device_enum);
 		bool ok = matcher->load(onnx_path, index_path, meta_path);
 
 		bfree(onnx_path);
@@ -391,7 +412,88 @@ static void initOcrReader(struct filter_data *tf)
     }
 }
 
+// ─── Download a file via HTTP GET (libcurl, required dep) ─────────────
+
+static size_t write_cb(char* ptr, size_t size, size_t nmemb, FILE* fp) {
+    return fwrite(ptr, size, nmemb, fp);
+}
+
+static bool downloadFile(const std::string& url, const std::string& dest) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+    FILE* fp = fopen(dest.c_str(), "wb");
+    if (!fp) { curl_easy_cleanup(curl); return false; }
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 30000L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    CURLcode res = curl_easy_perform(curl);
+    fclose(fp);
+    curl_easy_cleanup(curl);
+    if (res != CURLE_OK) { remove(dest.c_str()); return false; }
+    return true;
+}
+
 // ─── Card info loader (byId section from card-hash-index.json + vtes.json) ─
+
+static void loadVtesJson(struct filter_data *tf)
+{
+	if (!tf->vtes_db.is_empty()) return;
+
+	const char* krcg_url = "https://static.krcg.org/data/vtes.json";
+
+	// 1. Try plugin data directory (bundled install)
+	char* data_path = obs_module_file("vtes.json");
+	if (data_path) {
+		if (tf->vtes_db.load(data_path)) {
+			obs_log(LOG_INFO, "[VTES] Loaded %zu cards from %s", tf->vtes_db.size(), data_path);
+			bfree(data_path);
+			return;
+		}
+		bfree(data_path);
+	}
+
+	// 2. Try plugin config directory (previously downloaded)
+	char* config_dir = obs_module_config_path("");
+	if (config_dir) {
+		std::string config_vtes = std::string(config_dir) + "vtes.json";
+		bfree(config_dir);
+		if (!config_vtes.empty()) {
+			std::ifstream test(config_vtes);
+			if (test.good()) {
+				test.close();
+				if (tf->vtes_db.load(config_vtes)) {
+					obs_log(LOG_INFO, "[VTES] Loaded %zu cards from cached %s",
+						tf->vtes_db.size(), config_vtes.c_str());
+					return;
+				}
+			}
+		}
+	}
+
+	// 3. Download from krcg.org to config directory
+	obs_log(LOG_INFO, "[VTES] Downloading vtes.json from %s ...", krcg_url);
+	char* cfg_dir = obs_module_config_path("");
+	if (!cfg_dir) {
+		obs_log(LOG_WARNING, "[VTES] Cannot get config dir — vtes_db stays empty");
+		return;
+	}
+	std::string dest = std::string(cfg_dir) + "vtes.json";
+	bfree(cfg_dir);
+	if (downloadFile(krcg_url, dest)) {
+		if (tf->vtes_db.load(dest)) {
+			obs_log(LOG_INFO, "[VTES] Downloaded & loaded %zu cards from krcg.org",
+				tf->vtes_db.size());
+			return;
+		}
+		remove(dest.c_str());
+		obs_log(LOG_WARNING, "[VTES] Downloaded vtes.json but failed to parse");
+	} else {
+		obs_log(LOG_WARNING, "[VTES] Failed to download vtes.json from krcg.org");
+	}
+}
 
 static bool loadCardInfo(struct filter_data *tf)
 {
@@ -434,20 +536,8 @@ static bool loadCardInfo(struct filter_data *tf)
 		}
 	}
 
-	// 2. Load vtes.json into the full card database for type-based filtering
-	// (set_card_types is called after embedder loads, see detect_filter_obb_create)
-	char *vtesJsonPath = obs_module_file("vtes.json");
-	if (vtesJsonPath) {
-		bool loaded = tf->vtes_db.load(vtesJsonPath);
-		bfree(vtesJsonPath);
-		if (loaded) {
-			obs_log(LOG_INFO, "Loaded %zu cards from vtes.json", tf->vtes_db.size());
-		} else {
-			obs_log(LOG_WARNING, "Failed to load vtes.json");
-		}
-	} else {
-		obs_log(LOG_WARNING, "vtes.json not found in plugin data directory");
-	}
+	// 2. Load vtes.json into the full card database (local → download fallback)
+	loadVtesJson(tf);
 
 	return !tf->card_info_by_id.empty();
 }
@@ -456,8 +546,8 @@ static bool loadCardInfo(struct filter_data *tf)
 
 static void updateTemporalTracks(
 	struct filter_data *tf,
-	const std::vector<yolov8_obb_cpp::OBBObject>& current_detections,
-	std::vector<yolov8_obb_cpp::OBBObject>& output_objects)
+	const std::vector<vtes_detection::OBBObject>& current_detections,
+	std::vector<vtes_detection::OBBObject>& output_objects)
 {
 	output_objects.clear();
 
@@ -559,7 +649,7 @@ static void updateTemporalTracks(
 
 		if (track.stable_count >= tf->temporal_min_stable &&
 		    track.confidence >= tf->temporal_min_confidence) {
-			yolov8_obb_cpp::OBBObject obj;
+			vtes_detection::OBBObject obj;
 			obj.rect.x = track.avg_cx - track.avg_w / 2;
 			obj.rect.y = track.avg_cy - track.avg_h / 2;
 			obj.rect.width = track.avg_w;
@@ -606,14 +696,14 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	obs_property_list_add_string(p_det_mode, obs_module_text("Shape (Contour)"), DETECT_MODE_CONTOUR);
 	obs_property_list_add_string(p_det_mode, obs_module_text("AI Model (ONNX)"), DETECT_MODE_ONNX);
 
-	obs_property_t *p_use_gpu =
-		obs_properties_add_list(props, "useGPU", obs_module_text("InferenceDevice"),
+	obs_property_t *p_inf_dev =
+		obs_properties_add_list(props, "inference_device", obs_module_text("InferenceDevice"),
 				OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 
-	obs_property_list_add_string(p_use_gpu, obs_module_text("CPU"), USEGPU_CPU);
+	obs_property_list_add_string(p_inf_dev, obs_module_text("CPU"), INFERENCE_CPU);
 #if _WIN32
-	obs_property_list_add_string(p_use_gpu, obs_module_text("GPU (DirectML)"), USEGPU_DML);
-	obs_property_list_add_string(p_use_gpu, obs_module_text("GPU (CUDA)"), USEGPU_CUDA);
+	obs_property_list_add_string(p_inf_dev, obs_module_text("GPU (DirectML)"), INFERENCE_DML);
+	obs_property_list_add_string(p_inf_dev, obs_module_text("GPU (CUDA)"), INFERENCE_CUDA);
 #endif
 
 	// --- Card Type Classifier (for type-based embedding filter) ---
@@ -673,9 +763,9 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 void detect_filter_obb_defaults(obs_data_t *settings)
 {
 #if _WIN32
-	obs_data_set_default_string(settings, "useGPU", USEGPU_DML);
+	obs_data_set_default_string(settings, "inference_device", INFERENCE_DML);
 #else
-	obs_data_set_default_string(settings, "useGPU", USEGPU_CPU);
+	obs_data_set_default_string(settings, "inference_device", INFERENCE_CPU);
 #endif
 	obs_data_set_default_bool(settings, "sort_tracking", false);
 	obs_data_set_default_bool(settings, "preview", true);
@@ -757,6 +847,7 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		char *metaPath = obs_module_file("embeddings_1024d_meta.json");
 		if (modelPath && binPath && metaPath) {
 			obs_log(LOG_INFO, "[Embedding] Loading model: %s", modelPath);
+			tf->embedder.set_inference_device(tf->inference_device_enum);
 			tf->embedder.load(modelPath, binPath, metaPath);
 		}
 		bfree(modelPath);
@@ -784,6 +875,7 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 	// Classifier
 	tf->classifier_enabled = obs_data_get_bool(settings, "classifier_enabled");
 	if (tf->classifier_enabled) {
+		tf->classifierConfig.inference_device = tf->inference_device_enum;
 		tf->classifierConfig.ovalWeight = (float)obs_data_get_double(settings, "clf_oval_weight");
 		tf->classifierConfig.colorWeight = (float)obs_data_get_double(settings, "clf_color_weight");
 		tf->classifierConfig.contourWeight = (float)obs_data_get_double(settings, "clf_contour_weight");
@@ -809,8 +901,8 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 
 	if (tf->detectionMode == DETECT_MODE_CONTOUR) {
 		std::unique_lock<std::mutex> lock(tf->modelMutex);
-		if (tf->onnxruntimemodel) {
-			tf->onnxruntimemodel.reset();
+		if (tf->yolo_detector) {
+			tf->yolo_detector.reset();
 			obs_log(LOG_INFO, "Contour mode: ONNX model released");
 		}
 		tf->isDisabled = false;
@@ -819,11 +911,11 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 	}
 
 	// ONNX mode
-	const std::string newUseGpu = obs_data_get_string(settings, "useGPU");
+	const std::string newInfDev = obs_data_get_string(settings, "inference_device");
 	const uint32_t newNumThreads = (uint32_t)obs_data_get_int(settings, "numThreads");
 
 	bool reinitialize = modeChanged;
-	if (tf->useGPU != newUseGpu || tf->numThreads != newNumThreads) {
+	if (tf->inference_device != newInfDev || tf->numThreads != newNumThreads) {
 		reinitialize = true;
 	}
 
@@ -840,34 +932,25 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 			return;
 		}
 
-#if _WIN32
-		int outLength = MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, modelFilepath_rawPtr,
-						    -1, nullptr, 0);
-		tf->modelFilepath = std::wstring(outLength, L'\0');
-		MultiByteToWideChar(CP_ACP, MB_PRECOMPOSED, modelFilepath_rawPtr, -1,
-				    tf->modelFilepath.data(), outLength);
-#else
-		tf->modelFilepath = std::string(modelFilepath_rawPtr);
-#endif
+		std::string model_path(modelFilepath_rawPtr);
 		bfree(modelFilepath_rawPtr);
 
-		tf->useGPU = newUseGpu;
+		tf->inference_device = newInfDev;
+		tf->inference_device_enum = deviceStringToEnum(newInfDev);
 		tf->numThreads = newNumThreads;
 
 		int onnxruntime_device_id_ = 0;
-		bool onnxruntime_use_parallel_ = true;
-		float nms_th_ = 0.45f;
-		int num_classes_ = 1;
 
 		try {
-			if (tf->onnxruntimemodel) {
-				tf->onnxruntimemodel.reset();
+			if (tf->yolo_detector) {
+				tf->yolo_detector.reset();
 			}
-			tf->onnxruntimemodel =
-				std::make_unique<yolov8_obb_cpp::YOLOv8OBB>(
-					tf->modelFilepath, tf->numThreads, num_classes_,
-					tf->numThreads, tf->useGPU, onnxruntime_device_id_,
-					onnxruntime_use_parallel_, nms_th_,
+
+			tf->yolo_detector =
+				std::make_unique<vtes_detection::YOLODetector>(
+					model_path, cv::Size(1024, 1024),
+					tf->inference_device_enum,
+					onnxruntime_device_id_,
 					tf->conf_threshold);
 
 			char *jsonPath_rawPtr = obs_module_file("models/vtes.json");
@@ -883,7 +966,7 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 							auto &shapeArr = config["output_shape"]["shape"];
 							int num_dets = std::stoi(shapeArr[1].get<std::string>());
 							int num_feats = std::stoi(shapeArr[2].get<std::string>());
-							tf->onnxruntimemodel->setOutputShape(num_dets, num_feats);
+							tf->yolo_detector->setOutputShape(num_dets, num_feats);
 							obs_log(LOG_INFO,
 								"Model shape overridden from JSON: [1,%d,%d]",
 								num_dets, num_feats);
@@ -899,20 +982,20 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		} catch (const std::exception &e) {
 			obs_log(LOG_ERROR, "Failed to load OBB model: %s", e.what());
 			tf->isDisabled = true;
-			tf->onnxruntimemodel.reset();
+			tf->yolo_detector.reset();
 			return;
 		}
 	}
 
-	if (tf->onnxruntimemodel) {
-		tf->onnxruntimemodel->setBBoxConfThresh(tf->conf_threshold);
+	if (tf->yolo_detector) {
+		tf->yolo_detector->setConfThreshold(tf->conf_threshold);
 	}
 
 	if (reinitialize) {
 		obs_log(LOG_INFO, "VTES OBB Filter Options:");
 		obs_log(LOG_INFO, "  Mode: ONNX (AI Model)");
 		obs_log(LOG_INFO, "  Source: %s", obs_source_get_name(tf->source));
-		obs_log(LOG_INFO, "  Inference Device: %s", tf->useGPU.c_str());
+		obs_log(LOG_INFO, "  Inference Device: %s", tf->inference_device.c_str());
 		obs_log(LOG_INFO, "  Num Threads: %d", tf->numThreads);
 		obs_log(LOG_INFO, "  Preview: %s", tf->preview ? "true" : "false");
 		obs_log(LOG_INFO, "  Threshold: %.2f", tf->conf_threshold);
@@ -973,6 +1056,17 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 	tf->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
 	tf->lastDetectedObjectId = -1;
 
+	// Read inference device from settings before loading models
+	tf->inference_device = obs_data_get_string(settings, "inference_device");
+	if (tf->inference_device.empty()) {
+#if _WIN32
+		tf->inference_device = INFERENCE_DML;
+#else
+		tf->inference_device = INFERENCE_CPU;
+#endif
+	}
+	tf->inference_device_enum = deviceStringToEnum(tf->inference_device);
+
 	// Pre-load card info and embedding model
 	loadCardInfo(tf);
 	if (!tf->embedder.is_loaded()) {
@@ -981,6 +1075,7 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 		char *metaPath = obs_module_file("embeddings_1024d_meta.json");
 		if (modelPath && binPath && metaPath) {
 			obs_log(LOG_INFO, "[Embedding] Loading model on startup: %s", modelPath);
+			tf->embedder.set_inference_device(tf->inference_device_enum);
 			tf->embedder.load(modelPath, binPath, metaPath);
 		}
 		bfree(modelPath);
@@ -1003,9 +1098,27 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 		initOcrReader(tf);
 	}
 
-	// Start embedded web server
+	// Start embedded web server (port 8080 for card search UI)
 	tf->web_server = std::make_unique<WebServer>();
-	tf->web_server->start(tf->web_server_port, &tf->vtes_db);
+	bool ws_ok = tf->web_server->start(tf->web_server_port, &tf->vtes_db);
+	if (ws_ok) {
+		obs_log(LOG_INFO, "[WebServer] Started on http://localhost:%d", tf->web_server_port);
+		static bool session_notified = false;
+		if (!session_notified) {
+			session_notified = true;
+#ifdef _WIN32
+			std::string msg = "VTES web server started at http://localhost:"
+				+ std::to_string(tf->web_server_port)
+				+ "\n\nSearch cards from your browser\n"
+				"or click 'Open Card Search' in properties.";
+			MessageBoxA(NULL, msg.c_str(), "VTES Card Search", MB_OK | MB_ICONINFORMATION | MB_TASKMODAL);
+#else
+			obs_log(LOG_INFO, "[WebServer] Session notified (no MessageBox on this platform)");
+#endif
+		}
+	} else {
+		obs_log(LOG_WARNING, "[WebServer] Failed to start (port %d may be in use)", tf->web_server_port);
+	}
 
 	char *kawaseBlurEffectPath = obs_module_file(KAWASE_BLUR_EFFECT_PATH);
 	if (!kawaseBlurEffectPath) {
@@ -1086,7 +1199,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	if (tf->isDisabled) {
 		return;
 	}
-	if (tf->detectionMode == DETECT_MODE_ONNX && !tf->onnxruntimemodel) {
+	if (tf->detectionMode == DETECT_MODE_ONNX && !tf->yolo_detector) {
 		return;
 	}
 
@@ -1113,7 +1226,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	cv::Mat inferenceFrame;
 	cv::cvtColor(imageBGRA, inferenceFrame, cv::COLOR_BGRA2BGR);
 
-	std::vector<yolov8_obb_cpp::OBBObject> raw_objects;
+	std::vector<vtes_detection::OBBObject> raw_objects;
 
 	if (tf->detectionMode == DETECT_MODE_CONTOUR) {
 		vtes_detection::ContourParams cparams;
@@ -1126,12 +1239,9 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	} else {
 		try {
 			std::unique_lock<std::mutex> lock(tf->modelMutex);
-			auto *obb_model = dynamic_cast<yolov8_obb_cpp::YOLOv8OBB *>(tf->onnxruntimemodel.get());
-			if (obb_model) {
-				raw_objects = obb_model->inferOBB(inferenceFrame);
+			if (tf->yolo_detector) {
+				raw_objects = tf->yolo_detector->inferOBB(inferenceFrame);
 			}
-		} catch (const Ort::Exception &e) {
-			obs_log(LOG_ERROR, "ONNXRuntime Exception: %s", e.what());
 		} catch (const std::exception &e) {
 			obs_log(LOG_ERROR, "%s", e.what());
 		}
@@ -1139,7 +1249,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 
 	// ─── ONNX area filtering (filter out too small/large detections) ──────
 	if (tf->detectionMode == DETECT_MODE_ONNX && !raw_objects.empty()) {
-		std::vector<yolov8_obb_cpp::OBBObject> filtered;
+		std::vector<vtes_detection::OBBObject> filtered;
 		double max_area = tf->onnxMaxAreaFrac * inferenceFrame.cols * inferenceFrame.rows;
 		for (const auto& obj : raw_objects) {
 			double area = obj.rect.width * obj.rect.height;
@@ -1169,8 +1279,21 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				continue;
 			}
 
-			// ─── Vision-based type classifier (vtes_type_classifier.onnx, 99.9% acc) ─
-			std::string vision_type = runVisionTypeClassifier(tf, crops[i].crop);
+			// ─── Extract perspective-corrected card region using YOLO angle ─
+			// (axis-aligned crops include table background around tilted cards)
+			const auto& obj = raw_objects[i];
+			cv::Point2f center(obj.rect.x + obj.rect.width / 2,
+					   obj.rect.y + obj.rect.height / 2);
+			cv::Size2f size(obj.rect.width, obj.rect.height);
+			cv::RotatedRect rr(center, size, obj.angle * 180.0f / kPI);
+			cv::Point2f corners[4];
+			rr.points(corners);
+			cv::Mat card_region = extractCardRegion(inferenceFrame, corners);
+
+			// ─── Vision-based type classifier (vtes_type_classifier.onnx) ─
+			std::string vision_type;
+			if (!card_region.empty())
+				vision_type = runVisionTypeClassifier(tf, card_region);
 			if (!vision_type.empty()) {
 				per_object_type_filter[i] = vision_type;
 				// Map vision type to display label (for color-coded overlay)
@@ -1184,9 +1307,9 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				auto it = type_to_label.find(vision_type);
 				if (it != type_to_label.end()) typeIdx = it->second;
 				raw_objects[i].label = 100 + typeIdx;
-				obs_log(LOG_DEBUG, "Card %zu: vision_type=%s", i, vision_type.c_str());
+				obs_log(LOG_DEBUG, "Card %zu: vision_type=%s (rotated crop)", i, vision_type.c_str());
 			} else {
-				// Fallback: signal-based classifier
+				// Fallback: signal-based classifier (axis-aligned crop)
 				float typeConf = 0.0f;
 				vtes_classifier::SignalScores signals;
 				vtes_classifier::CardType type = tf->classifier->classify(crops[i].crop, typeConf, signals);
@@ -1194,7 +1317,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 					static_cast<int>(type));
 				raw_objects[i].label = 100 + static_cast<int>(type);
 				raw_objects[i].prob = typeConf;
-				obs_log(LOG_DEBUG, "Card %zu: signal_type=%d(%s) conf=%.2f",
+				obs_log(LOG_DEBUG, "Card %zu: signal_type=%d(%s) conf=%.2f (axis-aligned crop)",
 					i, static_cast<int>(type), per_object_type_filter[i].c_str(), typeConf);
 			}
 		}
@@ -1297,7 +1420,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	}
 
 	// ─── Temporal smoothing ──────────────────────────────────────────────
-	std::vector<yolov8_obb_cpp::OBBObject> final_objects;
+	std::vector<vtes_detection::OBBObject> final_objects;
 	if (tf->temporal_smoothing_enabled) {
 		updateTemporalTracks(tf, raw_objects, final_objects);
 	} else {
@@ -1307,7 +1430,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	if (!tf->showUnseenObjects) {
 		final_objects.erase(
 			std::remove_if(final_objects.begin(), final_objects.end(),
-				       [](const yolov8_obb_cpp::OBBObject &obj) { return obj.unseenFrames > 0; }),
+				       [](const vtes_detection::OBBObject &obj) { return obj.unseenFrames > 0; }),
 			final_objects.end());
 	}
 
@@ -1477,8 +1600,8 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		// ─── GPU indicator ─────────────────────────────────────────────────
 		{
 			std::string gpu_status;
-			if (tf->detectionMode == DETECT_MODE_ONNX && tf->onnxruntimemodel) {
-				const auto& prov = tf->onnxruntimemodel->getProvider();
+			if (tf->detectionMode == DETECT_MODE_ONNX && tf->yolo_detector) {
+				const auto& prov = tf->yolo_detector->provider();
 				if (prov == "dml") gpu_status = "GPU (DML)";
 				else if (prov == "cuda") gpu_status = "GPU (CUDA)";
 				else gpu_status = "CPU";
@@ -1490,8 +1613,8 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			cv::putText(frame, gpu_status, cv::Point2f(8, 20),
 				    cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 2);
 			// Show real provider name below
-			if (tf->detectionMode == DETECT_MODE_ONNX && tf->onnxruntimemodel) {
-				cv::putText(frame, tf->onnxruntimemodel->getProvider(),
+			if (tf->detectionMode == DETECT_MODE_ONNX && tf->yolo_detector) {
+				cv::putText(frame, tf->yolo_detector->provider(),
 					    cv::Point2f(8, 36),
 					    cv::FONT_HERSHEY_SIMPLEX, 0.35,
 					    cv::Scalar(200, 200, 200), 1);
@@ -1513,7 +1636,7 @@ void detect_filter_obb_video_render(void *data, gs_effect_t *_effect)
 		}
 		return;
 	}
-	if (tf->detectionMode == DETECT_MODE_ONNX && !tf->onnxruntimemodel) {
+	if (tf->detectionMode == DETECT_MODE_ONNX && !tf->yolo_detector) {
 		if (tf->source) {
 			obs_source_skip_video_filter(tf->source);
 		}
