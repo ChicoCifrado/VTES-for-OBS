@@ -32,6 +32,13 @@ public:
                    std::string& out_id,
                    float& out_confidence);
 
+    // ─── Vampire card validation ────────────────────────────────────
+    // Returns true if the card has an oval portrait (vampire indicator)
+    static bool hasVampireOval(const cv::Mat& card_bgr);
+    // OCR the capacity number from the bottom-right of a vampire card.
+    // Returns -1 if not found or unreadable.
+    int detectVampireCapacity(const cv::Mat& card_bgr);
+
 private:
     bool initialized_ = false;
     TessBaseAPI* tess_ = nullptr;
@@ -52,7 +59,9 @@ private:
 
     std::vector<VTESCardNameEntry> card_names_;
 
-    cv::Mat extractNameRegion(const cv::Mat& card_bgr);
+    // Visually locate the name region on a perspective-corrected card
+    // instead of using hardcoded percentages
+    cv::Mat detectNameRegion(const cv::Mat& card_bgr);
     cv::Mat preprocessForOcr(const cv::Mat& region);
     std::tuple<std::string, std::string, float> fuzzyMatch(const std::string& ocr_text);
 };

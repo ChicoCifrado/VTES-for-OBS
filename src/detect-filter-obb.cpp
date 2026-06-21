@@ -1427,15 +1427,52 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				std::string ocr_name, ocr_id;
 				float ocr_conf = 0.0f;
 				if (tf->ocr_reader->recognize(card_region, ocr_name, ocr_id, ocr_conf)) {
-					if (ocr_conf > confidence) {
-						card_name = ocr_name;
-						card_id = ocr_id;
-						confidence = ocr_conf;
-						thresh = 0.3f;
+					// ─── Vampire card validation ──────────────────────────
+					bool ocr_accepted = true;
+					auto ci_it = tf->card_info_by_id.find(ocr_id);
+					if (ci_it != tf->card_info_by_id.end()) {
+						bool is_vampire = false;
+						for (const auto& t : ci_it->second.types) {
+							if (t == "Vampire") { is_vampire = true; break; }
+						}
+						if (is_vampire) {
+							obs_log(LOG_INFO, "[OCR] Vampire validation for '%s' (id=%s)",
+								ocr_name.c_str(), ocr_id.c_str());
+
+							if (!VtesOcrReader::hasVampireOval(card_region)) {
+								obs_log(LOG_INFO, "[OCR] Vampire REJECTED: no oval portrait found");
+								ocr_accepted = false;
+							} else {
+								int detected_cap = tf->ocr_reader->detectVampireCapacity(card_region);
+								int expected_cap = ci_it->second.capacity;
+								if (detected_cap < 0) {
+									obs_log(LOG_WARNING, "[OCR] Vampire: could not read capacity, accepting anyway");
+								} else if (detected_cap != expected_cap) {
+									obs_log(LOG_INFO, "[OCR] Vampire REJECTED: capacity %d != expected %d",
+										detected_cap, expected_cap);
+									ocr_accepted = false;
+								} else {
+									obs_log(LOG_INFO, "[OCR] Vampire ACCEPTED: oval + capacity %d matches",
+										detected_cap);
+								}
+							}
+						}
 					}
-					matched = true;
-					obs_log(LOG_INFO, "[OCR] Card #%d: OCR matched '%s' (id=%s, conf=%.2f)",
-						obj.id, ocr_name.c_str(), ocr_id.c_str(), ocr_conf);
+
+					if (ocr_accepted) {
+						if (ocr_conf > confidence) {
+							card_name = ocr_name;
+							card_id = ocr_id;
+							confidence = ocr_conf;
+							thresh = 0.3f;
+						}
+						matched = true;
+						obs_log(LOG_INFO, "[OCR] Card #%d: OCR matched '%s' (id=%s, conf=%.2f)",
+							obj.id, ocr_name.c_str(), ocr_id.c_str(), ocr_conf);
+					} else {
+						obs_log(LOG_INFO, "[OCR] Card #%d: OCR result '%s' rejected by vampire validation",
+							obj.id, ocr_name.c_str());
+					}
 				}
 			}
 

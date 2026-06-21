@@ -178,7 +178,8 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
 
     if (!initialized_ || card_bgr.empty()) return false;
 
-    cv::Mat name_region = extractNameRegion(card_bgr);
+    // Step 1: visually locate the card name region (instead of hardcoded crop)
+    cv::Mat name_region = detectNameRegion(card_bgr);
     if (name_region.empty()) return false;
 
     cv::Mat processed = preprocessForOcr(name_region);
@@ -198,6 +199,18 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
     if (ocr_text.empty()) return false;
 
     obs_log(LOG_DEBUG, "[OCR] Raw Tesseract output: \"%s\" (%zu chars)", ocr_text.c_str(), ocr_text.size());
+
+    // Step 2: validate that the first character is uppercase
+    // Trim leading whitespace before checking
+    auto first_char = std::find_if(ocr_text.begin(), ocr_text.end(),
+        [](unsigned char c) { return !std::isspace(c); });
+    if (first_char == ocr_text.end() || !std::isupper((unsigned char)*first_char)) {
+        obs_log(LOG_DEBUG, "[OCR] Rejected: first char '%c' is not uppercase",
+                first_char != ocr_text.end() ? *first_char : '?');
+        return false;
+    }
+
+    obs_log(LOG_DEBUG, "[OCR] First char '%c' is uppercase, continuing", *first_char);
 
     {
         CardLookupResult api_result = lookup_card_by_ocr(ocr_text);
@@ -220,25 +233,74 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
     return true;
 }
 
-cv::Mat VtesOcrReader::extractNameRegion(const cv::Mat& card_bgr)
+// ─── Visual name region detection ────────────────────────────────────
+// Uses horizontal projection analysis to find the text band on the card,
+// instead of hardcoded percentage-based cropping.
+cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr)
 {
     if (card_bgr.empty()) return {};
 
     int h = card_bgr.rows;
     int w = card_bgr.cols;
+    int search_h = h * 2 / 5; // search top 40%
 
-    int name_top = (int)(h * 0.01f);
-    int name_bottom = (int)(h * 0.22f);
-    int name_h = name_bottom - name_top;
-    if (name_h < 10) {};
+    cv::Mat gray;
+    if (card_bgr.channels() == 3)
+        cv::cvtColor(card_bgr, gray, cv::COLOR_BGR2GRAY);
+    else
+        gray = card_bgr;
+
+    // Per-row standard deviation: text rows have high variance
+    std::vector<float> row_stddev(search_h, 0.0f);
+    for (int y = 0; y < search_h; y++) {
+        cv::Mat row = gray.row(y);
+        cv::Scalar mean, stddev;
+        cv::meanStdDev(row, mean, stddev);
+        row_stddev[y] = (float)stddev[0];
+    }
+
+    // Find the first significant contiguous text region
+    float threshold = 15.0f;
+    int best_start = -1, best_end = -1;
+    int best_len = 0;
+    int cur_start = -1;
+
+    for (int y = 0; y < search_h; y++) {
+        if (row_stddev[y] > threshold) {
+            if (cur_start == -1) cur_start = y;
+        } else {
+            if (cur_start != -1) {
+                int len = y - cur_start;
+                if (len > best_len) { best_len = len; best_start = cur_start; best_end = y; }
+                cur_start = -1;
+            }
+        }
+    }
+    if (cur_start != -1) {
+        int len = search_h - cur_start;
+        if (len > best_len) { best_start = cur_start; best_end = search_h; }
+    }
+
+    // Fallback if no text region found visually
+    if (best_start == -1) {
+        best_start = (int)(h * 0.015f);
+        best_end = (int)(h * 0.22f);
+        obs_log(LOG_DEBUG, "[OCR] detectNameRegion: fallback to 1.5%%-22%%");
+    } else {
+        // Add 2px padding
+        best_start = std::max(0, best_start - 2);
+        best_end = std::min(h, best_end + 2);
+    }
 
     int name_left = (int)(w * 0.03f);
     int name_w = (int)(w * 0.94f);
+    int name_h = best_end - best_start;
 
-    cv::Rect name_roi(name_left, name_top, name_w, name_h);
+    cv::Rect name_roi(name_left, best_start, name_w, name_h);
     name_roi &= cv::Rect(0, 0, w, h);
     if (name_roi.width < 16 || name_roi.height < 4) return {};
 
+    obs_log(LOG_DEBUG, "[OCR] detectNameRegion: y=[%d,%d] h=%d", best_start, best_end, name_h);
     return card_bgr(name_roi).clone();
 }
 
@@ -270,6 +332,150 @@ cv::Mat VtesOcrReader::preprocessForOcr(const cv::Mat& region)
     cv::morphologyEx(denoised, denoised, cv::MORPH_CLOSE, kernel);
 
     return denoised;
+}
+
+// ─── Vampire oval portrait detection ──────────────────────────────────
+// VTES vampire cards have a painted oval portrait frame in the center-top.
+// Library and Master cards have rectangular art frames with straight edges.
+// Uses HoughLinesP: an oval produces very few straight line segments,
+// while a rectangle frame produces many.
+bool VtesOcrReader::hasVampireOval(const cv::Mat& card_bgr)
+{
+    if (card_bgr.empty()) return false;
+
+    int h = card_bgr.rows;
+    int w = card_bgr.cols;
+
+    // Portrait area: center-top of the card
+    int px = (int)(w * 0.12f);
+    int py = (int)(h * 0.08f);
+    int pw = (int)(w * 0.76f);
+    int ph = (int)(h * 0.45f);
+
+    cv::Rect roi(px, py, pw, ph);
+    roi &= cv::Rect(0, 0, w, h);
+    if (roi.width < 30 || roi.height < 30) return false;
+
+    cv::Mat portrait = card_bgr(roi);
+
+    // Edge detection
+    cv::Mat gray, edges;
+    cv::cvtColor(portrait, gray, cv::COLOR_BGR2GRAY);
+    cv::GaussianBlur(gray, gray, cv::Size(3, 3), 0);
+    cv::Canny(gray, edges, 50, 150);
+
+    // Count straight line segments in the portrait area
+    std::vector<cv::Vec4i> lines;
+    cv::HoughLinesP(edges, lines, 1, CV_PI / 180, 40, 20, 10);
+
+    int line_count = (int)lines.size();
+    obs_log(LOG_DEBUG, "[OCR] hasVampireOval: %d lines in portrait area", line_count);
+
+    // Vampires (oval portrait): few straight lines (< 10)
+    // Non-vampires (rectangular art): many straight lines (≥ 10)
+    return line_count < 10;
+}
+
+// ─── Vampire capacity detection ──────────────────────────────────────
+// The capacity number appears inside a red circle in the bottom-right
+// corner of VTES vampire cards. Returns -1 if not found.
+int VtesOcrReader::detectVampireCapacity(const cv::Mat& card_bgr)
+{
+    if (!initialized_ || card_bgr.empty()) return -1;
+
+    int h = card_bgr.rows;
+    int w = card_bgr.cols;
+
+    // Bottom-right quadrant
+    int cx = (int)(w * 0.62f);
+    int cy = (int)(h * 0.65f);
+    int cw = w - cx;
+    int ch = h - cy;
+
+    cv::Rect cap_roi(cx, cy, cw, ch);
+    cap_roi &= cv::Rect(0, 0, w, h);
+    if (cap_roi.width < 12 || cap_roi.height < 12) return -1;
+
+    cv::Mat cap_region = card_bgr(cap_roi);
+
+    // Look for red circular region (the blood pool icon)
+    cv::Mat hsv;
+    cv::cvtColor(cap_region, hsv, cv::COLOR_BGR2HSV);
+
+    cv::Mat red_mask1, red_mask2;
+    cv::inRange(hsv, cv::Scalar(0, 50, 50), cv::Scalar(10, 255, 255), red_mask1);
+    cv::inRange(hsv, cv::Scalar(160, 50, 50), cv::Scalar(180, 255, 255), red_mask2);
+    cv::Mat red_mask = red_mask1 | red_mask2;
+
+    cv::GaussianBlur(red_mask, red_mask, cv::Size(5, 5), 0);
+
+    std::vector<cv::Vec3f> circles;
+    cv::HoughCircles(red_mask, circles, cv::HOUGH_GRADIENT, 1.5,
+                     cap_region.rows / 4, 50, 25, 5, cap_region.rows / 2);
+
+    if (circles.empty()) {
+        obs_log(LOG_DEBUG, "[OCR] detectVampireCapacity: no red circle found");
+        return -1;
+    }
+
+    obs_log(LOG_DEBUG, "[OCR] detectVampireCapacity: %zu circle(s) found", circles.size());
+
+    // Save current PSM, set to single-char mode for digit reading
+    fnSetVariable(tess_, "tessedit_pageseg_mode", "10");
+
+    int result = -1;
+    for (const auto& c : circles) {
+        int c_x = (int)c[0];
+        int c_y = (int)c[1];
+        int c_r = (int)c[2];
+        int inner_r = std::max(c_r / 2, 4);
+
+        int inner_x = std::max(0, c_x - inner_r);
+        int inner_y = std::max(0, c_y - inner_r);
+        int inner_w = std::min(cap_region.cols - inner_x, inner_r * 2);
+        int inner_h = std::min(cap_region.rows - inner_y, inner_r * 2);
+
+        cv::Rect inner(inner_x, inner_y, inner_w, inner_h);
+        if (inner.width < 6 || inner.height < 6) continue;
+
+        cv::Mat digit_area = cap_region(inner);
+
+        cv::Mat gray, binary;
+        cv::cvtColor(digit_area, gray, cv::COLOR_BGR2GRAY);
+        cv::GaussianBlur(gray, gray, cv::Size(3, 3), 0);
+        cv::threshold(gray, binary, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+
+        cv::Mat upscaled;
+        cv::resize(binary, upscaled, cv::Size(), 3.0, 3.0, cv::INTER_NEAREST);
+
+        fnSetImage(tess_, upscaled.data, upscaled.cols, upscaled.rows, 1, (int)upscaled.step);
+        char* text = fnGetUTF8Text(tess_);
+        if (!text) continue;
+
+        std::string num(text);
+        fnDeleteText(text);
+
+        num.erase(std::remove_if(num.begin(), num.end(),
+            [](unsigned char c) { return std::isspace(c) || c == '\n' || c == '\r'; }), num.end());
+
+        if (num.empty()) continue;
+
+        obs_log(LOG_DEBUG, "[OCR] detectVampireCapacity: raw='%s'", num.c_str());
+
+        try {
+            int cap = std::stoi(num);
+            if (cap >= 0 && cap <= 12) {
+                result = cap;
+                break;
+            }
+        } catch (...) {}
+    }
+
+    // Restore PSM to SINGLE_BLOCK for subsequent name reads
+    fnSetVariable(tess_, "tessedit_pageseg_mode", "6");
+
+    obs_log(LOG_DEBUG, "[OCR] detectVampireCapacity: result=%d", result);
+    return result;
 }
 
 std::string VtesOcrReader::normalize(const std::string& s)
