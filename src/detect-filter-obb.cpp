@@ -631,8 +631,11 @@ static void updateTemporalTracks(
 			if (!det.card_id.empty() && det.card_id == track.tracked_card_id) {
 				track.identity_hits++;
 			} else if (!det.card_id.empty()) {
-				// New identity detected — reset if strong evidence
-				if (track.identity_hits < 2) {
+				bool current_weak = track.identity_total < 5 ||
+				    (track.identity_total > 0 &&
+				     (float)track.identity_hits / track.identity_total < 0.4f);
+				bool new_much_better = det.prob > track.confidence + 0.2f;
+				if (current_weak || new_much_better) {
 					track.tracked_card_id = det.card_id;
 					track.tracked_card_name = det.card_name;
 					track.identity_hits = 1;
@@ -745,7 +748,7 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 
 	// --- Card Type Classifier (for type-based embedding filter) ---
 	obs_properties_add_int_slider(props, "process_every_n_frames", "Process every N frames (1=all, higher=faster)",
-				    1, 30, 1);
+				    1, 120, 1);
 
 	obs_properties_add_bool(props, "classifier_enabled", "Type Classifier (filter by card type)");
 
@@ -810,7 +813,7 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 
 	// Classifier defaults
 	obs_data_set_default_bool(settings, "classifier_enabled", true);
-	obs_data_set_default_int(settings, "process_every_n_frames", 3);
+	obs_data_set_default_int(settings, "process_every_n_frames", 30);
 	obs_data_set_default_double(settings, "clf_oval_weight", 0.5);
 	obs_data_set_default_double(settings, "clf_color_weight", 0.3);
 	obs_data_set_default_double(settings, "clf_contour_weight", 0.2);
@@ -1249,11 +1252,17 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		return;
 	}
 
-	// ─── Frame skip: process only every N frames ──────────────────────
+	// ─── Frame skip: process only every N frames + time throttle ─────
 	tf->video_tick_counter++;
 	if (tf->video_tick_counter % tf->process_every_n_frames != 0) {
 		return;
 	}
+	auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+	if (now_ns - tf->last_detection_time_ns < 500000000ULL) {
+		return;
+	}
+	tf->last_detection_time_ns = now_ns;
 
 	cv::Mat imageBGRA;
 	{
@@ -1309,6 +1318,19 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		raw_objects = filtered;
 	}
 
+	// ─── Extract perspective-corrected card regions once, reuse below ─
+	std::vector<cv::Mat> card_regions(raw_objects.size());
+	for (size_t i = 0; i < raw_objects.size(); i++) {
+		const auto& obj = raw_objects[i];
+		cv::Point2f center(obj.rect.x + obj.rect.width / 2,
+				   obj.rect.y + obj.rect.height / 2);
+		cv::Size2f size(obj.rect.width, obj.rect.height);
+		cv::RotatedRect rr(center, size, obj.angle * 180.0f / kPI);
+		cv::Point2f corners[4];
+		rr.points(corners);
+		card_regions[i] = extractCardRegion(inferenceFrame, corners);
+	}
+
 	// ─── VTES Card Classification (run BEFORE embedding to use type as filter) ─
 	// Store per-object type filter string for embedding
 	std::vector<std::string> per_object_type_filter(raw_objects.size(), "");
@@ -1328,21 +1350,10 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				continue;
 			}
 
-			// ─── Extract perspective-corrected card region using YOLO angle ─
-			// (axis-aligned crops include table background around tilted cards)
-			const auto& obj = raw_objects[i];
-			cv::Point2f center(obj.rect.x + obj.rect.width / 2,
-					   obj.rect.y + obj.rect.height / 2);
-			cv::Size2f size(obj.rect.width, obj.rect.height);
-			cv::RotatedRect rr(center, size, obj.angle * 180.0f / kPI);
-			cv::Point2f corners[4];
-			rr.points(corners);
-			cv::Mat card_region = extractCardRegion(inferenceFrame, corners);
-
 			// ─── Vision-based type classifier (vtes_type_classifier.onnx) ─
 			std::string vision_type;
-			if (!card_region.empty())
-				vision_type = runVisionTypeClassifier(tf, card_region);
+			if (!card_regions[i].empty())
+				vision_type = runVisionTypeClassifier(tf, card_regions[i]);
 			if (!vision_type.empty()) {
 				per_object_type_filter[i] = vision_type;
 				// Map vision type to display label (for color-coded overlay)
@@ -1379,14 +1390,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		for (size_t i = 0; i < raw_objects.size(); i++) {
 			auto& obj = raw_objects[i];
 
-			cv::Point2f center(obj.rect.x + obj.rect.width / 2,
-					   obj.rect.y + obj.rect.height / 2);
-			cv::Size2f size(obj.rect.width, obj.rect.height);
-			cv::RotatedRect rr(center, size, obj.angle * 180.0f / kPI);
-			cv::Point2f corners[4];
-			rr.points(corners);
-
-			cv::Mat card_region = extractCardRegion(inferenceFrame, corners);
+			cv::Mat card_region = card_regions[i];
 			if (card_region.empty()) continue;
 
 			std::string card_name, card_id;

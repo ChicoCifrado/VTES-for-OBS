@@ -155,9 +155,11 @@ bool VtesOcrReader::init(const std::string& tessdata_path,
     }
 
     fnSetVariable(tess_, "tessedit_char_whitelist",
-                  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',-&()");
+                  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',-.!?:/&() ");
     fnSetVariable(tess_, "load_system_dawg", "false");
     fnSetVariable(tess_, "load_freq_dawg", "false");
+    fnSetVariable(tess_, "classify_bln_numeric_mode", "0");
+    fnSetVariable(tess_, "tessedit_do_invert", "0");
 
     initialized_ = true;
     obs_log(LOG_INFO, "[OCR] Tesseract initialized (%zu card names loaded)",
@@ -206,7 +208,7 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
     }
 
     auto [matched_id, matched_name, score] = fuzzyMatch(ocr_text);
-    if (score < 0.3f) return false;
+    if (score < 0.45f) return false;
 
     out_name = matched_name;
     out_id = matched_id;
@@ -221,13 +223,13 @@ cv::Mat VtesOcrReader::extractNameRegion(const cv::Mat& card_bgr)
     int h = card_bgr.rows;
     int w = card_bgr.cols;
 
-    int name_top = (int)(h * 0.02f);
-    int name_bottom = (int)(h * 0.20f);
+    int name_top = (int)(h * 0.01f);
+    int name_bottom = (int)(h * 0.22f);
     int name_h = name_bottom - name_top;
-    if (name_h < 8) return {};
+    if (name_h < 10) {};
 
-    int name_left = (int)(w * 0.05f);
-    int name_w = (int)(w * 0.90f);
+    int name_left = (int)(w * 0.03f);
+    int name_w = (int)(w * 0.94f);
 
     cv::Rect name_roi(name_left, name_top, name_w, name_h);
     name_roi &= cv::Rect(0, 0, w, h);
@@ -248,18 +250,19 @@ cv::Mat VtesOcrReader::preprocessForOcr(const cv::Mat& region)
     }
 
     cv::Mat upscaled;
-    cv::resize(gray, upscaled, cv::Size(region.cols * 2, region.rows * 2),
+    cv::resize(gray, upscaled, cv::Size(region.cols * 3, region.rows * 3),
                0, 0, cv::INTER_CUBIC);
 
+    cv::Mat blurred;
+    cv::GaussianBlur(upscaled, blurred, cv::Size(3, 3), 0);
+
     cv::Mat binary;
-    cv::adaptiveThreshold(upscaled, binary, 255,
-                          cv::ADAPTIVE_THRESH_GAUSSIAN_C,
-                          cv::THRESH_BINARY_INV, 31, 8);
+    cv::threshold(blurred, binary, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
 
     cv::Mat denoised;
     cv::medianBlur(binary, denoised, 3);
 
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2));
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(1, 2));
     cv::morphologyEx(denoised, denoised, cv::MORPH_CLOSE, kernel);
 
     return denoised;
@@ -290,22 +293,20 @@ VtesOcrReader::fuzzyMatch(const std::string& ocr_text)
     for (const auto& entry : card_names_) {
         const std::string& candidate = entry.normalized;
 
-        if (candidate.find(ocr_norm) != std::string::npos ||
-            ocr_norm.find(candidate) != std::string::npos) {
-            float score = (float)std::min(ocr_norm.size(), candidate.size()) /
-                          (float)std::max(ocr_norm.size(), candidate.size());
-            if (candidate == ocr_norm) score = 1.0f;
-            if (score > best_score) {
-                best_score = score;
-                best_id = entry.id;
-                best_name = entry.printed_name;
-            }
-            continue;
+        if (candidate == ocr_norm) {
+            best_score = 1.0f;
+            best_id = entry.id;
+            best_name = entry.printed_name;
+            break;
         }
 
         size_t m = ocr_norm.size();
         size_t n = candidate.size();
-        if (std::abs((int)m - (int)n) > (int)(m * 0.5f)) continue;
+        size_t max_len = std::max(m, n);
+        size_t min_len = std::min(m, n);
+
+        if (min_len < 3) continue;
+        if (max_len > min_len * 3) continue;
 
         std::vector<size_t> prev(n + 1), curr(n + 1);
         for (size_t j = 0; j <= n; j++) prev[j] = j;
@@ -320,7 +321,6 @@ VtesOcrReader::fuzzyMatch(const std::string& ocr_text)
         }
 
         size_t dist = prev[n];
-        size_t max_len = std::max(m, n);
         float score = 1.0f - (float)dist / (float)max_len;
 
         if (score > best_score) {

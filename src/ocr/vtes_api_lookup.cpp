@@ -30,8 +30,8 @@ CardLookupResult lookup_card_by_ocr(const std::string& ocr_text) {
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 150L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 80L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 500L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 200L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
     CURLcode res = curl_easy_perform(curl);

@@ -173,8 +173,9 @@ struct filter_data {
 	float card_overlay_duration = 5.0f;
 
 	// --- Performance: frame skip (process every N frames) ---
-	std::atomic<int> process_every_n_frames{3};
+	std::atomic<int> process_every_n_frames{30}; // ~1-2 detections/sec at 30-60fps
 	int video_tick_counter = 0;
+	uint64_t last_detection_time_ns = 0;
 
 };
 #endif /* FILTERDATA_H */
