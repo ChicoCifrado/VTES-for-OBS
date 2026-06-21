@@ -197,18 +197,22 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
 
     if (ocr_text.empty()) return false;
 
+    obs_log(LOG_DEBUG, "[OCR] Raw Tesseract output: \"%s\" (%zu chars)", ocr_text.c_str(), ocr_text.size());
+
     {
         CardLookupResult api_result = lookup_card_by_ocr(ocr_text);
         if (!api_result.printed_name.empty()) {
             out_name = api_result.printed_name;
             out_id = std::to_string(api_result.id);
             out_confidence = 0.95f;
+            obs_log(LOG_DEBUG, "[OCR] API matched: %s (id=%s)", out_name.c_str(), out_id.c_str());
             return true;
         }
     }
 
     auto [matched_id, matched_name, score] = fuzzyMatch(ocr_text);
-    if (score < 0.45f) return false;
+    obs_log(LOG_DEBUG, "[OCR] FuzzyMatch best=%s score=%.3f thresh=0.30", matched_name.c_str(), score);
+    if (score < 0.30f) return false;
 
     out_name = matched_name;
     out_id = matched_id;
@@ -293,6 +297,7 @@ VtesOcrReader::fuzzyMatch(const std::string& ocr_text)
     for (const auto& entry : card_names_) {
         const std::string& candidate = entry.normalized;
 
+        // ─── Exact match ────────────────────────────────────────────────
         if (candidate == ocr_norm) {
             best_score = 1.0f;
             best_id = entry.id;
@@ -304,6 +309,17 @@ VtesOcrReader::fuzzyMatch(const std::string& ocr_text)
         size_t n = candidate.size();
         size_t max_len = std::max(m, n);
         size_t min_len = std::min(m, n);
+
+        // ─── Substring match (heuristic: OCR may get extra/missing chars) ─
+        if (candidate.find(ocr_norm) != std::string::npos ||
+            ocr_norm.find(candidate) != std::string::npos) {
+            float score = (float)min_len / (float)max_len;
+            if (score > best_score) {
+                best_score = score;
+                best_id = entry.id;
+                best_name = entry.printed_name;
+            }
+        }
 
         if (min_len < 3) continue;
         if (max_len > min_len * 3) continue;
