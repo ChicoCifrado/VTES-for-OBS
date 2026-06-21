@@ -198,19 +198,19 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
 
     if (ocr_text.empty()) return false;
 
-    obs_log(LOG_DEBUG, "[OCR] Raw Tesseract output: \"%s\" (%zu chars)", ocr_text.c_str(), ocr_text.size());
+    obs_log(LOG_INFO, "[OCR] Raw Tesseract: \"%s\" (%zu chars)", ocr_text.c_str(), ocr_text.size());
 
     // Step 2: validate that the first character is uppercase
     // Trim leading whitespace before checking
     auto first_char = std::find_if(ocr_text.begin(), ocr_text.end(),
         [](unsigned char c) { return !std::isspace(c); });
     if (first_char == ocr_text.end() || !std::isupper((unsigned char)*first_char)) {
-        obs_log(LOG_DEBUG, "[OCR] Rejected: first char '%c' is not uppercase",
+        obs_log(LOG_INFO, "[OCR] Rejected: first char '%c' not uppercase",
                 first_char != ocr_text.end() ? *first_char : '?');
         return false;
     }
 
-    obs_log(LOG_DEBUG, "[OCR] First char '%c' is uppercase, continuing", *first_char);
+    obs_log(LOG_INFO, "[OCR] First char '%c' uppercase, continuing", *first_char);
 
     {
         CardLookupResult api_result = lookup_card_by_ocr(ocr_text);
@@ -234,15 +234,16 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
 }
 
 // ─── Visual name region detection ────────────────────────────────────
-// Uses horizontal projection analysis to find the text band on the card,
-// instead of hardcoded percentage-based cropping.
+// VTES card names are always in a narrow band at the very top of the card
+// (~0-10% of card height). We scan only the top 12% for high-variance text
+// rows, take the first contiguous block (the name), not the card type below.
 cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr)
 {
     if (card_bgr.empty()) return {};
 
     int h = card_bgr.rows;
     int w = card_bgr.cols;
-    int search_h = h * 2 / 5; // search top 40%
+    int search_h = std::min(h * 12 / 100, h); // search only top 12%
 
     cv::Mat gray;
     if (card_bgr.channels() == 3)
@@ -259,48 +260,45 @@ cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr)
         row_stddev[y] = (float)stddev[0];
     }
 
-    // Find the first significant contiguous text region
-    float threshold = 15.0f;
-    int best_start = -1, best_end = -1;
-    int best_len = 0;
-    int cur_start = -1;
-
-    for (int y = 0; y < search_h; y++) {
-        if (row_stddev[y] > threshold) {
-            if (cur_start == -1) cur_start = y;
-        } else {
-            if (cur_start != -1) {
-                int len = y - cur_start;
-                if (len > best_len) { best_len = len; best_start = cur_start; best_end = y; }
-                cur_start = -1;
+    // Find the first significant text row from the top downwards.
+    // The card name is the first text encountered (ignore thin border lines).
+    int name_top = -1, name_bottom = -1;
+    for (int y = 2; y < search_h; y++) {
+        if (row_stddev[y] > 20.0f) {
+            name_top = y;
+            // Expand downwards while variance stays high
+            name_bottom = y;
+            for (int y2 = y + 1; y2 < search_h; y2++) {
+                if (row_stddev[y2] > 12.0f) {
+                    name_bottom = y2;
+                } else {
+                    break;
+                }
             }
+            break;
         }
-    }
-    if (cur_start != -1) {
-        int len = search_h - cur_start;
-        if (len > best_len) { best_start = cur_start; best_end = search_h; }
     }
 
     // Fallback if no text region found visually
-    if (best_start == -1) {
-        best_start = (int)(h * 0.015f);
-        best_end = (int)(h * 0.22f);
-        obs_log(LOG_DEBUG, "[OCR] detectNameRegion: fallback to 1.5%%-22%%");
+    if (name_top == -1) {
+        name_top = (int)(h * 0.01f);
+        name_bottom = (int)(h * 0.12f);
+        obs_log(LOG_INFO, "[OCR] detectNameRegion: fallback 1%%-12%%");
     } else {
         // Add 2px padding
-        best_start = std::max(0, best_start - 2);
-        best_end = std::min(h, best_end + 2);
+        name_top = std::max(0, name_top - 2);
+        name_bottom = std::min(h, name_bottom + 2);
     }
 
     int name_left = (int)(w * 0.03f);
     int name_w = (int)(w * 0.94f);
-    int name_h = best_end - best_start;
+    int name_h = name_bottom - name_top;
 
-    cv::Rect name_roi(name_left, best_start, name_w, name_h);
+    cv::Rect name_roi(name_left, name_top, name_w, name_h);
     name_roi &= cv::Rect(0, 0, w, h);
     if (name_roi.width < 16 || name_roi.height < 4) return {};
 
-    obs_log(LOG_DEBUG, "[OCR] detectNameRegion: y=[%d,%d] h=%d", best_start, best_end, name_h);
+    obs_log(LOG_INFO, "[OCR] detectNameRegion: y=[%d,%d] h=%d", name_top, name_bottom, name_h);
     return card_bgr(name_roi).clone();
 }
 

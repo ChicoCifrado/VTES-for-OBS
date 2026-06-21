@@ -1282,10 +1282,6 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	}
 
 	if (!should_detect) {
-		if (tf->preview) {
-			std::lock_guard<std::mutex> lk(tf->outputLock);
-			imageBGRA.copyTo(tf->outputPreviewBGRA);
-		}
 		return;
 	}
 
