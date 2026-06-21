@@ -1,3 +1,11 @@
+// Define NOMINMAX before any Windows header (obs-module.h may pull in windows.h)
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#endif
+
+#include <obs-module.h>
+#include "plugin-support.h"
 #include "vtes_ocr.hpp"
 #include "vtes_api_lookup.hpp"
 #include <opencv2/imgproc.hpp>
@@ -8,20 +16,100 @@
 #include <regex>
 #include <tuple>
 
-#ifdef VTES_HAVE_TESSERACT
-#include <tesseract/capi.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
 #endif
 
 VtesOcrReader::VtesOcrReader() {}
 
 VtesOcrReader::~VtesOcrReader()
 {
-#ifdef VTES_HAVE_TESSERACT
-    if (tess_) {
-        TessBaseAPIDelete(tess_);
-        tess_ = nullptr;
-    }
+    if (tess_ && fnDelete) fnDelete(tess_);
+#ifdef _WIN32
+    if (tess_lib_) FreeLibrary((HMODULE)tess_lib_);
+#else
+    if (tess_lib_) dlclose(tess_lib_);
 #endif
+}
+
+bool VtesOcrReader::loadTesseractDLL()
+{
+    if (tess_lib_) return true;
+
+#ifdef _WIN32
+    // Set the DLL directory to the Tesseract install so dependencies resolve
+    const char* tess_dirs[] = {
+        "C:\\Program Files\\Tesseract-OCR",
+        "C:\\Program Files (x86)\\Tesseract-OCR",
+        ""
+    };
+    HMODULE lib = nullptr;
+    for (const char* dir : tess_dirs) {
+        if (dir[0]) SetDllDirectoryA(dir);
+        lib = LoadLibraryA("libtesseract-5.dll");
+        if (dir[0]) SetDllDirectoryA(NULL);
+        if (lib) {
+            obs_log(LOG_INFO, "[OCR] Loaded Tesseract DLL from: %s", dir[0] ? dir : "PATH");
+            break;
+        }
+    }
+
+    if (!lib) {
+        // Try alternative DLL names
+        const char* alt_names[] = {"tesseract.dll", "libtesseract.dll"};
+        for (const char* name : alt_names) {
+            lib = LoadLibraryA(name);
+            if (lib) {
+                obs_log(LOG_INFO, "[OCR] Loaded Tesseract DLL: %s (via PATH)", name);
+                break;
+            }
+        }
+    }
+
+    if (!lib) {
+        obs_log(LOG_WARNING, "[OCR] Tesseract DLL not found");
+        return false;
+    }
+    tess_lib_ = lib;
+
+    fnCreate = (TessBaseAPI*(*)())GetProcAddress(lib, "TessBaseAPICreate");
+    fnDelete = (void(*)(TessBaseAPI*))GetProcAddress(lib, "TessBaseAPIDelete");
+    fnInit3 = (int(*)(TessBaseAPI*, const char*, const char*))GetProcAddress(lib, "TessBaseAPIInit3");
+    fnSetImage = (void(*)(TessBaseAPI*, const unsigned char*, int, int, int, int))GetProcAddress(lib, "TessBaseAPISetImage");
+    fnGetUTF8Text = (char*(*)(TessBaseAPI*))GetProcAddress(lib, "TessBaseAPIGetUTF8Text");
+    fnDeleteText = (void(*)(char*))GetProcAddress(lib, "TessDeleteText");
+    fnSetVariable = (void(*)(TessBaseAPI*, const char*, const char*))GetProcAddress(lib, "TessBaseAPISetVariable");
+    fnClear = (void(*)(TessBaseAPI*))GetProcAddress(lib, "TessBaseAPIClear");
+    fnEnd = (void(*)(TessBaseAPI*))GetProcAddress(lib, "TessBaseAPIEnd");
+#else
+    tess_lib_ = dlopen("libtesseract.so.5", RTLD_NOW | RTLD_LOCAL);
+    if (!tess_lib_) tess_lib_ = dlopen("libtesseract.so", RTLD_NOW | RTLD_LOCAL);
+    if (!tess_lib_) return false;
+
+    fnCreate = (TessBaseAPI*(*)())dlsym(tess_lib_, "TessBaseAPICreate");
+    fnDelete = (void(*)(TessBaseAPI*))dlsym(tess_lib_, "TessBaseAPIDelete");
+    fnInit3 = (int(*)(TessBaseAPI*, const char*, const char*))dlsym(tess_lib_, "TessBaseAPIInit3");
+    fnSetImage = (void(*)(TessBaseAPI*, const unsigned char*, int, int, int, int))dlsym(tess_lib_, "TessBaseAPISetImage");
+    fnGetUTF8Text = (char*(*)(TessBaseAPI*))dlsym(tess_lib_, "TessBaseAPIGetUTF8Text");
+    fnDeleteText = (void(*)(char*))dlsym(tess_lib_, "TessDeleteText");
+    fnSetVariable = (void(*)(TessBaseAPI*, const char*, const char*))dlsym(tess_lib_, "TessBaseAPISetVariable");
+    fnClear = (void(*)(TessBaseAPI*))dlsym(tess_lib_, "TessBaseAPIClear");
+    fnEnd = (void(*)(TessBaseAPI*))dlsym(tess_lib_, "TessBaseAPIEnd");
+#endif
+
+    if (!fnCreate || !fnDelete || !fnInit3 || !fnSetImage || !fnGetUTF8Text || !fnSetVariable) {
+#ifdef _WIN32
+        FreeLibrary((HMODULE)tess_lib_);
+#else
+        dlclose(tess_lib_);
+#endif
+        tess_lib_ = nullptr;
+        fnCreate = nullptr;
+        return false;
+    }
+    return true;
 }
 
 bool VtesOcrReader::init(const std::string& tessdata_path,
@@ -29,36 +117,52 @@ bool VtesOcrReader::init(const std::string& tessdata_path,
 {
     card_names_ = card_names;
 
-#ifdef VTES_HAVE_TESSERACT
-    tess_ = TessBaseAPICreate();
-    if (!tess_) {
-        fprintf(stderr, "[VtesOcr] Failed to create Tesseract API\n");
+    if (!loadTesseractDLL()) {
+        obs_log(LOG_WARNING, "[OCR] Tesseract DLL not found");
         return false;
     }
 
-    int rc = TessBaseAPIInit3(tess_, tessdata_path.c_str(), "eng");
+    tess_ = fnCreate();
+    if (!tess_) {
+        obs_log(LOG_WARNING, "[OCR] Failed to create Tesseract API");
+        return false;
+    }
+
+    // Use "vtes" fine-tuned model if available, otherwise "eng"
+    std::string lang = "eng";
+    std::string vtes_path = tessdata_path + "/vtes.traineddata";
+#ifdef _WIN32
+    DWORD attr = GetFileAttributesA(vtes_path.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        lang = "vtes";
+        obs_log(LOG_INFO, "[OCR] Using fine-tuned VTES model");
+    }
+#else
+    struct stat st;
+    if (stat(vtes_path.c_str(), &st) == 0 && st.st_size > 0) {
+        lang = "vtes";
+        obs_log(LOG_INFO, "[OCR] Using fine-tuned VTES model");
+    }
+#endif
+
+    int rc = fnInit3(tess_, tessdata_path.c_str(), lang.c_str());
     if (rc != 0) {
-        fprintf(stderr, "[VtesOcr] Tesseract init failed (rc=%d, path=%s)\n",
-                rc, tessdata_path.c_str());
-        TessBaseAPIDelete(tess_);
+        obs_log(LOG_WARNING, "[OCR] Tesseract init failed (rc=%d, path=%s, lang=%s)",
+                rc, tessdata_path.c_str(), lang.c_str());
+        fnDelete(tess_);
         tess_ = nullptr;
         return false;
     }
 
-    TessBaseAPISetVariable(tess_, "tessedit_char_whitelist",
-                           "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',-&()");
-    TessBaseAPISetVariable(tess_, "load_system_dawg", "false");
-    TessBaseAPISetVariable(tess_, "load_freq_dawg", "false");
+    fnSetVariable(tess_, "tessedit_char_whitelist",
+                  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',-&()");
+    fnSetVariable(tess_, "load_system_dawg", "false");
+    fnSetVariable(tess_, "load_freq_dawg", "false");
 
     initialized_ = true;
-    fprintf(stderr, "[VtesOcr] Tesseract initialized (%zu card names loaded)\n",
+    obs_log(LOG_INFO, "[OCR] Tesseract initialized (%zu card names loaded)",
             card_names_.size());
     return true;
-#else
-    (void)tessdata_path;
-    fprintf(stderr, "[VtesOcr] Tesseract not available (recompile with VTES_HAVE_TESSERACT)\n");
-    return false;
-#endif
 }
 
 bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
@@ -72,34 +176,25 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
 
     if (!initialized_ || card_bgr.empty()) return false;
 
-#ifdef VTES_HAVE_TESSERACT
-    // 1. Extract name region (top ~10% of card)
     cv::Mat name_region = extractNameRegion(card_bgr);
     if (name_region.empty()) return false;
 
-    // 2. Preprocess for OCR (grayscale + threshold)
     cv::Mat processed = preprocessForOcr(name_region);
     if (processed.empty()) return false;
 
-    // 3. Run Tesseract using raw image API (no Leptonica needed)
-    // processed is 8-bit grayscale (CV_8UC1)
-    TessBaseAPISetImage(tess_, processed.data, processed.cols, processed.rows,
-                        1, processed.step);
+    fnSetImage(tess_, processed.data, processed.cols, processed.rows, 1, (int)processed.step);
 
-    // Set the resolution so Tesseract scales properly
-    char* text = TessBaseAPIGetUTF8Text(tess_);
+    char* text = fnGetUTF8Text(tess_);
     if (!text) return false;
 
     std::string ocr_text(text);
-    TessDeleteText(text);
+    fnDeleteText(text);
 
-    // Clean OCR output
     ocr_text.erase(std::remove(ocr_text.begin(), ocr_text.end(), '\n'), ocr_text.end());
     ocr_text.erase(std::remove(ocr_text.begin(), ocr_text.end(), '\r'), ocr_text.end());
 
     if (ocr_text.empty()) return false;
 
-    // 4. Try API lookup against local VTES API first
     {
         CardLookupResult api_result = lookup_card_by_ocr(ocr_text);
         if (!api_result.printed_name.empty()) {
@@ -110,7 +205,6 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
         }
     }
 
-    // 5. Fallback: fuzzy match against local card names
     auto [matched_id, matched_name, score] = fuzzyMatch(ocr_text);
     if (score < 0.3f) return false;
 
@@ -118,10 +212,6 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
     out_id = matched_id;
     out_confidence = score;
     return true;
-#else
-    (void)card_bgr;
-    return false;
-#endif
 }
 
 cv::Mat VtesOcrReader::extractNameRegion(const cv::Mat& card_bgr)
@@ -131,7 +221,6 @@ cv::Mat VtesOcrReader::extractNameRegion(const cv::Mat& card_bgr)
     int h = card_bgr.rows;
     int w = card_bgr.cols;
 
-    // Card name is in the top ~20% of the card
     int name_top = (int)(h * 0.02f);
     int name_bottom = (int)(h * 0.20f);
     int name_h = name_bottom - name_top;
@@ -158,22 +247,18 @@ cv::Mat VtesOcrReader::preprocessForOcr(const cv::Mat& region)
         gray = region.clone();
     }
 
-    // Upscale 2x for better OCR
     cv::Mat upscaled;
     cv::resize(gray, upscaled, cv::Size(region.cols * 2, region.rows * 2),
                0, 0, cv::INTER_CUBIC);
 
-    // Adaptive threshold
     cv::Mat binary;
     cv::adaptiveThreshold(upscaled, binary, 255,
                           cv::ADAPTIVE_THRESH_GAUSSIAN_C,
                           cv::THRESH_BINARY_INV, 31, 8);
 
-    // Denoise
     cv::Mat denoised;
     cv::medianBlur(binary, denoised, 3);
 
-    // Morphological close to connect broken characters
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2));
     cv::morphologyEx(denoised, denoised, cv::MORPH_CLOSE, kernel);
 
@@ -205,7 +290,6 @@ VtesOcrReader::fuzzyMatch(const std::string& ocr_text)
     for (const auto& entry : card_names_) {
         const std::string& candidate = entry.normalized;
 
-        // Exact substring match
         if (candidate.find(ocr_norm) != std::string::npos ||
             ocr_norm.find(candidate) != std::string::npos) {
             float score = (float)std::min(ocr_norm.size(), candidate.size()) /
@@ -219,7 +303,6 @@ VtesOcrReader::fuzzyMatch(const std::string& ocr_text)
             continue;
         }
 
-        // Levenshtein distance
         size_t m = ocr_norm.size();
         size_t n = candidate.size();
         if (std::abs((int)m - (int)n) > (int)(m * 0.5f)) continue;

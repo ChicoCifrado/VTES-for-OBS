@@ -4,9 +4,8 @@
 #include <obs-module.h>
 #include <opencv2/dnn.hpp>
 #include <onnxruntime_cxx_api.h>
-#include "detection/yolo_detector.hpp"
+#include "detection/detector_base.hpp"
 #include "sort/Sort.h"
-#include "ws-client.h"
 #include "classifier/vtes_card_classifier.hpp"
 #include "embedding_matcher.h"
 #include "vtes_database.hpp"
@@ -87,7 +86,7 @@ struct filter_data {
 	std::mutex outputLock;
 	std::mutex modelMutex;
 
-	std::unique_ptr<vtes_detection::YOLODetector> yolo_detector;
+	std::unique_ptr<vtes_detection::DetectorBase> yolo_detector;
 	std::vector<std::string> classNames;
 
 #if _WIN32
@@ -109,14 +108,6 @@ struct filter_data {
 	// ONNX detection area filters
 	int onnxMinArea;
 	double onnxMaxAreaFrac;
-
-	// VTES-specific: WebSocket client for sending card crops to Node.js server
-	WebSocketClient wsClient;
-	std::string wsHost;
-	int wsPort;
-	std::chrono::steady_clock::time_point lastSendTime;
-	int cooldownSeconds;
-	std::atomic<bool> wsSendInProgress;
 
 	// --- Temporal smoothing (mtg_card_detector style) ---
 	static constexpr int TEMPORAL_WINDOW = 10; // frames
@@ -174,6 +165,16 @@ struct filter_data {
 	// --- Embedded web server for card search UI ---
 	std::unique_ptr<WebServer> web_server;
 	int web_server_port = 8080;
+
+	// --- Card image cache for overlay display ---
+	std::unordered_map<std::string, cv::Mat> card_image_cache;
+	std::chrono::steady_clock::time_point last_overlay_detection_time;
+	std::string current_overlay_card_url;
+	float card_overlay_duration = 5.0f;
+
+	// --- Performance: frame skip (process every N frames) ---
+	std::atomic<int> process_every_n_frames{3};
+	int video_tick_counter = 0;
 
 };
 #endif /* FILTERDATA_H */
