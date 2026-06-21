@@ -752,6 +752,9 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 
 	obs_properties_add_bool(props, "classifier_enabled", "Type Classifier (filter by card type)");
 
+	// OCR
+	obs_properties_add_bool(props, "ocr_enabled", "OCR (read card names with Tesseract)");
+
 	// Card Search Web Server
 	obs_properties_add_button(props, "card_search_btn", "Open Card Search",
 		[](obs_properties_t *, obs_property_t *, void *data) {
@@ -813,6 +816,7 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 
 	// Classifier defaults
 	obs_data_set_default_bool(settings, "classifier_enabled", true);
+	obs_data_set_default_bool(settings, "ocr_enabled", true);
 	obs_data_set_default_int(settings, "process_every_n_frames", 6);
 	obs_data_set_default_double(settings, "clf_oval_weight", 0.5);
 	obs_data_set_default_double(settings, "clf_color_weight", 0.3);
@@ -841,6 +845,18 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 	tf->saveDetectionsPath = obs_data_get_string(settings, "save_detections_path");
 	tf->process_every_n_frames = (int)obs_data_get_int(settings, "process_every_n_frames");
 	if (tf->process_every_n_frames < 1) tf->process_every_n_frames = 1;
+
+	// OCR enabled checkbox
+	bool ocr_wanted = obs_data_get_bool(settings, "ocr_enabled");
+	if (ocr_wanted && !tf->ocr_enabled) {
+		// Force re-initialization if user enables OCR
+		tf->ocr_reader.reset();
+		tf->ocr_enabled = false;
+	} else if (!ocr_wanted && tf->ocr_enabled) {
+		// User disabled OCR
+		tf->ocr_reader.reset();
+		tf->ocr_enabled = false;
+	}
 
 	const std::string newDetectMode = obs_data_get_string(settings, "detection_mode");
 	tf->contourEdgeLow = (int)obs_data_get_int(settings, "contour_edge_low");
@@ -890,9 +906,21 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		loadPerTypeEmbedders(tf);
 	}
 
+	// Ensure card database is loaded (required for OCR)
+	if (tf->vtes_db.is_empty()) {
+		loadCardInfo(tf);
+	}
+
 	// OCR reader (load once on startup, requires vtes_db from loadCardInfo)
 	if (!tf->ocr_reader) {
 		initOcrReader(tf);
+	}
+
+	// Respect user OCR enabled setting
+	bool ocr_wanted = obs_data_get_bool(settings, "ocr_enabled");
+	if (!ocr_wanted && tf->ocr_enabled) {
+		tf->ocr_reader.reset();
+		tf->ocr_enabled = false;
 	}
 
 	// Classifier
