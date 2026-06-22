@@ -917,7 +917,7 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 	}
 
 	// Respect user OCR enabled setting
-	bool ocr_wanted = obs_data_get_bool(settings, "ocr_enabled");
+	ocr_wanted = obs_data_get_bool(settings, "ocr_enabled");
 	if (!ocr_wanted && tf->ocr_enabled) {
 		tf->ocr_reader.reset();
 		tf->ocr_enabled = false;
