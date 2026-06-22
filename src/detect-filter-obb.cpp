@@ -1269,7 +1269,134 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 
 	detect_filter_obb_update(tf, settings);
 
+	// Start background OCR worker thread
+	start_ocr_worker(tf);
+
 	return tf;
+}
+
+// ─── Async OCR worker ────────────────────────────────────────────────
+// Runs Tesseract on a background thread so video_tick never blocks on OCR.
+// The worker owns the ocr_reader; video_tick submits jobs and consumes results.
+
+static void ocr_worker_func(detect_filter_obb* tf)
+{
+	obs_log(LOG_INFO, "[OCR Worker] Started");
+	while (tf->ocr_worker_active) {
+		filter_data::OcrJob job;
+		{
+			std::unique_lock<std::mutex> lock(tf->ocr_queue_lock);
+			tf->ocr_queue_cv.wait_for(lock, std::chrono::milliseconds(100),
+				[&]{ return !tf->ocr_queue.empty() || !tf->ocr_worker_active; });
+			if (!tf->ocr_worker_active) break;
+			if (tf->ocr_queue.empty()) continue;
+			job = std::move(tf->ocr_queue.front());
+			tf->ocr_queue.pop();
+		}
+
+		if (job.card_region.empty() || !tf->ocr_reader) continue;
+
+		std::string ocr_name, ocr_id;
+		float ocr_conf = 0.0f;
+		bool accepted = false;
+		if (tf->ocr_reader->recognize(job.card_region, ocr_name, ocr_id, ocr_conf, job.type_filter)) {
+			accepted = true;
+			// Vampire card validation
+			auto ci_it = tf->card_info_by_id.find(ocr_id);
+			if (ci_it != tf->card_info_by_id.end()) {
+				bool is_vampire = false;
+				for (const auto& t : ci_it->second.types) {
+					if (t == "Vampire") { is_vampire = true; break; }
+				}
+				if (is_vampire) {
+					obs_log(LOG_INFO, "[OCR] Vampire validation for '%s' (id=%s)",
+						ocr_name.c_str(), ocr_id.c_str());
+					if (!VtesOcrReader::hasVampireOval(job.card_region)) {
+						obs_log(LOG_INFO, "[OCR] Vampire REJECTED: no oval portrait found");
+						accepted = false;
+					} else {
+						int detected_cap = tf->ocr_reader->detectVampireCapacity(job.card_region);
+						int expected_cap = ci_it->second.capacity;
+						if (detected_cap < 0) {
+							obs_log(LOG_WARNING, "[OCR] Vampire: could not read capacity, accepting anyway");
+						} else if (detected_cap != expected_cap) {
+							obs_log(LOG_INFO, "[OCR] Vampire REJECTED: capacity %d != expected %d",
+								detected_cap, expected_cap);
+							accepted = false;
+						} else {
+							obs_log(LOG_INFO, "[OCR] Vampire ACCEPTED: oval + capacity %d matches",
+								detected_cap);
+						}
+					}
+				}
+			}
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(tf->ocr_result_lock);
+			tf->ocr_completed.push_back({job.id, true, accepted,
+				ocr_name, ocr_id, ocr_conf});
+		}
+	}
+	obs_log(LOG_INFO, "[OCR Worker] Stopped");
+}
+
+static void start_ocr_worker(detect_filter_obb* tf)
+{
+	if (tf->ocr_worker_active) return;
+	tf->ocr_worker_active = true;
+	tf->ocr_worker = std::thread(ocr_worker_func, tf);
+}
+
+static void stop_ocr_worker(detect_filter_obb* tf)
+{
+	if (!tf->ocr_worker_active) return;
+	tf->ocr_worker_active = false;
+	tf->ocr_queue_cv.notify_all();
+	if (tf->ocr_worker.joinable())
+		tf->ocr_worker.join();
+}
+
+static void submit_ocr_jobs(detect_filter_obb* tf,
+							const std::vector<cv::Mat>& card_regions,
+							const std::vector<std::string>& type_filters)
+{
+	if (!tf->ocr_worker_active || !tf->ocr_reader) return;
+	for (size_t i = 0; i < card_regions.size() && i < type_filters.size(); i++) {
+		if (card_regions[i].empty()) continue;
+		int64_t jid = tf->ocr_next_job_id++;
+		{
+			std::lock_guard<std::mutex> lock(tf->ocr_queue_lock);
+			tf->ocr_queue.push({jid, card_regions[i].clone(), type_filters[i]});
+		}
+		tf->ocr_queue_cv.notify_one();
+	}
+}
+
+static void drain_ocr_results(detect_filter_obb* tf,
+							  std::vector<vtes_detection::OBBObject>& objects)
+{
+	std::vector<filter_data::OcrJobResult> fresh;
+	{
+		std::lock_guard<std::mutex> lock(tf->ocr_result_lock);
+		fresh.swap(tf->ocr_completed);
+	}
+	for (auto& result : fresh) {
+		if (!result.completed) continue;
+		if (result.accepted) {
+			// Apply to the first object that still has no name ("???")
+			for (auto& obj : objects) {
+				if (obj.card_name == "???" || obj.card_name.empty()) {
+					obj.card_name = result.card_name;
+					obj.card_id = result.card_id;
+					obj.prob = result.confidence;
+					obs_log(LOG_INFO, "[OCR] Async result: '%s' (id=%s, conf=%.2f)",
+						result.card_name.c_str(), result.card_id.c_str(), result.confidence);
+					break;
+				}
+			}
+		}
+	}
 }
 
 void detect_filter_obb_destroy(void *data)
@@ -1286,6 +1413,9 @@ void detect_filter_obb_destroy(void *data)
 			tf->web_server->stop();
 			tf->web_server.reset();
 		}
+
+		// Stop OCR worker before destroying any resources it may use
+		stop_ocr_worker(tf);
 
 		obs_enter_graphics();
 		gs_texrender_destroy(tf->texrender);
@@ -1325,7 +1455,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	} else {
 		auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 			std::chrono::steady_clock::now().time_since_epoch()).count();
-		if (now_ns - tf->last_detection_time_ns < 100000000ULL) {
+		if (now_ns - tf->last_detection_time_ns < 33000000ULL) {
 			should_detect = false;
 		} else {
 			tf->last_detection_time_ns = now_ns;
@@ -1481,59 +1611,9 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				}
 			}
 
-			// OCR: runs whenever enabled, not just as embedding fallback
-			if (tf->ocr_enabled && tf->ocr_reader) {
-				std::string ocr_name, ocr_id;
-				float ocr_conf = 0.0f;
-				if (tf->ocr_reader->recognize(card_region, ocr_name, ocr_id, ocr_conf, type_filter)) {
-					// ─── Vampire card validation ──────────────────────────
-					bool ocr_accepted = true;
-					auto ci_it = tf->card_info_by_id.find(ocr_id);
-					if (ci_it != tf->card_info_by_id.end()) {
-						bool is_vampire = false;
-						for (const auto& t : ci_it->second.types) {
-							if (t == "Vampire") { is_vampire = true; break; }
-						}
-						if (is_vampire) {
-							obs_log(LOG_INFO, "[OCR] Vampire validation for '%s' (id=%s)",
-								ocr_name.c_str(), ocr_id.c_str());
-
-							if (!VtesOcrReader::hasVampireOval(card_region)) {
-								obs_log(LOG_INFO, "[OCR] Vampire REJECTED: no oval portrait found");
-								ocr_accepted = false;
-							} else {
-								int detected_cap = tf->ocr_reader->detectVampireCapacity(card_region);
-								int expected_cap = ci_it->second.capacity;
-								if (detected_cap < 0) {
-									obs_log(LOG_WARNING, "[OCR] Vampire: could not read capacity, accepting anyway");
-								} else if (detected_cap != expected_cap) {
-									obs_log(LOG_INFO, "[OCR] Vampire REJECTED: capacity %d != expected %d",
-										detected_cap, expected_cap);
-									ocr_accepted = false;
-								} else {
-									obs_log(LOG_INFO, "[OCR] Vampire ACCEPTED: oval + capacity %d matches",
-										detected_cap);
-								}
-							}
-						}
-					}
-
-					if (ocr_accepted) {
-						if (ocr_conf > confidence) {
-							card_name = ocr_name;
-							card_id = ocr_id;
-							confidence = ocr_conf;
-							thresh = 0.3f;
-						}
-						matched = true;
-						obs_log(LOG_INFO, "[OCR] Card #%d: OCR matched '%s' (id=%s, conf=%.2f)",
-							obj.id, ocr_name.c_str(), ocr_id.c_str(), ocr_conf);
-					} else {
-						obs_log(LOG_INFO, "[OCR] Card #%d: OCR result '%s' rejected by vampire validation",
-							obj.id, ocr_name.c_str());
-					}
-				}
-			}
+			// OCR is async: runs on a background worker thread.
+			// Jobs are submitted below; results are drained on the next frame.
+			// (The worker handles recognize() + vampire validation.)
 
 			if (matched) {
 				if (confidence >= thresh) {
@@ -1558,6 +1638,13 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 						obj.id, confidence, type_filter.c_str());
 				}
 			}
+		}
+
+		// Drain async OCR results from background worker (applies to
+		// objects still marked "???") and submit new jobs for this frame.
+		if (tf->ocr_enabled) {
+			drain_ocr_results(tf, raw_objects);
+			submit_ocr_jobs(tf, card_regions, per_object_type_filter);
 		}
 	}
 

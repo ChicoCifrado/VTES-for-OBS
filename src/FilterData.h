@@ -162,6 +162,32 @@ struct filter_data {
 	std::vector<VTESCardNameEntry> card_name_entries;  // built from vtes_db for fuzzy matching
 	bool ocr_enabled = false;
 
+	// --- Async OCR worker (background thread, doesn't block video_tick) ---
+	struct OcrJob {
+		int64_t id;
+		cv::Mat card_region;
+		std::string type_filter;
+	};
+	struct OcrJobResult {
+		int64_t id;
+		bool completed = false;
+		bool accepted = false;
+		std::string card_name;
+		std::string card_id;
+		float confidence = 0.0f;
+	};
+
+	std::thread ocr_worker;
+	std::mutex ocr_queue_lock;
+	std::condition_variable ocr_queue_cv;
+	std::queue<OcrJob> ocr_queue;
+	std::atomic<bool> ocr_worker_active{false};
+	std::atomic<int64_t> ocr_next_job_id{1};
+
+	// Completed results, produced by worker thread, consumed by video_tick
+	std::mutex ocr_result_lock;
+	std::vector<OcrJobResult> ocr_completed;
+
 	// --- Embedded web server for card search UI ---
 	std::unique_ptr<WebServer> web_server;
 	int web_server_port = 8080;
