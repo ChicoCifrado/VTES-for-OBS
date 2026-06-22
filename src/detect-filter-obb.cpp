@@ -979,20 +979,11 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 			"old='%s' new='%s'",
 			(int)modeChanged, (int)deviceSame, (int)threadsSame,
 			old_inference_device.c_str(), newInfDevSafe.c_str());
-		if (!modeChanged && threadsSame) {
-			if (deviceSame) {
-				reinitialize = false;
-			} else {
-				// Device string mismatch but model already loaded and
-				// mode unchanged — don't kill a working session over a
-				// spurious comparison (OBS sometimes passes stale settings).
-				obs_log(LOG_INFO,
-					"ONNX reload: device string mismatch, but keeping "
-					"existing loaded model to avoid session loss");
-				reinitialize = false;
-				tf->inference_device = old_inference_device;
-				tf->inference_device_enum = deviceStringToEnum(old_inference_device);
-			}
+		if (!modeChanged && deviceSame && threadsSame) {
+			reinitialize = false;
+			obs_log(LOG_INFO, "ONNX reload: nothing changed, keeping existing model");
+		} else {
+			obs_log(LOG_INFO, "ONNX reload: change detected, reloading model");
 		}
 	}
 
@@ -1080,9 +1071,42 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 			obs_data_set_string(settings, "error", "");
 		} catch (const std::exception &e) {
 			obs_log(LOG_ERROR, "Failed to load OBB model: %s", e.what());
+
+#if defined(TENSORRT_AVAILABLE) && !defined(ORT_CPU_ONLY)
+			// If TensorRT failed, fall back to DirectML without disabling
+			if (tf->inference_device_enum == InferenceDevice::CUDA) {
+				obs_log(LOG_WARNING,
+					"TensorRT loading failed, falling back to DirectML");
+				tf->inference_device = INFERENCE_DML;
+				tf->inference_device_enum = deviceStringToEnum(tf->inference_device);
+				try {
+					char *fallback_path = obs_module_file("models/vtes.onnx");
+					if (fallback_path) {
+						tf->yolo_detector =
+							std::make_unique<vtes_detection::YOLODetector>(
+								std::string(fallback_path),
+								cv::Size(1024, 1024),
+								tf->inference_device_enum, 0,
+								tf->conf_threshold);
+						bfree(fallback_path);
+					}
+				} catch (const std::exception &fallback_err) {
+					obs_log(LOG_ERROR, "Fallback to DirectML also failed: %s",
+						fallback_err.what());
+					tf->isDisabled = true;
+					tf->yolo_detector.reset();
+					return;
+				}
+			} else {
+				tf->isDisabled = true;
+				tf->yolo_detector.reset();
+				return;
+			}
+#else
 			tf->isDisabled = true;
 			tf->yolo_detector.reset();
 			return;
+#endif
 		}
 	}
 
