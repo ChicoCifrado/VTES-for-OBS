@@ -1447,7 +1447,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			if (tf->ocr_enabled && tf->ocr_reader) {
 				std::string ocr_name, ocr_id;
 				float ocr_conf = 0.0f;
-				if (tf->ocr_reader->recognize(card_region, ocr_name, ocr_id, ocr_conf)) {
+				if (tf->ocr_reader->recognize(card_region, ocr_name, ocr_id, ocr_conf, type_filter)) {
 					// ─── Vampire card validation ──────────────────────────
 					bool ocr_accepted = true;
 					auto ci_it = tf->card_info_by_id.find(ocr_id);

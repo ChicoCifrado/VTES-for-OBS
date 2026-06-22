@@ -170,7 +170,8 @@ bool VtesOcrReader::init(const std::string& tessdata_path,
 bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
                               std::string& out_name,
                               std::string& out_id,
-                              float& out_confidence)
+                              float& out_confidence,
+                              const std::string& card_type_hint)
 {
     out_name.clear();
     out_id.clear();
@@ -179,7 +180,7 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
     if (!initialized_ || card_bgr.empty()) return false;
 
     // Step 1: visually locate the card name region (instead of hardcoded crop)
-    cv::Mat name_region = detectNameRegion(card_bgr);
+    cv::Mat name_region = detectNameRegion(card_bgr, card_type_hint);
     if (name_region.empty()) return false;
 
     cv::Mat processed = preprocessForOcr(name_region);
@@ -234,10 +235,12 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
 }
 
 // ─── Visual name region detection ────────────────────────────────────
-// VTES card names are always in a narrow band at the very top of the card
-// (~0-10% of card height). We scan only the top 12% for high-variance text
-// rows, take the first contiguous block (the name), not the card type below.
-cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr)
+// VTES card names are always in a narrow band at the very top of the card.
+// Non-vampire cards have a card-type banner (e.g. "Master") above the name.
+// The classifier type hint tells us which card type we're looking at so we
+// can skip the banner and target the actual name band below it.
+cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr,
+                                        const std::string& card_type_hint)
 {
     if (card_bgr.empty()) return {};
 
@@ -279,13 +282,20 @@ cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr)
 
     int name_top = -1, name_bottom = -1;
     if (!bands.empty()) {
-        // Pick the tallest text band (the card name is usually in the largest font)
-        int best_idx = 0;
-        int best_h = bands[0].height;
-        for (size_t i = 1; i < bands.size(); i++) {
+        int start_idx = 0;
+        // Non-vampire cards have a type banner (e.g. "Master") as the first
+        // text band. Skip it and use the second band (the actual card name).
+        if (!card_type_hint.empty() && card_type_hint != "Vampire"
+            && bands.size() >= 2) {
+            start_idx = 1;
+        }
+        // Pick the tallest band from the remaining candidates
+        int best_idx = start_idx;
+        int best_h = bands[start_idx].height;
+        for (size_t i = start_idx + 1; i < bands.size(); i++) {
             if (bands[i].height > best_h) {
                 best_h = bands[i].height;
-                best_idx = i;
+                best_idx = (int)i;
             }
         }
         name_top = bands[best_idx].top;

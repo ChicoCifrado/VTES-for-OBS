@@ -30,7 +30,8 @@ public:
     bool recognize(const cv::Mat& card_bgr,
                    std::string& out_name,
                    std::string& out_id,
-                   float& out_confidence);
+                   float& out_confidence,
+                   const std::string& card_type_hint = "");
 
     // ─── Vampire card validation ────────────────────────────────────
     // Returns true if the card has an oval portrait (vampire indicator)
@@ -60,8 +61,10 @@ private:
     std::vector<VTESCardNameEntry> card_names_;
 
     // Visually locate the name region on a perspective-corrected card
-    // instead of using hardcoded percentages
-    cv::Mat detectNameRegion(const cv::Mat& card_bgr);
+    // card_type_hint: "Vampire", "Master", etc. from classifier — used to
+    // skip the card-type banner and target the actual card name below it.
+    cv::Mat detectNameRegion(const cv::Mat& card_bgr,
+                             const std::string& card_type_hint = "");
     cv::Mat preprocessForOcr(const cv::Mat& region);
     std::tuple<std::string, std::string, float> fuzzyMatch(const std::string& ocr_text);
 };
