@@ -1294,14 +1294,6 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		}
 	}
 
-	// Periodic counter log (every 30 ticks ≈ 0.5s at 60fps)
-	if (tf->video_tick_counter % 60 == 0) {
-		obs_log(LOG_INFO, "[vtes] tick: counter=%d mod=%d should_detect=%d",
-			tf->video_tick_counter,
-			tf->video_tick_counter % tf->process_every_n_frames,
-			(int)should_detect);
-	}
-
 	cv::Mat imageBGRA;
 	{
 		std::unique_lock<std::mutex> lock(tf->inputBGRALock, std::try_to_lock);
@@ -1337,8 +1329,6 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			std::unique_lock<std::mutex> lock(tf->modelMutex);
 			if (tf->yolo_detector) {
 				raw_objects = tf->yolo_detector->inferOBB(inferenceFrame);
-				obs_log(LOG_INFO, "[vtes] inferOBB: %zu raw objects",
-					raw_objects.size());
 			}
 		} catch (const std::exception &e) {
 			obs_log(LOG_ERROR, "%s", e.what());
@@ -1355,8 +1345,6 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				filtered.push_back(obj);
 			}
 		}
-		obs_log(LOG_INFO, "[vtes] area filter: %zu -> %zu objects",
-			raw_objects.size(), filtered.size());
 		raw_objects = filtered;
 	}
 
@@ -1428,9 +1416,6 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	// ─── Card identification (embedding + OCR) ──────────────────────────
 	// OCR runs regardless of embedding availability — don't guard with embed_available
 	bool embed_available = tf->embedder.is_loaded() || !tf->per_type_matchers.empty();
-	obs_log(LOG_INFO, "[vtes] identification: %zu objects, embed_available=%d ocr_enabled=%d has_reader=%d",
-		raw_objects.size(), (int)embed_available,
-		(int)tf->ocr_enabled, (int)(tf->ocr_reader ? 1 : 0));
 	if (!raw_objects.empty()) {
 		for (size_t i = 0; i < raw_objects.size(); i++) {
 			auto& obj = raw_objects[i];
@@ -1766,8 +1751,6 @@ void detect_filter_obb_video_render(void *data, gs_effect_t *_effect)
 {
 	struct detect_filter_obb *tf = reinterpret_cast<detect_filter_obb *>(data);
 
-	obs_log(LOG_INFO, "[vtes] render called");
-
 	if (tf->isDisabled) {
 		if (tf->source) {
 			obs_source_skip_video_filter(tf->source);
@@ -1783,7 +1766,6 @@ void detect_filter_obb_video_render(void *data, gs_effect_t *_effect)
 
 	uint32_t width, height;
 	if (!getRGBAFromStageSurface(tf, width, height)) {
-		obs_log(LOG_INFO, "[vtes] render: getRGBAFromStageSurface failed");
 		if (tf->source) {
 			obs_source_skip_video_filter(tf->source);
 		}
