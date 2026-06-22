@@ -37,6 +37,9 @@ static constexpr float kPI = 3.14159265358979323846f;
 #include "obs-utils/obs-utils.h"
 #include "detect-filter-utils.h"
 #include "detection/yolo_detector.hpp"
+#ifdef TENSORRT_AVAILABLE
+#include "detection/tensorrt_detector.hpp"
+#endif
 #include "detection/contour_detector.hpp"
 #include "classifier/vtes_card_classifier.hpp"
 #include "base64-utils.h"
@@ -356,6 +359,8 @@ static void buildCardNameEntries(struct filter_data *tf)
 
 static void initOcrReader(struct filter_data *tf)
 {
+    obs_log(LOG_INFO, "[OCR] initOcrReader called (ocr_reader=%p, enabled=%d)",
+            (void*)tf->ocr_reader.get(), (int)tf->ocr_enabled);
     if (tf->ocr_reader) return; // already initialized
 
     // Build card name entries first (needs vtes_db to be loaded)
@@ -399,8 +404,14 @@ static void initOcrReader(struct filter_data *tf)
     }
 
     if (found_path.empty()) {
-        obs_log(LOG_WARNING, "[OCR] eng.traineddata not found in any tessdata path. "
-                "Install Tesseract or place tessdata/ in plugin data dir.");
+        std::string checked;
+        for (const auto& p : tessdata_candidates) {
+            if (!checked.empty()) checked += ", ";
+            checked += p;
+        }
+        obs_log(LOG_WARNING, "[OCR] eng.traineddata not found. Checked: %s. "
+                "Install Tesseract with language data or copy tessdata/ into plugin data dir.",
+                checked.c_str());
         return;
     }
 
@@ -409,6 +420,8 @@ static void initOcrReader(struct filter_data *tf)
         tf->ocr_reader = std::move(reader);
         tf->ocr_enabled = true;
         obs_log(LOG_INFO, "[OCR] Tesseract initialized with tessdata: %s", found_path.c_str());
+    } else {
+        obs_log(LOG_WARNING, "[OCR] VtesOcrReader::init() failed (tessdata: %s)", found_path.c_str());
     }
 }
 
@@ -434,6 +447,30 @@ static bool downloadFile(const std::string& url, const std::string& dest) {
     curl_easy_cleanup(curl);
     if (res != CURLE_OK) { remove(dest.c_str()); return false; }
     return true;
+}
+
+// Download image bytes to memory (for card overlay cache)
+static size_t write_mem_cb(char* ptr, size_t size, size_t nmemb, std::vector<uchar>* out) {
+    size_t total = size * nmemb;
+    out->insert(out->end(), ptr, ptr + total);
+    return total;
+}
+
+static bool downloadImageToMemory(const std::string& url, std::vector<uchar>& out_data) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+    out_data.clear();
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_mem_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out_data);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5000L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2000L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "VTES-Card-Scanner/0.1.4");
+    CURLcode res = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+    return res == CURLE_OK && !out_data.empty();
 }
 
 // ─── Card info loader (byId section from card-hash-index.json + vtes.json) ─
@@ -594,8 +631,11 @@ static void updateTemporalTracks(
 			if (!det.card_id.empty() && det.card_id == track.tracked_card_id) {
 				track.identity_hits++;
 			} else if (!det.card_id.empty()) {
-				// New identity detected — reset if strong evidence
-				if (track.identity_hits < 2) {
+				bool current_weak = track.identity_total < 5 ||
+				    (track.identity_total > 0 &&
+				     (float)track.identity_hits / track.identity_total < 0.4f);
+				bool new_much_better = det.prob > track.confidence + 0.2f;
+				if (current_weak || new_much_better) {
 					track.tracked_card_id = det.card_id;
 					track.tracked_card_name = det.card_name;
 					track.identity_hits = 1;
@@ -686,6 +726,7 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	obs_properties_t *props = obs_properties_create();
 
 	obs_properties_add_bool(props, "preview", obs_module_text("Preview"));
+	obs_properties_add_bool(props, "always_active", "Always active (detect even when boxes hidden)");
 
 	obs_properties_add_float_slider(props, "threshold", obs_module_text("ConfThreshold"), 0.0,
 					1.0, 0.025);
@@ -706,31 +747,15 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	obs_property_list_add_string(p_inf_dev, obs_module_text("GPU (CUDA)"), INFERENCE_CUDA);
 #endif
 
-	// --- Card Type Classifier (for type-based embedding filter) ---
+	// --- Detection interval (timeout between detection runs) ---
+	obs_properties_add_float_slider(props, "detection_interval_seconds",
+		"Detection interval (seconds, 0 = process every frame)",
+		0.0, 5.0, 0.1);
+
 	obs_properties_add_bool(props, "classifier_enabled", "Type Classifier (filter by card type)");
 
-	// VTES: WebSocket server settings
-	obs_properties_t *vtes_group_props = obs_properties_create();
-	obs_property_t *vtes_group =
-		obs_properties_add_group(props, "vtes_group", "VTES Card Server",
-					 OBS_GROUP_CHECKABLE, vtes_group_props);
-
-	obs_property_set_modified_callback(vtes_group, [](obs_properties_t *props_,
-							  obs_property_t *, obs_data_t *settings) {
-		const bool enabled = obs_data_get_bool(settings, "vtes_group");
-		for (auto prop_name : {"vtes_ws_host", "vtes_ws_port", "vtes_cooldown"}) {
-			obs_property_t *prop = obs_properties_get(props_, prop_name);
-			obs_property_set_visible(prop, enabled);
-		}
-		return true;
-	});
-
-	obs_properties_add_text(vtes_group_props, "vtes_ws_host", "WebSocket Host",
-				OBS_TEXT_DEFAULT);
-	obs_properties_add_int_slider(vtes_group_props, "vtes_ws_port", "WebSocket Port",
-				      1000, 9999, 1);
-	obs_properties_add_int_slider(vtes_group_props, "vtes_cooldown", "Cooldown (seconds)",
-				      1, 30, 1);
+	// OCR
+	obs_properties_add_bool(props, "ocr_enabled", "OCR (read card names with Tesseract)");
 
 	// Card Search Web Server
 	obs_properties_add_button(props, "card_search_btn", "Open Card Search",
@@ -743,7 +768,15 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 			if (tf->web_server && tf->web_server->is_running()) {
 				std::string url = "http://localhost:" + std::to_string(tf->web_server->port());
 #ifdef _WIN32
-				ShellExecuteA(NULL, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+				int len = MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, nullptr, 0);
+				if (len > 0) {
+					std::wstring wurl(len, L'\0');
+					MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, &wurl[0], len);
+					HINSTANCE result = ShellExecuteW(NULL, L"open", wurl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+					if ((INT_PTR)result <= 32) {
+						obs_log(LOG_WARNING, "Failed to open browser (error %d)", (INT_PTR)result);
+					}
+				}
 #else
 				std::string cmd = "xdg-open " + url;
 				std::thread([cmd]() { system(cmd.c_str()); }).detach();
@@ -769,6 +802,7 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 #endif
 	obs_data_set_default_bool(settings, "sort_tracking", false);
 	obs_data_set_default_bool(settings, "preview", true);
+	obs_data_set_default_bool(settings, "always_active", true);
 	obs_data_set_default_double(settings, "threshold", 0.5);
 	obs_data_set_default_string(settings, "detection_mode", DETECT_MODE_CONTOUR);
 	obs_data_set_default_bool(settings, "temporal_smoothing", true);
@@ -793,18 +827,14 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 
 	// Classifier defaults
 	obs_data_set_default_bool(settings, "classifier_enabled", true);
+	obs_data_set_default_bool(settings, "ocr_enabled", true);
+	obs_data_set_default_double(settings, "detection_interval_seconds", 0.0);
 	obs_data_set_default_double(settings, "clf_oval_weight", 0.5);
 	obs_data_set_default_double(settings, "clf_color_weight", 0.3);
 	obs_data_set_default_double(settings, "clf_contour_weight", 0.2);
 	obs_data_set_default_double(settings, "clf_oval_thresh", 0.6);
 	obs_data_set_default_double(settings, "clf_color_thresh", 0.55);
 	obs_data_set_default_double(settings, "clf_oval_reject_master", 0.4);
-
-	// VTES defaults
-	obs_data_set_default_bool(settings, "vtes_group", false);
-	obs_data_set_default_string(settings, "vtes_ws_host", "127.0.0.1");
-	obs_data_set_default_int(settings, "vtes_ws_port", 3998);
-	obs_data_set_default_int(settings, "vtes_cooldown", 10);
 }
 
 void detect_filter_obb_update(void *data, obs_data_t *settings)
@@ -816,6 +846,7 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 	tf->isDisabled = true;
 
 	tf->preview = obs_data_get_bool(settings, "preview");
+	tf->always_active = obs_data_get_bool(settings, "always_active");
 	tf->conf_threshold = (float)obs_data_get_double(settings, "threshold");
 	tf->sortTracking = obs_data_get_bool(settings, "sort_tracking");
 	size_t maxUnseenFrames = (size_t)obs_data_get_int(settings, "max_unseen_frames");
@@ -824,6 +855,9 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 	}
 	tf->showUnseenObjects = obs_data_get_bool(settings, "show_unseen_objects");
 	tf->saveDetectionsPath = obs_data_get_string(settings, "save_detections_path");
+	tf->detection_interval_ms = (int)(obs_data_get_double(settings, "detection_interval_seconds") * 1000.0);
+	if (tf->detection_interval_ms < 0) tf->detection_interval_ms = 0;
+	if (tf->detection_interval_ms > 5000) tf->detection_interval_ms = 5000;
 
 	const std::string newDetectMode = obs_data_get_string(settings, "detection_mode");
 	tf->contourEdgeLow = (int)obs_data_get_int(settings, "contour_edge_low");
@@ -849,6 +883,13 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 			obs_log(LOG_INFO, "[Embedding] Loading model: %s", modelPath);
 			tf->embedder.set_inference_device(tf->inference_device_enum);
 			tf->embedder.load(modelPath, binPath, metaPath);
+			tf->embedder.set_threshold(0.80f);
+		} else {
+			obs_log(LOG_WARNING, "[Embedding] Model files missing — "
+				"vtes_embedder_1024d.onnx=%s embeddings_1024d.bin=%s embeddings_1024d_meta.json=%s",
+				modelPath ? "OK" : "MISSING",
+				binPath ? "OK" : "MISSING",
+				metaPath ? "OK" : "MISSING");
 		}
 		bfree(modelPath);
 		bfree(binPath);
@@ -867,9 +908,18 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		loadPerTypeEmbedders(tf);
 	}
 
-	// OCR reader (load once on startup, requires vtes_db from loadCardInfo)
-	if (!tf->ocr_reader) {
+	// Ensure card database is loaded (required for OCR)
+	if (tf->vtes_db.is_empty()) {
+		loadCardInfo(tf);
+	}
+
+	// OCR reader: respect user setting
+	bool ocr_wanted = obs_data_get_bool(settings, "ocr_enabled");
+	tf->ocr_enabled = ocr_wanted;
+	if (ocr_wanted && !tf->ocr_reader) {
 		initOcrReader(tf);
+	} else if (!ocr_wanted && tf->ocr_reader) {
+		tf->ocr_reader.reset();
 	}
 
 	// Classifier
@@ -883,15 +933,20 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		tf->classifierConfig.colorThreshold = (float)obs_data_get_double(settings, "clf_color_thresh");
 		tf->classifierConfig.ovalRejectForMaster = (float)obs_data_get_double(settings, "clf_oval_reject_master");
 
-		if (!tf->classifier) {
-			tf->classifier = std::make_unique<vtes_classifier::VTESCardClassifier>(tf->classifierConfig);
-			tf->cropExtractor = std::make_unique<vtes_classifier::CardCropExtractor>();
-			obs_log(LOG_INFO, "VTES Card Classifier initialized");
-		} else {
-			// Update config
-			tf->classifier = std::make_unique<vtes_classifier::VTESCardClassifier>(tf->classifierConfig);
+		{
+			std::unique_lock<std::mutex> lock(tf->modelMutex);
+			if (!tf->classifier) {
+				tf->classifier = std::make_unique<vtes_classifier::VTESCardClassifier>(tf->classifierConfig);
+				tf->cropExtractor = std::make_unique<vtes_classifier::CardCropExtractor>();
+				obs_log(LOG_INFO, "VTES Card Classifier initialized");
+			} else {
+				// Update config
+				tf->classifier = std::make_unique<vtes_classifier::VTESCardClassifier>(tf->classifierConfig);
+				tf->cropExtractor = std::make_unique<vtes_classifier::CardCropExtractor>();
+			}
 		}
 	} else {
+		std::unique_lock<std::mutex> lock(tf->modelMutex);
 		tf->classifier.reset();
 		tf->cropExtractor.reset();
 	}
@@ -913,10 +968,37 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 	// ONNX mode
 	const std::string newInfDev = obs_data_get_string(settings, "inference_device");
 	const uint32_t newNumThreads = (uint32_t)obs_data_get_int(settings, "numThreads");
+	const std::string newInfDevSafe = newInfDev.empty() ? INFERENCE_DML : newInfDev;
+	const uint32_t newNumThreadsSafe = newNumThreads > 0 ? newNumThreads : 0;
+
+	// Save old values before overwriting — needed for change detection below
+	std::string old_inference_device = tf->inference_device;
+	uint32_t old_numThreads = tf->numThreads;
+
+	tf->inference_device = newInfDevSafe;
+	tf->inference_device_enum = deviceStringToEnum(newInfDevSafe);
+	tf->numThreads = newNumThreadsSafe;
 
 	bool reinitialize = modeChanged;
-	if (tf->inference_device != newInfDev || tf->numThreads != newNumThreads) {
+	if (old_inference_device != newInfDevSafe || old_numThreads != newNumThreadsSafe) {
 		reinitialize = true;
+	}
+
+	// If model already loaded and nothing actually changed, skip reload
+	if (reinitialize && tf->yolo_detector) {
+		bool deviceSame = (old_inference_device == newInfDevSafe);
+		bool threadsSame = (old_numThreads == newNumThreadsSafe);
+		obs_log(LOG_INFO,
+			"ONNX reload check: modeChanged=%d deviceSame=%d threadsSame=%d "
+			"old='%s' new='%s'",
+			(int)modeChanged, (int)deviceSame, (int)threadsSame,
+			old_inference_device.c_str(), newInfDevSafe.c_str());
+		if (!modeChanged && deviceSame && threadsSame) {
+			reinitialize = false;
+			obs_log(LOG_INFO, "ONNX reload: nothing changed, keeping existing model");
+		} else {
+			obs_log(LOG_INFO, "ONNX reload: change detected, reloading model");
+		}
 	}
 
 	if (reinitialize) {
@@ -935,10 +1017,6 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		std::string model_path(modelFilepath_rawPtr);
 		bfree(modelFilepath_rawPtr);
 
-		tf->inference_device = newInfDev;
-		tf->inference_device_enum = deviceStringToEnum(newInfDev);
-		tf->numThreads = newNumThreads;
-
 		int onnxruntime_device_id_ = 0;
 
 		try {
@@ -946,12 +1024,52 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 				tf->yolo_detector.reset();
 			}
 
-			tf->yolo_detector =
-				std::make_unique<vtes_detection::YOLODetector>(
-					model_path, cv::Size(1024, 1024),
-					tf->inference_device_enum,
-					onnxruntime_device_id_,
-					tf->conf_threshold);
+#if defined(TENSORRT_AVAILABLE) && !defined(ORT_CPU_ONLY)
+			if (tf->inference_device_enum == InferenceDevice::CUDA) {
+				// Use TensorRTDetector for GPU inference (tensor cores)
+				char *enginePath_rawPtr = obs_module_file("models/vtes.engine");
+				if (enginePath_rawPtr == nullptr) {
+					obs_log(LOG_ERROR, "TensorRT engine file not found (models/vtes.engine)");
+					throw std::runtime_error("Missing TensorRT engine file");
+				}
+				std::string engine_path(enginePath_rawPtr);
+				bfree(enginePath_rawPtr);
+				tf->yolo_detector =
+					std::make_unique<vtes_detection::TensorRTDetector>(
+						engine_path, cv::Size(1024, 1024),
+						onnxruntime_device_id_,
+						tf->conf_threshold);
+				obs_log(LOG_INFO, "Using TensorRT detector: %s", engine_path.c_str());
+			} else {
+				tf->yolo_detector =
+					std::make_unique<vtes_detection::YOLODetector>(
+						model_path, cv::Size(1024, 1024),
+						tf->inference_device_enum,
+						onnxruntime_device_id_,
+						tf->conf_threshold);
+			}
+#else
+			// TensorRT no disponible en este build — si el usuario seleccionó
+			// CUDA, forzamos DirectML (YOLODetector + CUDA EP requiere DLLs
+			// que no tenemos y fallaría con 'Failed to load shared library')
+			{
+				InferenceDevice effective_device = tf->inference_device_enum;
+				if (effective_device == InferenceDevice::CUDA) {
+					obs_log(LOG_WARNING,
+						"TensorRT not available in this build, "
+						"falling back to DirectML");
+					effective_device = InferenceDevice::DirectML;
+					tf->inference_device = INFERENCE_DML;
+					tf->inference_device_enum = effective_device;
+				}
+				tf->yolo_detector =
+					std::make_unique<vtes_detection::YOLODetector>(
+						model_path, cv::Size(1024, 1024),
+						effective_device,
+						onnxruntime_device_id_,
+						tf->conf_threshold);
+			}
+#endif
 
 			char *jsonPath_rawPtr = obs_module_file("models/vtes.json");
 			if (jsonPath_rawPtr) {
@@ -981,9 +1099,42 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 			obs_data_set_string(settings, "error", "");
 		} catch (const std::exception &e) {
 			obs_log(LOG_ERROR, "Failed to load OBB model: %s", e.what());
+
+#if defined(TENSORRT_AVAILABLE) && !defined(ORT_CPU_ONLY)
+			// If TensorRT failed, fall back to DirectML without disabling
+			if (tf->inference_device_enum == InferenceDevice::CUDA) {
+				obs_log(LOG_WARNING,
+					"TensorRT loading failed, falling back to DirectML");
+				tf->inference_device = INFERENCE_DML;
+				tf->inference_device_enum = deviceStringToEnum(tf->inference_device);
+				try {
+					char *fallback_path = obs_module_file("models/vtes.onnx");
+					if (fallback_path) {
+						tf->yolo_detector =
+							std::make_unique<vtes_detection::YOLODetector>(
+								std::string(fallback_path),
+								cv::Size(1024, 1024),
+								tf->inference_device_enum, 0,
+								tf->conf_threshold);
+						bfree(fallback_path);
+					}
+				} catch (const std::exception &fallback_err) {
+					obs_log(LOG_ERROR, "Fallback to DirectML also failed: %s",
+						fallback_err.what());
+					tf->isDisabled = true;
+					tf->yolo_detector.reset();
+					return;
+				}
+			} else {
+				tf->isDisabled = true;
+				tf->yolo_detector.reset();
+				return;
+			}
+#else
 			tf->isDisabled = true;
 			tf->yolo_detector.reset();
 			return;
+#endif
 		}
 	}
 
@@ -997,36 +1148,9 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		obs_log(LOG_INFO, "  Source: %s", obs_source_get_name(tf->source));
 		obs_log(LOG_INFO, "  Inference Device: %s", tf->inference_device.c_str());
 		obs_log(LOG_INFO, "  Num Threads: %d", tf->numThreads);
-		obs_log(LOG_INFO, "  Preview: %s", tf->preview ? "true" : "false");
+		obs_log(LOG_INFO, "  Show Boxes: %s", tf->preview ? "true" : "false");
+		obs_log(LOG_INFO, "  Always Active: %s", tf->always_active ? "true" : "false");
 		obs_log(LOG_INFO, "  Threshold: %.2f", tf->conf_threshold);
-	}
-
-	// VTES: WebSocket connection
-	bool vtesEnabled = obs_data_get_bool(settings, "vtes_group");
-	std::string newWsHost = obs_data_get_string(settings, "vtes_ws_host");
-	int newWsPort = (int)obs_data_get_int(settings, "vtes_ws_port");
-	int newCooldown = (int)obs_data_get_int(settings, "vtes_cooldown");
-
-	if (vtesEnabled) {
-		tf->wsHost = newWsHost;
-		tf->wsPort = newWsPort;
-		tf->cooldownSeconds = newCooldown;
-
-		if (!tf->wsClient.is_connected()) {
-			if (tf->wsClient.connect(tf->wsHost, tf->wsPort)) {
-				obs_log(LOG_INFO, "[VTES] WebSocket connected to %s:%d",
-					tf->wsHost.c_str(), tf->wsPort);
-			} else {
-				obs_log(LOG_WARNING,
-					"[VTES] WebSocket connection failed to %s:%d",
-					tf->wsHost.c_str(), tf->wsPort);
-			}
-		}
-	} else {
-		if (tf->wsClient.is_connected()) {
-			tf->wsClient.disconnect();
-			obs_log(LOG_INFO, "[VTES] WebSocket disconnected");
-		}
 	}
 
 	tf->isDisabled = false;
@@ -1045,6 +1169,16 @@ void detect_filter_obb_deactivate(void *data)
 	struct detect_filter_obb *tf = reinterpret_cast<detect_filter_obb *>(data);
 	tf->isDisabled = true;
 }
+
+// ─── Async OCR worker forward declarations ──────────────────────────
+static void ocr_worker_func(detect_filter_obb* tf);
+static void start_ocr_worker(detect_filter_obb* tf);
+static void stop_ocr_worker(detect_filter_obb* tf);
+static void submit_ocr_jobs(detect_filter_obb* tf,
+							const std::vector<cv::Mat>& card_regions,
+							const std::vector<std::string>& type_filters);
+static void drain_ocr_results(detect_filter_obb* tf,
+							  std::vector<vtes_detection::OBBObject>& objects);
 
 void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 {
@@ -1077,6 +1211,13 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 			obs_log(LOG_INFO, "[Embedding] Loading model on startup: %s", modelPath);
 			tf->embedder.set_inference_device(tf->inference_device_enum);
 			tf->embedder.load(modelPath, binPath, metaPath);
+			tf->embedder.set_threshold(0.80f);
+		} else {
+			obs_log(LOG_WARNING, "[Embedding] Model files missing at startup — "
+				"vtes_embedder_1024d.onnx=%s embeddings_1024d.bin=%s embeddings_1024d_meta.json=%s",
+				modelPath ? "OK" : "MISSING",
+				binPath ? "OK" : "MISSING",
+				metaPath ? "OK" : "MISSING");
 		}
 		bfree(modelPath);
 		bfree(binPath);
@@ -1107,10 +1248,10 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 		if (!session_notified) {
 			session_notified = true;
 #ifdef _WIN32
-			std::string msg = "VTES web server started at http://localhost:"
+			std::string msg = "Servidor web VTES iniciado en http://localhost:"
 				+ std::to_string(tf->web_server_port)
-				+ "\n\nSearch cards from your browser\n"
-				"or click 'Open Card Search' in properties.";
+				+ "\n\nBusca cartas desde tu navegador\n"
+				"o haz clic en 'Open Card Search' en propiedades.";
 			MessageBoxA(NULL, msg.c_str(), "VTES Card Search", MB_OK | MB_ICONINFORMATION | MB_TASKMODAL);
 #else
 			obs_log(LOG_INFO, "[WebServer] Session notified (no MessageBox on this platform)");
@@ -1154,7 +1295,134 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 
 	detect_filter_obb_update(tf, settings);
 
+	// Start background OCR worker thread
+	start_ocr_worker(tf);
+
 	return tf;
+}
+
+// ─── Async OCR worker ────────────────────────────────────────────────
+// Runs Tesseract on a background thread so video_tick never blocks on OCR.
+// The worker owns the ocr_reader; video_tick submits jobs and consumes results.
+
+static void ocr_worker_func(detect_filter_obb* tf)
+{
+	obs_log(LOG_INFO, "[OCR Worker] Started");
+	while (tf->ocr_worker_active) {
+		filter_data::OcrJob job;
+		{
+			std::unique_lock<std::mutex> lock(tf->ocr_queue_lock);
+			tf->ocr_queue_cv.wait_for(lock, std::chrono::milliseconds(100),
+				[&]{ return !tf->ocr_queue.empty() || !tf->ocr_worker_active; });
+			if (!tf->ocr_worker_active) break;
+			if (tf->ocr_queue.empty()) continue;
+			job = std::move(tf->ocr_queue.front());
+			tf->ocr_queue.pop();
+		}
+
+		if (job.card_region.empty() || !tf->ocr_reader) continue;
+
+		std::string ocr_name, ocr_id;
+		float ocr_conf = 0.0f;
+		bool accepted = false;
+		if (tf->ocr_reader->recognize(job.card_region, ocr_name, ocr_id, ocr_conf, job.type_filter)) {
+			accepted = true;
+			// Vampire card validation
+			auto ci_it = tf->card_info_by_id.find(ocr_id);
+			if (ci_it != tf->card_info_by_id.end()) {
+				bool is_vampire = false;
+				for (const auto& t : ci_it->second.types) {
+					if (t == "Vampire") { is_vampire = true; break; }
+				}
+				if (is_vampire) {
+					obs_log(LOG_INFO, "[OCR] Vampire validation for '%s' (id=%s)",
+						ocr_name.c_str(), ocr_id.c_str());
+					if (!VtesOcrReader::hasVampireOval(job.card_region)) {
+						obs_log(LOG_INFO, "[OCR] Vampire REJECTED: no oval portrait found");
+						accepted = false;
+					} else {
+						int detected_cap = tf->ocr_reader->detectVampireCapacity(job.card_region);
+						int expected_cap = ci_it->second.capacity;
+						if (detected_cap < 0) {
+							obs_log(LOG_WARNING, "[OCR] Vampire: could not read capacity, accepting anyway");
+						} else if (detected_cap != expected_cap) {
+							obs_log(LOG_INFO, "[OCR] Vampire REJECTED: capacity %d != expected %d",
+								detected_cap, expected_cap);
+							accepted = false;
+						} else {
+							obs_log(LOG_INFO, "[OCR] Vampire ACCEPTED: oval + capacity %d matches",
+								detected_cap);
+						}
+					}
+				}
+			}
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(tf->ocr_result_lock);
+			tf->ocr_completed.push_back({job.id, true, accepted,
+				ocr_name, ocr_id, ocr_conf});
+		}
+	}
+	obs_log(LOG_INFO, "[OCR Worker] Stopped");
+}
+
+static void start_ocr_worker(detect_filter_obb* tf)
+{
+	if (tf->ocr_worker_active) return;
+	tf->ocr_worker_active = true;
+	tf->ocr_worker = std::thread(ocr_worker_func, tf);
+}
+
+static void stop_ocr_worker(detect_filter_obb* tf)
+{
+	if (!tf->ocr_worker_active) return;
+	tf->ocr_worker_active = false;
+	tf->ocr_queue_cv.notify_all();
+	if (tf->ocr_worker.joinable())
+		tf->ocr_worker.join();
+}
+
+static void submit_ocr_jobs(detect_filter_obb* tf,
+							const std::vector<cv::Mat>& card_regions,
+							const std::vector<std::string>& type_filters)
+{
+	if (!tf->ocr_worker_active || !tf->ocr_reader) return;
+	for (size_t i = 0; i < card_regions.size() && i < type_filters.size(); i++) {
+		if (card_regions[i].empty()) continue;
+		int64_t jid = tf->ocr_next_job_id++;
+		{
+			std::lock_guard<std::mutex> lock(tf->ocr_queue_lock);
+			tf->ocr_queue.push({jid, card_regions[i].clone(), type_filters[i]});
+		}
+		tf->ocr_queue_cv.notify_one();
+	}
+}
+
+static void drain_ocr_results(detect_filter_obb* tf,
+							  std::vector<vtes_detection::OBBObject>& objects)
+{
+	std::vector<filter_data::OcrJobResult> fresh;
+	{
+		std::lock_guard<std::mutex> lock(tf->ocr_result_lock);
+		fresh.swap(tf->ocr_completed);
+	}
+	for (auto& result : fresh) {
+		if (!result.completed) continue;
+		if (result.accepted) {
+			// Apply to the first object that still has no name ("???")
+			for (auto& obj : objects) {
+				if (obj.card_name == "???" || obj.card_name.empty()) {
+					obj.card_name = result.card_name;
+					obj.card_id = result.card_id;
+					obj.prob = result.confidence;
+					obs_log(LOG_INFO, "[OCR] Async result: '%s' (id=%s, conf=%.2f)",
+						result.card_name.c_str(), result.card_id.c_str(), result.confidence);
+					break;
+				}
+			}
+		}
+	}
 }
 
 void detect_filter_obb_destroy(void *data)
@@ -1172,10 +1440,8 @@ void detect_filter_obb_destroy(void *data)
 			tf->web_server.reset();
 		}
 
-		// VTES: disconnect WebSocket
-		if (tf->wsClient.is_connected()) {
-			tf->wsClient.disconnect();
-		}
+		// Stop OCR worker before destroying any resources it may use
+		stop_ocr_worker(tf);
 
 		obs_enter_graphics();
 		gs_texrender_destroy(tf->texrender);
@@ -1207,27 +1473,47 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		return;
 	}
 
+	// ─── Preview + Always Active: stop detection when hidden ─────────
+	bool should_detect = tf->preview || tf->always_active;
+
+	// ─── Detection interval: minimum time between detection runs ─────
+	auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+	if (should_detect && tf->detection_interval_ms > 0) {
+		uint64_t interval_ns = (uint64_t)tf->detection_interval_ms * 1000000ULL;
+		if (now_ns - tf->last_detection_time_ns < interval_ns) {
+			should_detect = false;
+		} else {
+			tf->last_detection_time_ns = now_ns;
+		}
+	} else {
+		tf->last_detection_time_ns = now_ns;
+	}
+
 	cv::Mat imageBGRA;
 	{
 		std::unique_lock<std::mutex> lock(tf->inputBGRALock, std::try_to_lock);
 		if (!lock.owns_lock()) {
-			obs_log(LOG_DEBUG, "OBB tick: inputBGRALock busy");
 			return;
 		}
 		if (tf->inputBGRA.empty()) {
-			obs_log(LOG_DEBUG, "OBB tick: inputBGRA empty");
 			return;
 		}
-		obs_log(LOG_DEBUG, "OBB tick: inputBGRA %dx%d",
-			tf->inputBGRA.cols, tf->inputBGRA.rows);
 		imageBGRA = tf->inputBGRA.clone();
 	}
 
-	cv::Mat inferenceFrame;
-	cv::cvtColor(imageBGRA, inferenceFrame, cv::COLOR_BGRA2BGR);
+	try {
+
+	// ─── Cooldown: skip detection after successful card identification ─────
+	auto _cd_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+	bool in_cooldown = (tf->cooldown_until_time_ns > 0 && _cd_now_ns < tf->cooldown_until_time_ns);
 
 	std::vector<vtes_detection::OBBObject> raw_objects;
 
+	if (should_detect && !in_cooldown) {
+	cv::Mat inferenceFrame;
+	cv::cvtColor(imageBGRA, inferenceFrame, cv::COLOR_BGRA2BGR);
 	if (tf->detectionMode == DETECT_MODE_CONTOUR) {
 		vtes_detection::ContourParams cparams;
 		cparams.edge_low = tf->contourEdgeLow;
@@ -1260,6 +1546,19 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		raw_objects = filtered;
 	}
 
+	// ─── Extract perspective-corrected card regions once, reuse below ─
+	std::vector<cv::Mat> card_regions(raw_objects.size());
+	for (size_t i = 0; i < raw_objects.size(); i++) {
+		const auto& obj = raw_objects[i];
+		cv::Point2f center(obj.rect.x + obj.rect.width / 2,
+				   obj.rect.y + obj.rect.height / 2);
+		cv::Size2f size(obj.rect.width, obj.rect.height);
+		cv::RotatedRect rr(center, size, obj.angle * 180.0f / kPI);
+		cv::Point2f corners[4];
+		rr.points(corners);
+		card_regions[i] = extractCardRegion(inferenceFrame, corners);
+	}
+
 	// ─── VTES Card Classification (run BEFORE embedding to use type as filter) ─
 	// Store per-object type filter string for embedding
 	std::vector<std::string> per_object_type_filter(raw_objects.size(), "");
@@ -1279,21 +1578,10 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				continue;
 			}
 
-			// ─── Extract perspective-corrected card region using YOLO angle ─
-			// (axis-aligned crops include table background around tilted cards)
-			const auto& obj = raw_objects[i];
-			cv::Point2f center(obj.rect.x + obj.rect.width / 2,
-					   obj.rect.y + obj.rect.height / 2);
-			cv::Size2f size(obj.rect.width, obj.rect.height);
-			cv::RotatedRect rr(center, size, obj.angle * 180.0f / kPI);
-			cv::Point2f corners[4];
-			rr.points(corners);
-			cv::Mat card_region = extractCardRegion(inferenceFrame, corners);
-
 			// ─── Vision-based type classifier (vtes_type_classifier.onnx) ─
 			std::string vision_type;
-			if (!card_region.empty())
-				vision_type = runVisionTypeClassifier(tf, card_region);
+			if (!card_regions[i].empty())
+				vision_type = runVisionTypeClassifier(tf, card_regions[i]);
 			if (!vision_type.empty()) {
 				per_object_type_filter[i] = vision_type;
 				// Map vision type to display label (for color-coded overlay)
@@ -1323,20 +1611,14 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		}
 	}
 
-	// ─── Embedding-based card identification (per-type models, fallback to global) ─
+	// ─── Card identification (embedding + OCR) ──────────────────────────
+	// OCR runs regardless of embedding availability — don't guard with embed_available
 	bool embed_available = tf->embedder.is_loaded() || !tf->per_type_matchers.empty();
-	if (embed_available && !raw_objects.empty()) {
+	if (!raw_objects.empty()) {
 		for (size_t i = 0; i < raw_objects.size(); i++) {
 			auto& obj = raw_objects[i];
 
-			cv::Point2f center(obj.rect.x + obj.rect.width / 2,
-					   obj.rect.y + obj.rect.height / 2);
-			cv::Size2f size(obj.rect.width, obj.rect.height);
-			cv::RotatedRect rr(center, size, obj.angle * 180.0f / kPI);
-			cv::Point2f corners[4];
-			rr.points(corners);
-
-			cv::Mat card_region = extractCardRegion(inferenceFrame, corners);
+			cv::Mat card_region = card_regions[i];
 			if (card_region.empty()) continue;
 
 			std::string card_name, card_id;
@@ -1346,33 +1628,25 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			float thresh = 0.35f;
 
 			// Try per-type embedder first
-			auto pt_it = tf->per_type_matchers.find(type_filter);
-			if (pt_it != tf->per_type_matchers.end() && pt_it->second->is_loaded()) {
-				matched = pt_it->second->identify(card_region, card_name, card_id, confidence);
-				thresh = pt_it->second->threshold();
-			}
-			// Fallback to global embedder
-			if (!matched && tf->embedder.is_loaded()) {
-				matched = tf->embedder.identify(card_region, card_name, card_id, confidence, type_filter);
-				thresh = tf->embedder.threshold();
-			}
+	obs_log(LOG_INFO, "[Classify] Card #%d type_filter='%s' crop=%dx%d",
+		obj.id, type_filter.c_str(), card_region.cols, card_region.rows);
 
-			// OCR fallback: when embedding confidence is low or no match
-			if (tf->ocr_enabled && tf->ocr_reader &&
-			    (!matched || confidence < thresh * 0.8f)) {
-				std::string ocr_name, ocr_id;
-				float ocr_conf = 0.0f;
-				if (tf->ocr_reader->recognize(card_region, ocr_name, ocr_id, ocr_conf)) {
-					if (ocr_conf > confidence) {
-						card_name = ocr_name;
-						card_id = ocr_id;
-						confidence = ocr_conf;
-						matched = true;
-						obs_log(LOG_INFO, "[OCR] Card #%d: OCR matched '%s' (id=%s, conf=%.2f)",
-							obj.id, ocr_name.c_str(), ocr_id.c_str(), ocr_conf);
-					}
+	if (embed_available) {
+				auto pt_it = tf->per_type_matchers.find(type_filter);
+				if (pt_it != tf->per_type_matchers.end() && pt_it->second->is_loaded()) {
+					matched = pt_it->second->identify(card_region, card_name, card_id, confidence);
+					thresh = pt_it->second->threshold();
+				}
+				// Fallback to global embedder
+				if (!matched && tf->embedder.is_loaded()) {
+					matched = tf->embedder.identify(card_region, card_name, card_id, confidence, type_filter);
+					thresh = tf->embedder.threshold();
 				}
 			}
+
+			// OCR is async: runs on a background worker thread.
+			// Jobs are submitted below; results are drained on the next frame.
+			// (The worker handles recognize() + vampire validation.)
 
 			if (matched) {
 				if (confidence >= thresh) {
@@ -1383,8 +1657,9 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				obj.card_id = card_id;
 				obj.prob = confidence;
 				obs_log(LOG_INFO,
-					"[Embed] Card #%d: %s (id=%s, sim=%.4f, filter=%s%s)",
+					"[Embed] Card #%d: '%s' (id=%s, sim=%.4f, thresh=%.2f, crop=%dx%d, filter=%s%s)",
 					obj.id, card_name.c_str(), card_id.c_str(), confidence,
+					thresh, card_region.cols, card_region.rows,
 					type_filter.c_str(),
 					confidence >= thresh ? "" : " ?");
 			} else {
@@ -1393,12 +1668,36 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				if (confidence > 0.2f) {
 					obj.prob = confidence;
 					obs_log(LOG_INFO,
-						"[Embed] Card #%d: no match (best_sim=%.4f, filter=%s)",
-						obj.id, confidence, type_filter.c_str());
+						"[Embed] Card #%d: no match (best_sim=%.4f, thresh=%.2f, crop=%dx%d, filter=%s)",
+						obj.id, confidence, thresh,
+						card_region.cols, card_region.rows,
+						type_filter.c_str());
 				}
 			}
 		}
-	}
+
+		// Drain async OCR results from background worker (applies to
+		// objects still marked "???") and submit new jobs for this frame.
+		if (tf->ocr_enabled) {
+			drain_ocr_results(tf, raw_objects);
+			// Pass empty type hint so name-region detection is stable
+			// (the vision type classifier is too frame-unstable to trust)
+			std::vector<std::string> empty_filters(card_regions.size(), "");
+			submit_ocr_jobs(tf, card_regions, empty_filters);
+		}
+	} // end if (!raw_objects.empty())
+		// ─── Set cooldown on successful identification ─────
+		for (const auto& obj : raw_objects) {
+			if (!obj.card_id.empty()) {
+				auto _cd_set_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now().time_since_epoch()).count();
+				tf->cooldown_until_time_ns = _cd_set_ns + (int64_t)(tf->card_overlay_duration * 1e9);
+				obs_log(LOG_INFO, "[Cooldown] Card identified, detection paused for %.1f seconds",
+					tf->card_overlay_duration);
+				break;
+			}
+		}
+	} // end if (should_detect && !in_cooldown)
 
 	// ─── SORT tracking (optional) ────────────────────────────────────────
 	if (tf->sortTracking) {
@@ -1455,73 +1754,6 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		} else {
 			obs_log(LOG_ERROR, "Failed to open file for writing detections: %s",
 				tf->saveDetectionsPath.c_str());
-		}
-	}
-
-	// ─── VTES: Send card crop to Node.js server via WebSocket ──────────
-	if (tf->wsClient.is_connected() && !final_objects.empty()) {
-		auto now = std::chrono::steady_clock::now();
-		auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-			now - tf->lastSendTime).count();
-
-		if (elapsed >= tf->cooldownSeconds) {
-			const auto &card = final_objects[0];
-
-			// Extract perspective-corrected card region from OBB corners
-			cv::Point2f center(card.rect.x + card.rect.width / 2,
-					   card.rect.y + card.rect.height / 2);
-			cv::Size2f size(card.rect.width, card.rect.height);
-			cv::RotatedRect rr(center, size, card.angle * 180.0f / kPI);
-			cv::Point2f corners[4];
-			rr.points(corners);
-
-			cv::Mat cardImage = extractCardRegion(inferenceFrame, corners);
-			if (!cardImage.empty()) {
-				try {
-					std::vector<uchar> buf;
-					std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 85};
-					cv::imencode(".jpg", cardImage, buf, params);
-
-					nlohmann::json msg;
-					msg["type"] = "card_crop";
-					msg["image"] = base64_encode(buf);
-					msg["confidence"] = card.prob;
-					msg["angle"] = card.angle;
-					msg["timestamp"] = std::chrono::duration_cast<
-						std::chrono::milliseconds>(
-						std::chrono::system_clock::now().time_since_epoch()).count();
-					if (!card.card_name.empty()) {
-						msg["card_name"] = card.card_name;
-						msg["card_id"] = card.card_id;
-						// Look up full card info if available
-						auto it = tf->card_info_by_id.find(card.card_id);
-						if (it != tf->card_info_by_id.end()) {
-							nlohmann::json cardInfo;
-							cardInfo["name"] = it->second.name;
-							cardInfo["types"] = it->second.types;
-							cardInfo["clans"] = it->second.clans;
-							cardInfo["capacity"] = it->second.capacity;
-							cardInfo["disciplines"] = it->second.disciplines;
-							cardInfo["cardText"] = it->second.cardText;
-							cardInfo["url"] = it->second.url;
-							cardInfo["group"] = it->second.group;
-							msg["card_info"] = cardInfo;
-						}
-					}
-
-					std::string jsonStr = msg.dump();
-					if (tf->wsClient.send_text(jsonStr)) {
-						tf->lastSendTime = now;
-						obs_log(LOG_INFO, "[VTES] Sent card crop (conf: %.2f, angle: %.2f)",
-							card.prob, card.angle);
-					} else {
-						obs_log(LOG_WARNING, "[VTES] Failed to send card crop");
-						tf->wsClient.disconnect();
-					}
-				} catch (const cv::Exception &e) {
-					obs_log(LOG_ERROR, "[VTES] imencode failed: %s", e.what());
-				}
-			}
 		}
 	}
 
@@ -1597,6 +1829,65 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			}
 		}
 
+		// ─── Card image overlay with fade (show detected card art) ──────
+		{
+			std::string detected_url;
+			for (const auto& obj : final_objects) {
+				if (obj.card_id.empty()) continue;
+				auto it = tf->card_info_by_id.find(obj.card_id);
+				if (it != tf->card_info_by_id.end() && !it->second.url.empty()) {
+					detected_url = it->second.url;
+					break;
+				}
+			}
+			if (!detected_url.empty()) {
+				tf->last_overlay_detection_time = std::chrono::steady_clock::now();
+				tf->current_overlay_card_url = detected_url;
+				if (tf->card_image_cache.find(detected_url) == tf->card_image_cache.end()) {
+					std::vector<uchar> img_data;
+					if (downloadImageToMemory(detected_url, img_data)) {
+						cv::Mat img = cv::imdecode(img_data, cv::IMREAD_COLOR);
+						if (!img.empty())
+							tf->card_image_cache[detected_url] = img;
+					}
+				}
+			}
+
+			if (!tf->current_overlay_card_url.empty()) {
+				auto now = std::chrono::steady_clock::now();
+				auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+					now - tf->last_overlay_detection_time).count();
+				float elapsed_sec = elapsed_ms / 1000.0f;
+				float alpha = 1.0f - (elapsed_sec / tf->card_overlay_duration);
+				alpha = std::max(0.0f, std::min(1.0f, alpha));
+
+				if (alpha > 0.0f) {
+					auto cache_it = tf->card_image_cache.find(tf->current_overlay_card_url);
+					if (cache_it != tf->card_image_cache.end()) {
+						int overlay_w = 180;
+						int overlay_h = (int)(overlay_w * 88.0 / 63.0 + 0.5f);
+						int pad = 10;
+						int x = frame.cols - overlay_w - pad;
+						int y = frame.rows - overlay_h - pad;
+
+						cv::Mat overlay_resized;
+						cv::resize(cache_it->second, overlay_resized, cv::Size(overlay_w, overlay_h));
+
+					cv::Rect roi(x, y, overlay_w, overlay_h);
+						cv::Rect roi_clamped = roi & cv::Rect(0, 0, frame.cols, frame.rows);
+						if (roi_clamped.width > 0 && roi_clamped.height > 0) {
+							int ox = roi_clamped.x - x;
+							int oy = roi_clamped.y - y;
+							cv::Mat overlay_cropped = overlay_resized(cv::Rect(ox, oy, roi_clamped.width, roi_clamped.height));
+							cv::addWeighted(frame(roi_clamped), 1.0 - alpha, overlay_cropped, alpha, 0.0, frame(roi_clamped));
+						}
+					}
+				} else {
+					tf->current_overlay_card_url.clear();
+				}
+			}
+		}
+
 		// ─── GPU indicator ─────────────────────────────────────────────────
 		{
 			std::string gpu_status;
@@ -1623,6 +1914,12 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 
 		std::lock_guard<std::mutex> lock(tf->outputLock);
 		cv::cvtColor(frame, tf->outputPreviewBGRA, cv::COLOR_BGR2BGRA);
+	}
+	} catch (const cv::Exception &e) {
+		obs_log(LOG_ERROR, "[video_tick] OpenCV error: %s (file=%s line=%d func=%s)",
+			e.what(), e.file, e.line, e.func);
+	} catch (const std::exception &e) {
+		obs_log(LOG_ERROR, "[video_tick] Exception: %s", e.what());
 	}
 }
 
@@ -1703,3 +2000,4 @@ void detect_filter_obb_video_render(void *data, gs_effect_t *_effect)
 	}
 	return;
 }
+// force recompile

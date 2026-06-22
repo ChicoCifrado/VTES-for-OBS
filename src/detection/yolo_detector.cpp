@@ -1,9 +1,15 @@
+#ifdef _WIN32
+#define NOMINMAX
+#endif
 #include "yolo_detector.hpp"
 #include "plugin-support.h"
 #include <obs.h>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace vtes_detection {
 
@@ -17,6 +23,26 @@ static Ort::SessionOptions makeSessionOptions(InferenceDevice device, int device
         cuda_opts.device_id = device_id;
         opts.AppendExecutionProvider_CUDA(cuda_opts);
     }
+#ifdef _WIN32
+    if (device == InferenceDevice::DirectML) {
+        // Load DML provider DLL dynamically — the header dml_provider_factory.h
+        // is only in the NuGet package, not the ORT GPU zip release
+        HMODULE hDml = LoadLibraryW(L"onnxruntime_providers_dml.dll");
+        if (hDml) {
+            using DmlFn = OrtStatus*(__stdcall*)(OrtSessionOptions*, int);
+            auto dmlFn = (DmlFn)GetProcAddress(hDml, "OrtSessionOptionsAppendExecutionProvider_DML");
+            if (dmlFn) {
+                OrtStatus* status = dmlFn(opts, device_id);
+                if (status) {
+                    obs_log(LOG_WARNING, "[YOLODetector] DML provider unavailable, fallback to CPU");
+                }
+            }
+            // Keep DLL loaded — ORT needs it during inference
+        } else {
+            obs_log(LOG_WARNING, "[YOLODetector] Failed to load onnxruntime_providers_dml.dll");
+        }
+    }
+#endif
     return opts;
 }
 
