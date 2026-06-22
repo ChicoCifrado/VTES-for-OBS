@@ -4,8 +4,9 @@
 #include <obs-module.h>
 #include <opencv2/dnn.hpp>
 #include <onnxruntime_cxx_api.h>
-#include "detection/detector_base.hpp"
+#include "detection/yolo_detector.hpp"
 #include "sort/Sort.h"
+#include "ws-client.h"
 #include "classifier/vtes_card_classifier.hpp"
 #include "embedding_matcher.h"
 #include "vtes_database.hpp"
@@ -14,8 +15,6 @@
 #include <chrono>
 #include <atomic>
 #include <deque>
-#include <queue>
-#include <condition_variable>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -83,13 +82,12 @@ struct filter_data {
 
 	bool isDisabled;
 	bool preview;
-	bool always_active;
 
 	std::mutex inputBGRALock;
 	std::mutex outputLock;
 	std::mutex modelMutex;
 
-	std::unique_ptr<vtes_detection::DetectorBase> yolo_detector;
+	std::unique_ptr<vtes_detection::YOLODetector> yolo_detector;
 	std::vector<std::string> classNames;
 
 #if _WIN32
@@ -111,6 +109,14 @@ struct filter_data {
 	// ONNX detection area filters
 	int onnxMinArea;
 	double onnxMaxAreaFrac;
+
+	// VTES-specific: WebSocket client for sending card crops to Node.js server
+	WebSocketClient wsClient;
+	std::string wsHost;
+	int wsPort;
+	std::chrono::steady_clock::time_point lastSendTime;
+	int cooldownSeconds;
+	std::atomic<bool> wsSendInProgress;
 
 	// --- Temporal smoothing (mtg_card_detector style) ---
 	static constexpr int TEMPORAL_WINDOW = 10; // frames
@@ -165,48 +171,9 @@ struct filter_data {
 	std::vector<VTESCardNameEntry> card_name_entries;  // built from vtes_db for fuzzy matching
 	bool ocr_enabled = false;
 
-	// --- Async OCR worker (background thread, doesn't block video_tick) ---
-	struct OcrJob {
-		int64_t id;
-		cv::Mat card_region;
-		std::string type_filter;
-	};
-	struct OcrJobResult {
-		int64_t id;
-		bool completed = false;
-		bool accepted = false;
-		std::string card_name;
-		std::string card_id;
-		float confidence = 0.0f;
-	};
-
-	std::thread ocr_worker;
-	std::mutex ocr_queue_lock;
-	std::condition_variable ocr_queue_cv;
-	std::queue<OcrJob> ocr_queue;
-	std::atomic<bool> ocr_worker_active{false};
-	std::atomic<int64_t> ocr_next_job_id{1};
-
-	// Completed results, produced by worker thread, consumed by video_tick
-	std::mutex ocr_result_lock;
-	std::vector<OcrJobResult> ocr_completed;
-
 	// --- Embedded web server for card search UI ---
 	std::unique_ptr<WebServer> web_server;
 	int web_server_port = 8080;
-
-	// --- Card image cache for overlay display ---
-	std::unordered_map<std::string, cv::Mat> card_image_cache;
-	std::chrono::steady_clock::time_point last_overlay_detection_time;
-	std::string current_overlay_card_url;
-	float card_overlay_duration = 5.0f;
-
-	// --- Performance: minimum detection interval ---
-	std::atomic<int> detection_interval_ms{0}; // 0 = process every frame
-	uint64_t last_detection_time_ns = 0;
-
-	// --- Cooldown: skip detection for N ns after successful identification ---
-	int64_t cooldown_until_time_ns = 0;
 
 };
 #endif /* FILTERDATA_H */

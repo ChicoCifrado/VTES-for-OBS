@@ -39,51 +39,17 @@ cd VTES-for-OBS
 .\vtes-grimoire.ps1 deploy
 ```
 
-El script `vtes-grimoire.ps1` provee una TUI interactiva:
+The `vtes-grimoire.ps1` script provides an interactive TUI:
 
 ```
-1. BUILD PLUGIN       — Compilar el plugin de OBS
-2. DEPLOY TO OBS      — Copiar DLL + datos a OBS
-3. COPY PER-TYPE      — Sincronizar modelos por tipo desde WSL
-4. INSTALL TESSERACT   — Instalar motor OCR
-5. VERIFY STATUS      — Diagnóstico completo del sistema
-6. DEPLOY ALL         — Compilar + Desplegar en un solo paso
-7. PACKAGE INSTALLER  — Generar .exe (NSIS) para distribuir
+1. BUILD PLUGIN     — Compile the OBS plugin
+2. DEPLOY TO OBS    — Copy DLL + data to OBS
+3. COPY PER-TYPE    — Sync per-type models from WSL
+4. INSTALL TESSERACT — Install OCR engine
+5. VERIFY STATUS    — Full system diagnosis
+6. DEPLOY ALL       — Build + Deploy in one step
 Q. QUIT
 ```
-
-### Comandos CLI
-
-```
-.\vtes-grimoire.ps1 build       # Compilar
-.\vtes-grimoire.ps1 deploy      # Copiar a OBS
-.\vtes-grimoire.ps1 package     # Generar instalador NSIS (alias: installer)
-.\vtes-grimoire.ps1 verify      # Diagnóstico del sistema
-.\vtes-grimoire.ps1 all         # Build + Deploy
-```
-
-### Instalador NSIS
-
-La opción **7** (o `.ps1 package`) genera un `.exe` redistribuible con:
-
-- DLL del plugin + todas las dependencias de ejecución (ONNX Runtime, CUDA, TensorRT, OpenCV)
-- Archivos de datos (modelos, embeddings, configs)
-- Entrada en Agregar o Quitar Programas de Windows
-- Desinstalador que limpia todos los archivos de VTES
-
-El instalador usa como destino `C:\Program Files\obs-studio` y detecta la ubicación de OBS desde el registro.
-
-### Desinstalación
-
-1. Cierra OBS Studio
-2. Ve a **Agregar o Quitar Programas** → **VTES Card Scanner OBS Plugin** → **Desinstalar**
-3. O ejecuta `uninstall-vtes-card-scanner.exe` en `obs-plugins\64bit\`
-
-El desinstalador elimina:
-- DLL del plugin + PDB de `obs-plugins\64bit\`
-- Todas las DLLs de ejecución (ONNX, CUDA, TensorRT, OpenCV, DirectML)
-- Directorio de datos (`data\obs-plugins\vtes-card-scanner\`) — modelos, embeddings, logs
-- Directorios vacíos sobrantes, entrada del registro de Windows
 
 ### OBS Setup
 
