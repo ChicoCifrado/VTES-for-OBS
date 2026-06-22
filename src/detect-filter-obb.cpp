@@ -846,18 +846,6 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 	tf->process_every_n_frames = (int)obs_data_get_int(settings, "process_every_n_frames");
 	if (tf->process_every_n_frames < 1) tf->process_every_n_frames = 1;
 
-	// OCR enabled checkbox
-	bool ocr_wanted = obs_data_get_bool(settings, "ocr_enabled");
-	if (ocr_wanted && !tf->ocr_enabled) {
-		// Force re-initialization if user enables OCR
-		tf->ocr_reader.reset();
-		tf->ocr_enabled = false;
-	} else if (!ocr_wanted && tf->ocr_enabled) {
-		// User disabled OCR
-		tf->ocr_reader.reset();
-		tf->ocr_enabled = false;
-	}
-
 	const std::string newDetectMode = obs_data_get_string(settings, "detection_mode");
 	tf->contourEdgeLow = (int)obs_data_get_int(settings, "contour_edge_low");
 	tf->contourEdgeHigh = (int)obs_data_get_int(settings, "contour_edge_high");
@@ -911,16 +899,13 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		loadCardInfo(tf);
 	}
 
-	// OCR reader (load once on startup, requires vtes_db from loadCardInfo)
-	if (!tf->ocr_reader) {
+	// OCR reader: respect user setting
+	bool ocr_wanted = obs_data_get_bool(settings, "ocr_enabled");
+	tf->ocr_enabled = ocr_wanted;
+	if (ocr_wanted && !tf->ocr_reader) {
 		initOcrReader(tf);
-	}
-
-	// Respect user OCR enabled setting
-	ocr_wanted = obs_data_get_bool(settings, "ocr_enabled");
-	if (!ocr_wanted && tf->ocr_enabled) {
+	} else if (!ocr_wanted && tf->ocr_reader) {
 		tf->ocr_reader.reset();
-		tf->ocr_enabled = false;
 	}
 
 	// Classifier
