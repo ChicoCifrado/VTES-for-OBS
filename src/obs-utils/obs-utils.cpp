@@ -16,16 +16,19 @@ bool getRGBAFromStageSurface(filter_data *tf, uint32_t &width, uint32_t &height)
 {
 
 	if (!obs_source_enabled(tf->source)) {
+		obs_log(LOG_INFO, "[vtes] getRGBA: filter source not enabled");
 		return false;
 	}
 
 	obs_source_t *target = obs_filter_get_target(tf->source);
 	if (!target) {
+		obs_log(LOG_INFO, "[vtes] getRGBA: no target (filter not attached to source?)");
 		return false;
 	}
 	width = obs_source_get_base_width(target);
 	height = obs_source_get_base_height(target);
 	if (width == 0 || height == 0) {
+		obs_log(LOG_INFO, "[vtes] getRGBA: target has zero size (w=%d h=%d)", (int)width, (int)height);
 		return false;
 	}
 	gs_texrender_reset(tf->texrender);

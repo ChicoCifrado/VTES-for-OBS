@@ -1269,13 +1269,16 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	struct detect_filter_obb *tf = reinterpret_cast<detect_filter_obb *>(data);
 
 	if (tf->isDisabled) {
+		obs_log(LOG_INFO, "[vtes] tick: isDisabled");
 		return;
 	}
 	if (tf->detectionMode == DETECT_MODE_ONNX && !tf->yolo_detector) {
+		obs_log(LOG_INFO, "[vtes] tick: no yolo detector");
 		return;
 	}
 
 	if (!obs_source_enabled(tf->source)) {
+		obs_log(LOG_INFO, "[vtes] tick: source not enabled");
 		return;
 	}
 
@@ -1298,17 +1301,18 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	{
 		std::unique_lock<std::mutex> lock(tf->inputBGRALock, std::try_to_lock);
 		if (!lock.owns_lock()) {
-			obs_log(LOG_DEBUG, "OBB tick: inputBGRALock busy");
+			obs_log(LOG_INFO, "[vtes] tick: inputBGRALock busy");
 			return;
 		}
 		if (tf->inputBGRA.empty()) {
-			obs_log(LOG_DEBUG, "OBB tick: inputBGRA empty");
+			obs_log(LOG_INFO, "[vtes] tick: inputBGRA empty");
 			return;
 		}
 		imageBGRA = tf->inputBGRA.clone();
 	}
 
 	if (!should_detect) {
+		obs_log(LOG_INFO, "[vtes] tick: should_detect false");
 		return;
 	}
 
@@ -1768,6 +1772,7 @@ void detect_filter_obb_video_render(void *data, gs_effect_t *_effect)
 
 	uint32_t width, height;
 	if (!getRGBAFromStageSurface(tf, width, height)) {
+		obs_log(LOG_INFO, "[vtes] render: getRGBAFromStageSurface failed");
 		if (tf->source) {
 			obs_source_skip_video_filter(tf->source);
 		}
