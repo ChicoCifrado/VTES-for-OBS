@@ -975,10 +975,24 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		bool deviceSame = (old_inference_device == newInfDevSafe);
 		bool threadsSame = (old_numThreads == newNumThreadsSafe);
 		obs_log(LOG_INFO,
-			"ONNX reload check: modeChanged=%d deviceSame=%d threadsSame=%d",
-			(int)modeChanged, (int)deviceSame, (int)threadsSame);
-		if (!modeChanged && deviceSame && threadsSame) {
-			reinitialize = false;
+			"ONNX reload check: modeChanged=%d deviceSame=%d threadsSame=%d "
+			"old='%s' new='%s'",
+			(int)modeChanged, (int)deviceSame, (int)threadsSame,
+			old_inference_device.c_str(), newInfDevSafe.c_str());
+		if (!modeChanged && threadsSame) {
+			if (deviceSame) {
+				reinitialize = false;
+			} else {
+				// Device string mismatch but model already loaded and
+				// mode unchanged — don't kill a working session over a
+				// spurious comparison (OBS sometimes passes stale settings).
+				obs_log(LOG_INFO,
+					"ONNX reload: device string mismatch, but keeping "
+					"existing loaded model to avoid session loss");
+				reinitialize = false;
+				tf->inference_device = old_inference_device;
+				tf->inference_device_enum = deviceStringToEnum(old_inference_device);
+			}
 		}
 	}
 
