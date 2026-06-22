@@ -1155,6 +1155,16 @@ void detect_filter_obb_deactivate(void *data)
 	tf->isDisabled = true;
 }
 
+// ─── Async OCR worker forward declarations ──────────────────────────
+static void ocr_worker_func(detect_filter_obb* tf);
+static void start_ocr_worker(detect_filter_obb* tf);
+static void stop_ocr_worker(detect_filter_obb* tf);
+static void submit_ocr_jobs(detect_filter_obb* tf,
+							const std::vector<cv::Mat>& card_regions,
+							const std::vector<std::string>& type_filters);
+static void drain_ocr_results(detect_filter_obb* tf,
+							  std::vector<vtes_detection::OBBObject>& objects);
+
 void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 {
 	obs_log(LOG_INFO, "VTES OBB filter created");
