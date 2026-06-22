@@ -28,7 +28,7 @@ function(set_target_properties_plugin target)
 
   install(
     TARGETS ${target}
-    RUNTIME DESTINATION bin/64bit
+    RUNTIME DESTINATION obs-plugins/64bit
     LIBRARY DESTINATION obs-plugins/64bit)
 
   install(

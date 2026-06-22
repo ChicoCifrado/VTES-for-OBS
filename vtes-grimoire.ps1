@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 <#
 .SYNOPSIS
     VTES Card Scanner - Grimorio Sanguineo
@@ -139,11 +139,7 @@ function Test-TesseractReady {
 }
 
 function Test-OcrCompiled {
-    $dll = Join-Path $SCRIPT:OBS_PLUGIN_DIR "vtes-card-scanner.dll"
-    if (-not (Test-Path $dll)) { return $false }
-    $bytes = [System.IO.File]::ReadAllBytes($dll)
-    $text = [System.Text.Encoding]::ASCII.GetString($bytes)
-    return $text -match "Tesseract|VTES_HAVE_TESSERACT|tesseract"
+    return Test-TesseractReady
 }
 
 function Get-CalculationSummary {
@@ -217,7 +213,7 @@ function Invoke-Verify {
 }
 
 function Invoke-Build {
-    param([string]$Config = "RelWithDebInfo", [bool]$WithTesseract = $true)
+    param([string]$Config = "RelWithDebInfo")
     Clear-Host
     Write-FrameTop
     Write-FrameMid ("  " + $C.BOLD + $C.CRIMSON + "RITUAL DE CONSTRUCCION  " + $C.GOLD + "[" + $Config + "]" + $C.RESET)
@@ -229,11 +225,11 @@ function Invoke-Build {
         Remove-Item -Recurse -Force $SCRIPT:BUILD_DIR
     }
     $cmakeArgs = @("--preset", "windows-x64")
-    if ($WithTesseract) {
-        $cmakeArgs += "-DUSE_SYSTEM_TESSERACT=ON"
-        Write-Success "Tesseract OCR: HABILITADO"
+    $tesseractAvail = Test-TesseractReady
+    if ($tesseractAvail) {
+        Write-Success "Tesseract OCR runtime disponible (DLL cargada dinamicamente)"
     } else {
-        Write-Info "Tesseract OCR: deshabilitado"
+        Write-Info "Tesseract OCR runtime NO disponible"
     }
     Write-Info "Configurando CMake..."
     cmake @cmakeArgs
@@ -252,11 +248,10 @@ function Invoke-Build {
     $cudaPaths = @(
         "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin",
         "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin",
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin",
-        "C:\Program Files\NVIDIA\CUDNN\v9.23\bin\12.9\x64"
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin"
     )
     $cudaDlls = @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll",
-                  "cufft64_11.dll", "cudnn64_9.dll")
+                  "cufft64_11.dll")
     $cudaCopied = 0
     $releasePluginDir = "$releaseDir/obs-plugins/64bit"
     foreach ($cudaPath in $cudaPaths) {
@@ -270,8 +265,54 @@ function Invoke-Build {
         }
     }
     if ($cudaCopied -gt 0) { Write-Info ("CUDA runtime DLLs: " + $cudaCopied + " copiadas a release") }
+    # ── Copy TensorRT DLLs to release dir (if TENSORRT_ROOT is set) ─
+    $trtRoot = $env:TENSORRT_ROOT
+    if ($trtRoot) {
+        $trtDlls = @("nvinfer_lean_11.dll", "nvinfer_plugin_11.dll")
+        $trtCopied = 0
+        foreach ($trtDir in @("$trtRoot\bin", "$trtRoot\lib")) {
+            if (-not (Test-Path $trtDir)) { continue }
+            foreach ($dll in $trtDlls) {
+                $src = Join-Path $trtDir $dll
+                if (Test-Path $src) {
+                    Copy-Item $src "$releasePluginDir\" -Force -ErrorAction SilentlyContinue
+                    $trtCopied++
+                }
+            }
+        }
+        if ($trtCopied -gt 0) { Write-Info ("TensorRT DLLs: " + $trtCopied + " copiadas a release") }
+    }
+    # ── Copy TensorRT engine file to release data models dir ─
+    $engineFile = Join-Path $SCRIPT:PROJECT_ROOT "vtes.engine"
+    $modelsDir = "$releaseDir/data/obs-plugins/vtes-card-scanner/models"
+    if (Test-Path $engineFile) {
+        if (-not (Test-Path $modelsDir)) { New-Item -ItemType Directory -Path $modelsDir -Force | Out-Null }
+        Copy-Item $engineFile "$modelsDir\" -Force
+        Write-Success "TensorRT engine copiado a release: $modelsDir"
+    } else {
+        Write-Error "TensorRT engine NO encontrado en: $engineFile"
+        Write-Info "Generalo con: trtexec --onnx=data/models/vtes.onnx --saveEngine=vtes.engine --versionCompatible"
+    }
+    # ── cudnn64_9.dll ya no se copia — TensorRT no requiere cuDNN ─
     Pop-Location
     return $true
+}
+
+function Invoke-Clean {
+    Clear-Host
+    Write-FrameTop
+    Write-FrameMid ("  " + $C.BOLD + $C.CRIMSON + "RITUAL DE PURIFICACION - Limpiando build_x64" + $C.RESET)
+    Write-FrameSep
+    Write-Host ""
+    Push-Location $SCRIPT:PROJECT_ROOT
+    if (Test-Path $SCRIPT:BUILD_DIR) {
+        Write-Info "Purgando $($SCRIPT:BUILD_DIR)..."
+        Remove-Item -Recurse -Force $SCRIPT:BUILD_DIR
+        Write-Success "build_x64 eliminado"
+    } else {
+        Write-Info "build_x64 no existe - nada que limpiar"
+    }
+    Pop-Location
 }
 
 function Invoke-Deploy {
@@ -302,15 +343,23 @@ function Invoke-Deploy {
         Copy-Item $srcData $dstData -Recurse -Force
         Write-Success ("Data copiada: " + $srcData + " -> " + $dstData)
     } else { Write-Error "Data no encontrada en: $srcData" }
+    # ── Fallback: ensure vtes.engine is in OBS data models dir ─────
+    $engineSrc = Join-Path $SCRIPT:PROJECT_ROOT "vtes.engine"
+    $engineDstDir = Join-Path $dstData "models"
+    $engineDst = Join-Path $engineDstDir "vtes.engine"
+    if (Test-Path $engineSrc) {
+        if (-not (Test-Path $engineDstDir)) { New-Item -ItemType Directory -Path $engineDstDir -Force | Out-Null }
+        Copy-Item $engineSrc $engineDst -Force
+        Write-Success "TensorRT engine asegurado en: $engineDst"
+    }
     # ── CUDA Runtime DLLs ─
     $cudaPaths = @(
         "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin",
         "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin",
-        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin",
-        "C:\Program Files\NVIDIA\CUDNN\v9.23\bin\12.9\x64"
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin"
     )
     $cudaDlls = @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll",
-                  "cufft64_11.dll", "cudnn64_9.dll")
+                  "cufft64_11.dll")
     $cudaCopied = 0
     foreach ($cudaPath in $cudaPaths) {
         if (-not (Test-Path $cudaPath)) { continue }
@@ -324,19 +373,38 @@ function Invoke-Deploy {
     }
     if ($cudaCopied -gt 0) {
         Write-Success ("CUDA runtime DLLs: " + $cudaCopied + " copiadas a obs-plugins/64bit")
-        # Also copy to OBS bin/64bit/ so ORT provider can find them via LoadLibrary
-        $obsBin = "C:\Program Files\obs-studio\bin\64bit"
-        if (Test-Path $obsBin) {
-            foreach ($cudaPath in $cudaPaths) {
-                if (-not (Test-Path $cudaPath)) { continue }
-                foreach ($dll in $cudaDlls) {
-                    $src = Join-Path $cudaPath $dll
-                    if (Test-Path $src) {
-                        Copy-Item $src "$obsBin\" -Force -ErrorAction SilentlyContinue
-                    }
+    }
+    # ── TensorRT DLLs (desde TENSORRT_ROOT) ─
+    $trtRoot = $env:TENSORRT_ROOT
+    if ($trtRoot) {
+        $trtDlls = @("nvinfer_lean_11.dll", "nvinfer_plugin_11.dll")
+        $trtCopied = 0
+        foreach ($trtDir in @("$trtRoot\bin", "$trtRoot\lib")) {
+            if (-not (Test-Path $trtDir)) { continue }
+            foreach ($dll in $trtDlls) {
+                $src = Join-Path $trtDir $dll
+                if (Test-Path $src) {
+                    Copy-Item $src "$dstDll\" -Force -ErrorAction SilentlyContinue
+                    $trtCopied++
                 }
             }
-            Write-Info "CUDA DLLs tambien copiadas a $obsBin"
+        }
+        if ($trtCopied -gt 0) {
+            Write-Info ("TensorRT DLLs: " + $trtCopied + " copiadas a obs-plugins/64bit")
+            # Also copy to OBS bin/64bit/
+            $obsBin = "C:\Program Files\obs-studio\bin\64bit"
+            if (Test-Path $obsBin) {
+                foreach ($trtDir in @("$trtRoot\bin", "$trtRoot\lib")) {
+                    if (-not (Test-Path $trtDir)) { continue }
+                    foreach ($dll in $trtDlls) {
+                        $src = Join-Path $trtDir $dll
+                        if (Test-Path $src) {
+                            Copy-Item $src "$obsBin\" -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
+                Write-Info "TensorRT DLLs tambien copiadas a $obsBin"
+            }
         }
     }
     # DirectML.dll ships with Windows 10 1903+ — copy as DirectML fallback
@@ -393,7 +461,8 @@ function Invoke-InstallTesseract {
     Write-FrameMid ("  " + $C.BOLD + $C.CRIMSON + "RITUAL DE INVOCACION - Tesseract OCR" + $C.RESET)
     Write-FrameSep
     Write-Host ""
-    if (Test-TesseractReady) {
+    $tesseractReady = Test-TesseractReady
+    if ($tesseractReady) {
         Write-Success ("Tesseract ya esta instalado en: " + $SCRIPT:TESSERACT_PATH)
         return $true
     }
@@ -457,10 +526,12 @@ function Invoke-Package {
     $nsiContent = @'
 ; VTES Card Scanner - NSIS Installer
 SetCompressor lzma
+RequestExecutionLevel admin
 !include "MUI2.nsh"
 !define MUI_ABORTWARNING
 !define MUI_FINISHPAGE_RUN_TEXT "Launch OBS Studio"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\bin\64bit\obs64.exe"
+!define MUI_FINISHPAGE_NOREBOOTSUPPORT
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "__PROJECT_ROOT__\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
@@ -472,17 +543,13 @@ SetCompressor lzma
 Name "VTES Card Scanner"
 OutFile "__OUT_PATH__"
 InstallDir "$PROGRAMFILES64\obs-studio"
+InstallDirRegKey HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\obs-studio" "InstallLocation"
 Section "Plugin" SEC_PLUGIN
   SectionIn RO
   SetOutPath "$INSTDIR\obs-plugins\64bit"
   File "__RELEASE_DIR__\obs-plugins\64bit\vtes-card-scanner.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\vtes-card-scanner.pdb"
-  SetOutPath "$INSTDIR\data\obs-plugins\vtes-card-scanner"
-  File /r "__RELEASE_DIR__\data\obs-plugins\vtes-card-scanner\*.*"
-SectionEnd
-Section "ONNX Runtime" SEC_ONNX
-  SectionIn RO
-  SetOutPath "$INSTDIR\obs-plugins\64bit"
+  ; 3rd-party DLLs (all present in release dir after cmake --install)
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime_providers_shared.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime_providers_cuda.dll"
@@ -491,11 +558,16 @@ Section "ONNX Runtime" SEC_ONNX
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cublasLt64_12.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cufft64_11.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cudnn64_9.dll"
-SectionEnd
-Section "OpenCV Runtime" SEC_OPENCV
-  SectionIn RO
-  SetOutPath "$INSTDIR\obs-plugins\64bit"
-  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\opencv_*.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\nvinfer_lean_11.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\nvinfer_plugin_11.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\DirectML.dll"
+  ; OpenCV world DLL (version varies: opencv_world4xx.dll or opencv_world5xx.dll)
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\opencv_world*.dll"
+  SetOutPath "$INSTDIR\data\obs-plugins\vtes-card-scanner"
+  File /r "__RELEASE_DIR__\data\obs-plugins\vtes-card-scanner\*.*"
+  ; TensorRT engine file → data/models/
+  SetOutPath "$INSTDIR\data\obs-plugins\vtes-card-scanner\models"
+  File /nonfatal "__PROJECT_ROOT__\vtes.engine"
 SectionEnd
 Section -Post
   WriteUninstaller "$INSTDIR\obs-plugins\64bit\uninstall-vtes-card-scanner.exe"
@@ -503,10 +575,16 @@ Section -Post
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner" "UninstallString" "$INSTDIR\obs-plugins\64bit\uninstall-vtes-card-scanner.exe"
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner" "DisplayVersion" "__CONFIG__"
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner" "Publisher" "VTES Card Scanner"
+  WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner" "InstallLocation" "$INSTDIR"
 SectionEnd
 Section Uninstall
+  SetOutPath "$INSTDIR"
+  ; ── Clean OBS data dir (models, embeddings, logs, etc.) ──────────
+  RMDir /r "$INSTDIR\data\obs-plugins\vtes-card-scanner"
+  ; ── Remove VTES plugin DLLs ──────────────────────────────────────
   Delete "$INSTDIR\obs-plugins\64bit\vtes-card-scanner.dll"
   Delete "$INSTDIR\obs-plugins\64bit\vtes-card-scanner.pdb"
+  ; ── Remove 3rd-party runtime DLLs (only ours — nonfatal if shared) ─
   Delete "$INSTDIR\obs-plugins\64bit\onnxruntime.dll"
   Delete "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_shared.dll"
   Delete "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_cuda.dll"
@@ -515,9 +593,33 @@ Section Uninstall
   Delete "$INSTDIR\obs-plugins\64bit\cublasLt64_12.dll"
   Delete "$INSTDIR\obs-plugins\64bit\cufft64_11.dll"
   Delete "$INSTDIR\obs-plugins\64bit\cudnn64_9.dll"
-  Delete "$INSTDIR\obs-plugins\64bit\opencv_*.dll"
-  RMDir /r "$INSTDIR\data\obs-plugins\vtes-card-scanner"
-  Delete "$INSTDIR\obs-plugins\64bit\uninstall-vtes-card-scanner.exe"
+  Delete "$INSTDIR\obs-plugins\64bit\nvinfer_lean_11.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\nvinfer_plugin_11.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\DirectML.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\opencv_world*.dll"
+  ; ── Retry locked files (OBS running) ──────────────────────────────
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\vtes-card-scanner.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\vtes-card-scanner.pdb"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\onnxruntime.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_shared.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_cuda.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cudart64_12.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cublas64_12.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cublasLt64_12.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cufft64_11.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cudnn64_9.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\nvinfer_lean_11.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\nvinfer_plugin_11.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\DirectML.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\opencv_world*.dll"
+  ; ── Remove empty directories ──────────────────────────────────────
+  RMDir "$INSTDIR\obs-plugins\64bit"
+  RMDir "$INSTDIR\obs-plugins"
+  RMDir "$INSTDIR\data\obs-plugins\vtes-card-scanner"
+  RMDir "$INSTDIR\data\obs-plugins"
+  ; ── Uninstaller itself LAST ────────────────────────────────────────
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\uninstall-vtes-card-scanner.exe"
+  ; ── Clean Windows registry ────────────────────────────────────────
   DeleteRegKey HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner"
 SectionEnd
 '@
@@ -573,9 +675,8 @@ function Invoke-DeployAll {
     Write-FrameMid ("  " + $C.BOLD + $C.CRIMSON + "RITUAL COMPLETO - Build + Deploy" + $C.RESET)
     Write-FrameSep
     Write-Host ""
-    $tesseractAvailable = Test-TesseractReady
     Write-Banner "FASE 1: CONSTRUCCION"
-    $ok = Invoke-Build -Config $Config -WithTesseract $tesseractAvailable
+    $ok = Invoke-Build -Config $Config
     if (-not $ok) { Write-Error "Construccion fallida. Abortando."; return }
     Write-Host ""
     Write-Banner "FASE 2: INVOCACION"
@@ -618,7 +719,7 @@ function Show-Menu {
         $choice = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown").Character
         Write-Host ($C.GOLD + $choice + $C.RESET)
         switch ($choice) {
-            "1" { Invoke-Build -WithTesseract (Test-TesseractReady); Write-Host ""; Write-DimGrim "  Presiona cualquier tecla..."; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") 2>$null }
+            "1" { Invoke-Build; Write-Host ""; Write-DimGrim "  Presiona cualquier tecla..."; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") 2>$null }
             "2" { Invoke-Deploy; Write-Host ""; Write-DimGrim "  Presiona cualquier tecla..."; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") 2>$null }
             "3" { Invoke-CopyPerType; Write-Host ""; Write-DimGrim "  Presiona cualquier tecla..."; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") 2>$null }
             "4" { Invoke-InstallTesseract; Write-Host ""; Write-DimGrim "  Presiona cualquier tecla..."; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") 2>$null }
@@ -646,20 +747,22 @@ function Main {
         $Host.UI.RawUI.ForegroundColor = "White"
         $Host.UI.RawUI.BackgroundColor = "Black"
     }
-    $cmdLine = $MyInvocation.Line.Trim()
-    if ($cmdLine -match "\S+\.ps1\s+(\w+)") {
-        $action = $Matches[1].ToLower()
+    if ($args.Count -gt 0) {
+        $action = $args[0].ToLower()
+        $cfg = if ($args.Count -gt 1) { $args[1] } else { "RelWithDebInfo" }
         switch ($action) {
-            "build"     { Invoke-Build -WithTesseract (Test-TesseractReady); return }
+            "build"     { Invoke-Build -Config $cfg; return }
             "deploy"    { Invoke-Deploy; return }
             "verify"    { Invoke-Verify; return }
             "sync"      { Invoke-CopyPerType; return }
             "tesseract" { Invoke-InstallTesseract; return }
             "all"       { Invoke-DeployAll; return }
-            "package"   { Invoke-Package; return }
+            "package"   { Invoke-Package -Config $cfg; return }
+            "installer" { Invoke-Package -Config $cfg; return }
+            "clean"     { Invoke-Clean; return }
         }
     }
     Show-Menu
 }
 
-Main
+Main $args

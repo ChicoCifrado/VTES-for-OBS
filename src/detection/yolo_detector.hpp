@@ -8,23 +8,12 @@
 #include <vector>
 #include <string>
 
+#include "detector_base.hpp"
 #include "detection_types.hpp"
 
 namespace vtes_detection {
 
-struct OBBObject
-{
-    cv::Rect2f rect;
-    float angle;
-    int label;
-    float prob;
-    int id;
-    int unseenFrames;
-    std::string card_id;
-    std::string card_name;
-};
-
-class YOLODetector {
+class YOLODetector : public DetectorBase {
 public:
     YOLODetector(const std::string& model_path,
                  cv::Size input_size = cv::Size(640, 640),
@@ -32,16 +21,16 @@ public:
                  int device_id = 0,
                  float conf_threshold = 0.3f);
 
-    ~YOLODetector();
+    ~YOLODetector() override;
 
-    std::vector<OBBObject> inferOBB(const cv::Mat& frame);
+    std::vector<OBBObject> inferOBB(const cv::Mat& frame) override;
 
-    void setConfThreshold(float thresh) { conf_threshold_ = thresh; }
-    float confThreshold() const { return conf_threshold_; }
-    cv::Size inputSize() const { return input_size_; }
-    std::string provider() const;
+    void setConfThreshold(float thresh) override { conf_threshold_ = thresh; }
+    float confThreshold() const override { return conf_threshold_; }
+    cv::Size inputSize() const override { return input_size_; }
+    std::string provider() const override;
 
-    void setOutputShape(int num_detections, int features_per_det);
+    void setOutputShape(int num_detections, int features_per_det) override;
 
 private:
     Ort::Session session_{nullptr};

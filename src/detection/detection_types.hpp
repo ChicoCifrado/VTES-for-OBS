@@ -15,6 +15,22 @@ inline const char* inferenceDeviceToString(InferenceDevice dev) {
     }
 }
 
+namespace vtes_detection {
+
+struct OBBObject
+{
+    cv::Rect2f rect;
+    float angle;
+    int label;
+    float prob;
+    int id;
+    int unseenFrames;
+    std::string card_id;
+    std::string card_name;
+};
+
+} // namespace vtes_detection
+
 struct Object {
     cv::Rect_<float> rect;
     int label;
