@@ -1035,12 +1035,26 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 						tf->conf_threshold);
 			}
 #else
-			tf->yolo_detector =
-				std::make_unique<vtes_detection::YOLODetector>(
-					model_path, cv::Size(1024, 1024),
-					tf->inference_device_enum,
-					onnxruntime_device_id_,
-					tf->conf_threshold);
+			// TensorRT no disponible en este build — si el usuario seleccionó
+			// CUDA, forzamos DirectML (YOLODetector + CUDA EP requiere DLLs
+			// que no tenemos y fallaría con 'Failed to load shared library')
+			{
+				InferenceDevice effective_device = tf->inference_device_enum;
+				if (effective_device == InferenceDevice::CUDA) {
+					obs_log(LOG_WARNING,
+						"TensorRT not available in this build, "
+						"falling back to DirectML");
+					effective_device = InferenceDevice::DirectML;
+					tf->inference_device = INFERENCE_DML;
+					tf->inference_device_enum = effective_device;
+				}
+				tf->yolo_detector =
+					std::make_unique<vtes_detection::YOLODetector>(
+						model_path, cv::Size(1024, 1024),
+						effective_device,
+						onnxruntime_device_id_,
+						tf->conf_threshold);
+			}
 #endif
 
 			char *jsonPath_rawPtr = obs_module_file("models/vtes.json");
