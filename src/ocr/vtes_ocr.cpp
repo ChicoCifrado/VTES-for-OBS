@@ -243,7 +243,8 @@ cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr)
 
     int h = card_bgr.rows;
     int w = card_bgr.cols;
-    int search_h = std::min(h * 12 / 100, h); // search only top 12%
+    // Search wider (top 20%) to include card name below the type banner
+    int search_h = std::min(h * 20 / 100, h);
 
     cv::Mat gray;
     if (card_bgr.channels() == 3)
@@ -260,23 +261,35 @@ cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr)
         row_stddev[y] = (float)stddev[0];
     }
 
-    // Find the first significant text row from the top downwards.
-    // The card name is the first text encountered (ignore thin border lines).
-    int name_top = -1, name_bottom = -1;
+    // Find ALL contiguous text bands in the search region
+    struct TextBand { int top, bottom, height; };
+    std::vector<TextBand> bands;
     for (int y = 2; y < search_h; y++) {
         if (row_stddev[y] > 20.0f) {
-            name_top = y;
-            // Expand downwards while variance stays high
-            name_bottom = y;
-            for (int y2 = y + 1; y2 < search_h; y2++) {
-                if (row_stddev[y2] > 12.0f) {
-                    name_bottom = y2;
-                } else {
-                    break;
-                }
+            int top = y;
+            int bottom = y;
+            while (y + 1 < search_h && row_stddev[y + 1] > 12.0f) {
+                bottom = y + 1;
+                y++;
             }
-            break;
+            int band_h = bottom - top + 1;
+            bands.push_back({top, bottom, band_h});
         }
+    }
+
+    int name_top = -1, name_bottom = -1;
+    if (!bands.empty()) {
+        // Pick the tallest text band (the card name is usually in the largest font)
+        int best_idx = 0;
+        int best_h = bands[0].height;
+        for (size_t i = 1; i < bands.size(); i++) {
+            if (bands[i].height > best_h) {
+                best_h = bands[i].height;
+                best_idx = i;
+            }
+        }
+        name_top = bands[best_idx].top;
+        name_bottom = bands[best_idx].bottom;
     }
 
     // Fallback if no text region found visually

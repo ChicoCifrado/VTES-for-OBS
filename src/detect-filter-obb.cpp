@@ -817,7 +817,7 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 	// Classifier defaults
 	obs_data_set_default_bool(settings, "classifier_enabled", true);
 	obs_data_set_default_bool(settings, "ocr_enabled", true);
-	obs_data_set_default_int(settings, "process_every_n_frames", 6);
+	obs_data_set_default_int(settings, "process_every_n_frames", 1);
 	obs_data_set_default_double(settings, "clf_oval_weight", 0.5);
 	obs_data_set_default_double(settings, "clf_color_weight", 0.3);
 	obs_data_set_default_double(settings, "clf_contour_weight", 0.2);
@@ -1287,7 +1287,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	} else {
 		auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 			std::chrono::steady_clock::now().time_since_epoch()).count();
-		if (now_ns - tf->last_detection_time_ns < 200000000ULL) {
+		if (now_ns - tf->last_detection_time_ns < 100000000ULL) {
 			should_detect = false;
 		} else {
 			tf->last_detection_time_ns = now_ns;
