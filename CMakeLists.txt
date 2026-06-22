@@ -107,6 +107,10 @@ if(EXISTS "${ORT_DIR}/lib/onnxruntime.lib")
         install(FILES "${ORT_DIR}/lib/onnxruntime_providers_cuda.dll"
                 DESTINATION "obs-plugins/64bit")
     endif()
+    if(EXISTS "${ORT_DIR}/lib/onnxruntime_providers_dml.dll")
+        install(FILES "${ORT_DIR}/lib/onnxruntime_providers_dml.dll"
+                DESTINATION "obs-plugins/64bit")
+    endif()
     # Install CUDA runtime DLLs needed by the CUDA provider
     # Convert Windows backslash paths to CMake forward-slash paths
     set(_cuda_dll_dirs "")

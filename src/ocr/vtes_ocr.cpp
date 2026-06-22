@@ -9,8 +9,10 @@
 #include "vtes_ocr.hpp"
 #include "vtes_api_lookup.hpp"
 #include <opencv2/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <algorithm>
 #include <cctype>
+#include <string>
 #include <cmath>
 #include <cstring>
 #include <regex>
@@ -213,6 +215,39 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
 
     obs_log(LOG_INFO, "[OCR] First char '%c' uppercase, continuing", *first_char);
 
+    // ─── Sanity filter: reject garbage OCR text ─────────────────────────
+    {
+        int alpha = 0, total = 0;
+        char first_real = 0;
+        bool repeated = true;
+        for (unsigned char c : ocr_text) {
+            if (!std::isspace(c)) {
+                if (first_real == 0) first_real = (char)c;
+                else if (c != (unsigned char)first_real) repeated = false;
+                if (std::isalpha(c)) alpha++;
+                total++;
+            }
+        }
+        if (total < 3) {
+            obs_log(LOG_INFO, "[OCR] Rejected: too few chars (%d)", total);
+            return false;
+        }
+        if (total > 55) {
+            obs_log(LOG_INFO, "[OCR] Rejected: too many chars (%d, max 55)", total);
+            return false;
+        }
+        if ((float)alpha / (float)total < 0.40f) {
+            obs_log(LOG_INFO, "[OCR] Rejected: low alphabetic ratio %d/%d",
+                    alpha, total);
+            return false;
+        }
+        if (repeated && total > 4) {
+            obs_log(LOG_INFO, "[OCR] Rejected: repeated single char '%c'",
+                    first_real);
+            return false;
+        }
+    }
+
     {
         CardLookupResult api_result = lookup_card_by_ocr(ocr_text);
         if (!api_result.printed_name.empty()) {
@@ -235,10 +270,14 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
 }
 
 // ─── Visual name region detection ────────────────────────────────────
-// VTES card names are always in a narrow band at the very top of the card.
-// Non-vampire cards have a card-type banner (e.g. "Master") above the name.
-// The classifier type hint tells us which card type we're looking at so we
-// can skip the banner and target the actual name band below it.
+// VTES card layout:
+//   Non-Vamp:  type banner (~top 8%) → name (~10-18%) → art → text
+//   Vampire:   type banner (~top 8%) → oval portrait (~8-53%) → name (~53-60%)
+//
+// Uses horizontal projection of vertical Sobel edges to locate the text
+// band. Text rows produce a dense cluster of vertical edges (letter
+// strokes) — this is far more selective than raw pixel stddev, which
+// also responds to card art and background texture.
 cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr,
                                         const std::string& card_type_hint)
 {
@@ -246,8 +285,6 @@ cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr,
 
     int h = card_bgr.rows;
     int w = card_bgr.cols;
-    // Search wider (top 20%) to include card name below the type banner
-    int search_h = std::min(h * 20 / 100, h);
 
     cv::Mat gray;
     if (card_bgr.channels() == 3)
@@ -255,63 +292,115 @@ cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr,
     else
         gray = card_bgr;
 
-    // Per-row standard deviation: text rows have high variance
-    std::vector<float> row_stddev(search_h, 0.0f);
-    for (int y = 0; y < search_h; y++) {
-        cv::Mat row = gray.row(y);
-        cv::Scalar mean, stddev;
-        cv::meanStdDev(row, mean, stddev);
-        row_stddev[y] = (float)stddev[0];
-    }
+    // CLAHE to normalise lighting before edge detection
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+    cv::Mat enhanced;
+    clahe->apply(gray, enhanced);
 
-    // Find ALL contiguous text bands in the search region
-    struct TextBand { int top, bottom, height; };
-    std::vector<TextBand> bands;
-    for (int y = 2; y < search_h; y++) {
-        if (row_stddev[y] > 20.0f) {
-            int top = y;
-            int bottom = y;
-            while (y + 1 < search_h && row_stddev[y + 1] > 12.0f) {
-                bottom = y + 1;
-                y++;
-            }
-            int band_h = bottom - top + 1;
-            bands.push_back({top, bottom, band_h});
-        }
-    }
+    // Vertical Sobel: strong response at letter vertical strokes
+    cv::Mat sobel;
+    cv::Sobel(enhanced, sobel, CV_16S, 1, 0, 3);
 
-    int name_top = -1, name_bottom = -1;
-    if (!bands.empty()) {
-        int start_idx = 0;
-        // Non-vampire cards have a type banner (e.g. "Master") as the first
-        // text band. Skip it and use the second band (the actual card name).
-        if (!card_type_hint.empty() && card_type_hint != "Vampire"
-            && bands.size() >= 2) {
-            start_idx = 1;
-        }
-        // Pick the tallest band from the remaining candidates
-        int best_idx = start_idx;
-        int best_h = bands[start_idx].height;
-        for (size_t i = start_idx + 1; i < bands.size(); i++) {
-            if (bands[i].height > best_h) {
-                best_h = bands[i].height;
-                best_idx = (int)i;
-            }
-        }
-        name_top = bands[best_idx].top;
-        name_bottom = bands[best_idx].bottom;
-    }
+    // Take absolute magnitude and convert to 8-bit
+    cv::Mat abs_edges;
+    cv::convertScaleAbs(sobel, abs_edges);
 
-    // Fallback if no text region found visually
-    if (name_top == -1) {
-        name_top = (int)(h * 0.01f);
-        name_bottom = (int)(h * 0.12f);
-        obs_log(LOG_INFO, "[OCR] detectNameRegion: fallback 1%%-12%%");
+    // Binarise edge magnitude (keep only strong edges)
+    cv::Mat edge_binary;
+    cv::threshold(abs_edges, edge_binary, 24.0, 255.0, cv::THRESH_BINARY);
+
+    // Expected name zone (fraction of card height)
+    // Narrow bands that exclude type banner (<10%) and card art (>17%/60%)
+    bool is_vampire = (!card_type_hint.empty() && card_type_hint == "Vampire");
+    int zone_top, zone_bot;
+    if (is_vampire) {
+        zone_top = h * 53 / 100;  // 53%-60% for vampire names
+        zone_bot = h * 60 / 100;
     } else {
-        // Add 2px padding
-        name_top = std::max(0, name_top - 2);
-        name_bottom = std::min(h, name_bottom + 2);
+        zone_top = h * 10 / 100;  // 10%-17% for non-vamp names
+        zone_bot = h * 17 / 100;
     }
+    zone_top = std::max(0, zone_top);
+    zone_bot = std::min(h, zone_bot);
+
+    // Horizontal projection of edge pixels within the expected zone
+    int zone_h = zone_bot - zone_top;
+    std::vector<int> proj(zone_h, 0);
+    for (int y = 0; y < zone_h; y++) {
+        proj[y] = cv::countNonZero(edge_binary.row(zone_top + y));
+    }
+
+    // Smooth the projection (moving average, window = 3)
+    std::vector<int> smooth(zone_h, 0);
+    for (int y = 0; y < zone_h; y++) {
+        int sum = 0, cnt = 0;
+        for (int dy = -1; dy <= 1; dy++) {
+            int ny = y + dy;
+            if (ny >= 0 && ny < zone_h) { sum += proj[ny]; cnt++; }
+        }
+        smooth[y] = sum / cnt;
+    }
+
+    // Precompute prefix sum of smoothed projection for O(1) range sums
+    std::vector<int> prefix(zone_h + 1, 0);
+    for (int y = 0; y < zone_h; y++)
+        prefix[y + 1] = prefix[y] + smooth[y];
+
+    // Find the sub-range within the zone with the highest average edge density
+    int best_start = 0, best_end = 0, best_density = 0;
+    const int min_name_h = std::max(8, h * 4 / 100);  // at least 4% of card
+    const int max_name_h = std::min(zone_h, h * 14 / 100); // at most 14%
+
+    for (int start = 0; start < zone_h; start++) {
+        for (int cand_h = min_name_h; cand_h <= max_name_h && start + cand_h <= zone_h; cand_h++) {
+            int total_edges = prefix[start + cand_h] - prefix[start];
+            // Count rows with strong edge content
+            int text_rows = 0;
+            for (int y = start; y < start + cand_h; y++) {
+                if (smooth[y] > w * 0.02f) text_rows++;
+            }
+            if (text_rows < cand_h * 3 / 4) continue;  // need ≥75% text rows
+            int avg_per_row = total_edges / cand_h;
+            if (avg_per_row > best_density) {
+                best_density = avg_per_row;
+                best_start = start;
+                best_end = start + cand_h;
+            }
+        }
+    }
+
+    // Tighten: within the found range, trim low-edge rows from top/bottom
+    if (best_density > 0) {
+        int peak = 0;
+        for (int y = best_start; y < best_end; y++)
+            if (smooth[y] > peak) peak = smooth[y];
+        int trim_thresh = peak * 25 / 100;  // 25% of peak
+        while (best_start < best_end && smooth[best_start] < trim_thresh)
+            best_start++;
+        while (best_end > best_start && smooth[best_end - 1] < trim_thresh)
+            best_end--;
+        if (best_end - best_start < min_name_h)
+            best_density = 0;  // trimmed too much, fallback
+    }
+
+    int name_top, name_bottom;
+    if (best_density > 0) {
+        name_top = zone_top + best_start;
+        name_bottom = zone_top + best_end;
+    } else {
+        // Fallback to fixed position if no clear text band found
+        if (is_vampire) {
+            name_top = h * 53 / 100;
+            name_bottom = h * 59 / 100;
+        } else {
+            name_top = h * 10 / 100;
+            name_bottom = h * 18 / 100;
+        }
+    }
+
+    // 2px padding
+    name_top = std::max(0, name_top - 2);
+    name_bottom = std::min(h, name_bottom + 2);
 
     int name_left = (int)(w * 0.03f);
     int name_w = (int)(w * 0.94f);
@@ -321,8 +410,18 @@ cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr,
     name_roi &= cv::Rect(0, 0, w, h);
     if (name_roi.width < 16 || name_roi.height < 4) return {};
 
-    obs_log(LOG_INFO, "[OCR] detectNameRegion: y=[%d,%d] h=%d", name_top, name_bottom, name_h);
-    return card_bgr(name_roi).clone();
+    obs_log(LOG_INFO, "[OCR] detectNameRegion: zone=[%d,%d] search=%dpx best_density=%d → y=[%d,%d] h=%d",
+            zone_top, zone_bot, zone_h, best_density, name_top, name_bottom, name_h);
+
+    cv::Mat debug_roi = card_bgr(name_roi).clone();
+    static int debug_cnt = 0;
+    if (debug_cnt < 20) {
+        std::string debug_path = "vtes_ocr_name_" + std::to_string(debug_cnt++) + ".png";
+        cv::imwrite(debug_path, debug_roi);
+        obs_log(LOG_INFO, "[OCR] detectNameRegion: y=[%d,%d] h=%d → %s",
+                name_top, name_bottom, name_h, debug_path.c_str());
+    }
+    return debug_roi;
 }
 
 cv::Mat VtesOcrReader::preprocessForOcr(const cv::Mat& region)
@@ -336,19 +435,34 @@ cv::Mat VtesOcrReader::preprocessForOcr(const cv::Mat& region)
         gray = region.clone();
     }
 
-    cv::Mat upscaled;
-    cv::resize(gray, upscaled, cv::Size(region.cols * 3, region.rows * 3),
-               0, 0, cv::INTER_CUBIC);
+    // Step 1: CLAHE contrast enhancement — boosts text vs. background
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+    cv::Mat enhanced;
+    clahe->apply(gray, enhanced);
 
+    // Step 2: 3x upscale with Lanczos (sharper than INTER_CUBIC for text)
+    cv::Mat upscaled;
+    cv::resize(enhanced, upscaled, cv::Size(region.cols * 3, region.rows * 3),
+               0, 0, cv::INTER_LANCZOS4);
+
+    // Step 3: light blur to remove upscale noise
     cv::Mat blurred;
     cv::GaussianBlur(upscaled, blurred, cv::Size(3, 3), 0);
 
+    // Step 4: Adaptive threshold instead of global OTSU
+    // Works better for variable lighting on webcam captures
     cv::Mat binary;
-    cv::threshold(blurred, binary, 0, 255, cv::THRESH_BINARY_INV | cv::THRESH_OTSU);
+    cv::adaptiveThreshold(blurred, binary, 255,
+                          cv::ADAPTIVE_THRESH_GAUSSIAN_C,
+                          cv::THRESH_BINARY_INV,
+                          31,  // block size (odd, ~3 × font size)
+                          6);  // subtract constant
 
+    // Step 5: median blur to remove salt-and-pepper noise
     cv::Mat denoised;
     cv::medianBlur(binary, denoised, 3);
 
+    // Step 6: connect broken characters with a 1×2 close kernel
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(1, 2));
     cv::morphologyEx(denoised, denoised, cv::MORPH_CLOSE, kernel);
 

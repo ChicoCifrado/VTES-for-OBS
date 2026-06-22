@@ -17,7 +17,7 @@
 class EmbeddingMatcher {
 public:
     EmbeddingMatcher()
-        : threshold_(0.35f), embedding_dim_(0), num_cards_(0),
+        : threshold_(0.80f), embedding_dim_(0), num_cards_(0),
           inference_device_(InferenceDevice::CPU) {}
 
     void set_inference_device(InferenceDevice dev) { inference_device_ = dev; }

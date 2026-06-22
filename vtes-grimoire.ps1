@@ -531,6 +531,7 @@ RequestExecutionLevel admin
 !define MUI_ABORTWARNING
 !define MUI_FINISHPAGE_RUN_TEXT "Launch OBS Studio"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\bin\64bit\obs64.exe"
+!define MUI_FINISHPAGE_NOREBOOTSUPPORT
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "__PROJECT_ROOT__\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
@@ -542,17 +543,13 @@ RequestExecutionLevel admin
 Name "VTES Card Scanner"
 OutFile "__OUT_PATH__"
 InstallDir "$PROGRAMFILES64\obs-studio"
+InstallDirRegKey HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\obs-studio" "InstallLocation"
 Section "Plugin" SEC_PLUGIN
   SectionIn RO
   SetOutPath "$INSTDIR\obs-plugins\64bit"
   File "__RELEASE_DIR__\obs-plugins\64bit\vtes-card-scanner.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\vtes-card-scanner.pdb"
-  SetOutPath "$INSTDIR\data\obs-plugins\vtes-card-scanner"
-  File /r "__RELEASE_DIR__\data\obs-plugins\vtes-card-scanner\*.*"
-SectionEnd
-Section "ONNX Runtime" SEC_ONNX
-  SectionIn RO
-  SetOutPath "$INSTDIR\obs-plugins\64bit"
+  ; 3rd-party DLLs (all present in release dir after cmake --install)
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime_providers_shared.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime_providers_cuda.dll"
@@ -561,6 +558,16 @@ Section "ONNX Runtime" SEC_ONNX
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cublasLt64_12.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cufft64_11.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cudnn64_9.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\nvinfer_lean_11.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\nvinfer_plugin_11.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\DirectML.dll"
+  ; OpenCV world DLL (version varies: opencv_world4xx.dll or opencv_world5xx.dll)
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\opencv_world*.dll"
+  SetOutPath "$INSTDIR\data\obs-plugins\vtes-card-scanner"
+  File /r "__RELEASE_DIR__\data\obs-plugins\vtes-card-scanner\*.*"
+  ; TensorRT engine file → data/models/
+  SetOutPath "$INSTDIR\data\obs-plugins\vtes-card-scanner\models"
+  File /nonfatal "__PROJECT_ROOT__\vtes.engine"
 SectionEnd
 Section -Post
   WriteUninstaller "$INSTDIR\obs-plugins\64bit\uninstall-vtes-card-scanner.exe"
@@ -568,14 +575,16 @@ Section -Post
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner" "UninstallString" "$INSTDIR\obs-plugins\64bit\uninstall-vtes-card-scanner.exe"
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner" "DisplayVersion" "__CONFIG__"
   WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner" "Publisher" "VTES Card Scanner"
+  WriteRegStr HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner" "InstallLocation" "$INSTDIR"
 SectionEnd
 Section Uninstall
   SetOutPath "$INSTDIR"
-  ; Remove data directory first (user-generated files, logs, etc.)
+  ; ── Clean OBS data dir (models, embeddings, logs, etc.) ──────────
   RMDir /r "$INSTDIR\data\obs-plugins\vtes-card-scanner"
-  ; Remove plugin DLLs
+  ; ── Remove VTES plugin DLLs ──────────────────────────────────────
   Delete "$INSTDIR\obs-plugins\64bit\vtes-card-scanner.dll"
   Delete "$INSTDIR\obs-plugins\64bit\vtes-card-scanner.pdb"
+  ; ── Remove 3rd-party runtime DLLs (only ours — nonfatal if shared) ─
   Delete "$INSTDIR\obs-plugins\64bit\onnxruntime.dll"
   Delete "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_shared.dll"
   Delete "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_cuda.dll"
@@ -584,8 +593,11 @@ Section Uninstall
   Delete "$INSTDIR\obs-plugins\64bit\cublasLt64_12.dll"
   Delete "$INSTDIR\obs-plugins\64bit\cufft64_11.dll"
   Delete "$INSTDIR\obs-plugins\64bit\cudnn64_9.dll"
-  Delete "$INSTDIR\obs-plugins\64bit\opencv_*.dll"
-  ; Retry: if any DLLs were locked by a running OBS, mark them for reboot
+  Delete "$INSTDIR\obs-plugins\64bit\nvinfer_lean_11.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\nvinfer_plugin_11.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\DirectML.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\opencv_world*.dll"
+  ; ── Retry locked files (OBS running) ──────────────────────────────
   Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\vtes-card-scanner.dll"
   Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\vtes-card-scanner.pdb"
   Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\onnxruntime.dll"
@@ -596,11 +608,18 @@ Section Uninstall
   Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cublasLt64_12.dll"
   Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cufft64_11.dll"
   Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cudnn64_9.dll"
-  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\opencv_*.dll"
-  ; Remove the obs-plugins directory if empty (non-recursive is safe — other plugins coexist)
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\nvinfer_lean_11.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\nvinfer_plugin_11.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\DirectML.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\opencv_world*.dll"
+  ; ── Remove empty directories ──────────────────────────────────────
   RMDir "$INSTDIR\obs-plugins\64bit"
-  ; Delete the uninstaller itself LAST (may need /REBOOTOK if running)
+  RMDir "$INSTDIR\obs-plugins"
+  RMDir "$INSTDIR\data\obs-plugins\vtes-card-scanner"
+  RMDir "$INSTDIR\data\obs-plugins"
+  ; ── Uninstaller itself LAST ────────────────────────────────────────
   Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\uninstall-vtes-card-scanner.exe"
+  ; ── Clean Windows registry ────────────────────────────────────────
   DeleteRegKey HKLM "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\VTES Card Scanner"
 SectionEnd
 '@

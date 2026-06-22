@@ -726,6 +726,7 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	obs_properties_t *props = obs_properties_create();
 
 	obs_properties_add_bool(props, "preview", obs_module_text("Preview"));
+	obs_properties_add_bool(props, "always_active", "Always active (detect even when boxes hidden)");
 
 	obs_properties_add_float_slider(props, "threshold", obs_module_text("ConfThreshold"), 0.0,
 					1.0, 0.025);
@@ -746,9 +747,10 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	obs_property_list_add_string(p_inf_dev, obs_module_text("GPU (CUDA)"), INFERENCE_CUDA);
 #endif
 
-	// --- Card Type Classifier (for type-based embedding filter) ---
-	obs_properties_add_int_slider(props, "process_every_n_frames", "Process every N frames (1=all, higher=faster)",
-				    1, 120, 1);
+	// --- Detection interval (timeout between detection runs) ---
+	obs_properties_add_float_slider(props, "detection_interval_seconds",
+		"Detection interval (seconds, 0 = process every frame)",
+		0.0, 5.0, 0.1);
 
 	obs_properties_add_bool(props, "classifier_enabled", "Type Classifier (filter by card type)");
 
@@ -766,7 +768,15 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 			if (tf->web_server && tf->web_server->is_running()) {
 				std::string url = "http://localhost:" + std::to_string(tf->web_server->port());
 #ifdef _WIN32
-				ShellExecuteA(NULL, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+				int len = MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, nullptr, 0);
+				if (len > 0) {
+					std::wstring wurl(len, L'\0');
+					MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, &wurl[0], len);
+					HINSTANCE result = ShellExecuteW(NULL, L"open", wurl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+					if ((INT_PTR)result <= 32) {
+						obs_log(LOG_WARNING, "Failed to open browser (error %d)", (INT_PTR)result);
+					}
+				}
 #else
 				std::string cmd = "xdg-open " + url;
 				std::thread([cmd]() { system(cmd.c_str()); }).detach();
@@ -792,6 +802,7 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 #endif
 	obs_data_set_default_bool(settings, "sort_tracking", false);
 	obs_data_set_default_bool(settings, "preview", true);
+	obs_data_set_default_bool(settings, "always_active", true);
 	obs_data_set_default_double(settings, "threshold", 0.5);
 	obs_data_set_default_string(settings, "detection_mode", DETECT_MODE_CONTOUR);
 	obs_data_set_default_bool(settings, "temporal_smoothing", true);
@@ -817,7 +828,7 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 	// Classifier defaults
 	obs_data_set_default_bool(settings, "classifier_enabled", true);
 	obs_data_set_default_bool(settings, "ocr_enabled", true);
-	obs_data_set_default_int(settings, "process_every_n_frames", 1);
+	obs_data_set_default_double(settings, "detection_interval_seconds", 0.0);
 	obs_data_set_default_double(settings, "clf_oval_weight", 0.5);
 	obs_data_set_default_double(settings, "clf_color_weight", 0.3);
 	obs_data_set_default_double(settings, "clf_contour_weight", 0.2);
@@ -835,6 +846,7 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 	tf->isDisabled = true;
 
 	tf->preview = obs_data_get_bool(settings, "preview");
+	tf->always_active = obs_data_get_bool(settings, "always_active");
 	tf->conf_threshold = (float)obs_data_get_double(settings, "threshold");
 	tf->sortTracking = obs_data_get_bool(settings, "sort_tracking");
 	size_t maxUnseenFrames = (size_t)obs_data_get_int(settings, "max_unseen_frames");
@@ -843,8 +855,9 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 	}
 	tf->showUnseenObjects = obs_data_get_bool(settings, "show_unseen_objects");
 	tf->saveDetectionsPath = obs_data_get_string(settings, "save_detections_path");
-	tf->process_every_n_frames = (int)obs_data_get_int(settings, "process_every_n_frames");
-	if (tf->process_every_n_frames < 1) tf->process_every_n_frames = 1;
+	tf->detection_interval_ms = (int)(obs_data_get_double(settings, "detection_interval_seconds") * 1000.0);
+	if (tf->detection_interval_ms < 0) tf->detection_interval_ms = 0;
+	if (tf->detection_interval_ms > 5000) tf->detection_interval_ms = 5000;
 
 	const std::string newDetectMode = obs_data_get_string(settings, "detection_mode");
 	tf->contourEdgeLow = (int)obs_data_get_int(settings, "contour_edge_low");
@@ -870,6 +883,7 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 			obs_log(LOG_INFO, "[Embedding] Loading model: %s", modelPath);
 			tf->embedder.set_inference_device(tf->inference_device_enum);
 			tf->embedder.load(modelPath, binPath, metaPath);
+			tf->embedder.set_threshold(0.80f);
 		} else {
 			obs_log(LOG_WARNING, "[Embedding] Model files missing — "
 				"vtes_embedder_1024d.onnx=%s embeddings_1024d.bin=%s embeddings_1024d_meta.json=%s",
@@ -1134,7 +1148,8 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		obs_log(LOG_INFO, "  Source: %s", obs_source_get_name(tf->source));
 		obs_log(LOG_INFO, "  Inference Device: %s", tf->inference_device.c_str());
 		obs_log(LOG_INFO, "  Num Threads: %d", tf->numThreads);
-		obs_log(LOG_INFO, "  Preview: %s", tf->preview ? "true" : "false");
+		obs_log(LOG_INFO, "  Show Boxes: %s", tf->preview ? "true" : "false");
+		obs_log(LOG_INFO, "  Always Active: %s", tf->always_active ? "true" : "false");
 		obs_log(LOG_INFO, "  Threshold: %.2f", tf->conf_threshold);
 	}
 
@@ -1196,6 +1211,7 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 			obs_log(LOG_INFO, "[Embedding] Loading model on startup: %s", modelPath);
 			tf->embedder.set_inference_device(tf->inference_device_enum);
 			tf->embedder.load(modelPath, binPath, metaPath);
+			tf->embedder.set_threshold(0.80f);
 		} else {
 			obs_log(LOG_WARNING, "[Embedding] Model files missing at startup — "
 				"vtes_embedder_1024d.onnx=%s embeddings_1024d.bin=%s embeddings_1024d_meta.json=%s",
@@ -1457,19 +1473,21 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		return;
 	}
 
-	// ─── Frame skip: process only every N frames + time throttle ─────
-	tf->video_tick_counter++;
-	bool should_detect = true;
-	if (tf->video_tick_counter % tf->process_every_n_frames != 0) {
-		should_detect = false;
-	} else {
-		auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-			std::chrono::steady_clock::now().time_since_epoch()).count();
-		if (now_ns - tf->last_detection_time_ns < 33000000ULL) {
+	// ─── Preview + Always Active: stop detection when hidden ─────────
+	bool should_detect = tf->preview || tf->always_active;
+
+	// ─── Detection interval: minimum time between detection runs ─────
+	auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+	if (should_detect && tf->detection_interval_ms > 0) {
+		uint64_t interval_ns = (uint64_t)tf->detection_interval_ms * 1000000ULL;
+		if (now_ns - tf->last_detection_time_ns < interval_ns) {
 			should_detect = false;
 		} else {
 			tf->last_detection_time_ns = now_ns;
 		}
+	} else {
+		tf->last_detection_time_ns = now_ns;
 	}
 
 	cv::Mat imageBGRA;
@@ -1484,16 +1502,18 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		imageBGRA = tf->inputBGRA.clone();
 	}
 
-	if (!should_detect) {
-		return;
-	}
+	try {
 
-	cv::Mat inferenceFrame;
-	cv::cvtColor(imageBGRA, inferenceFrame, cv::COLOR_BGRA2BGR);
+	// ─── Cooldown: skip detection after successful card identification ─────
+	auto _cd_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+	bool in_cooldown = (tf->cooldown_until_time_ns > 0 && _cd_now_ns < tf->cooldown_until_time_ns);
 
 	std::vector<vtes_detection::OBBObject> raw_objects;
 
-	try {
+	if (should_detect && !in_cooldown) {
+	cv::Mat inferenceFrame;
+	cv::cvtColor(imageBGRA, inferenceFrame, cv::COLOR_BGRA2BGR);
 	if (tf->detectionMode == DETECT_MODE_CONTOUR) {
 		vtes_detection::ContourParams cparams;
 		cparams.edge_low = tf->contourEdgeLow;
@@ -1608,7 +1628,10 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			float thresh = 0.35f;
 
 			// Try per-type embedder first
-			if (embed_available) {
+	obs_log(LOG_INFO, "[Classify] Card #%d type_filter='%s' crop=%dx%d",
+		obj.id, type_filter.c_str(), card_region.cols, card_region.rows);
+
+	if (embed_available) {
 				auto pt_it = tf->per_type_matchers.find(type_filter);
 				if (pt_it != tf->per_type_matchers.end() && pt_it->second->is_loaded()) {
 					matched = pt_it->second->identify(card_region, card_name, card_id, confidence);
@@ -1634,8 +1657,9 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				obj.card_id = card_id;
 				obj.prob = confidence;
 				obs_log(LOG_INFO,
-					"[Embed] Card #%d: %s (id=%s, sim=%.4f, filter=%s%s)",
+					"[Embed] Card #%d: '%s' (id=%s, sim=%.4f, thresh=%.2f, crop=%dx%d, filter=%s%s)",
 					obj.id, card_name.c_str(), card_id.c_str(), confidence,
+					thresh, card_region.cols, card_region.rows,
 					type_filter.c_str(),
 					confidence >= thresh ? "" : " ?");
 			} else {
@@ -1644,8 +1668,10 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				if (confidence > 0.2f) {
 					obj.prob = confidence;
 					obs_log(LOG_INFO,
-						"[Embed] Card #%d: no match (best_sim=%.4f, filter=%s)",
-						obj.id, confidence, type_filter.c_str());
+						"[Embed] Card #%d: no match (best_sim=%.4f, thresh=%.2f, crop=%dx%d, filter=%s)",
+						obj.id, confidence, thresh,
+						card_region.cols, card_region.rows,
+						type_filter.c_str());
 				}
 			}
 		}
@@ -1654,9 +1680,24 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		// objects still marked "???") and submit new jobs for this frame.
 		if (tf->ocr_enabled) {
 			drain_ocr_results(tf, raw_objects);
-			submit_ocr_jobs(tf, card_regions, per_object_type_filter);
+			// Pass empty type hint so name-region detection is stable
+			// (the vision type classifier is too frame-unstable to trust)
+			std::vector<std::string> empty_filters(card_regions.size(), "");
+			submit_ocr_jobs(tf, card_regions, empty_filters);
 		}
-	}
+	} // end if (!raw_objects.empty())
+		// ─── Set cooldown on successful identification ─────
+		for (const auto& obj : raw_objects) {
+			if (!obj.card_id.empty()) {
+				auto _cd_set_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now().time_since_epoch()).count();
+				tf->cooldown_until_time_ns = _cd_set_ns + (int64_t)(tf->card_overlay_duration * 1e9);
+				obs_log(LOG_INFO, "[Cooldown] Card identified, detection paused for %.1f seconds",
+					tf->card_overlay_duration);
+				break;
+			}
+		}
+	} // end if (should_detect && !in_cooldown)
 
 	// ─── SORT tracking (optional) ────────────────────────────────────────
 	if (tf->sortTracking) {

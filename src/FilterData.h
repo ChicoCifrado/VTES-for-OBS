@@ -83,6 +83,7 @@ struct filter_data {
 
 	bool isDisabled;
 	bool preview;
+	bool always_active;
 
 	std::mutex inputBGRALock;
 	std::mutex outputLock;
@@ -200,10 +201,12 @@ struct filter_data {
 	std::string current_overlay_card_url;
 	float card_overlay_duration = 5.0f;
 
-	// --- Performance: frame skip (process every N frames) ---
-	std::atomic<int> process_every_n_frames{1}; // every frame
-	int video_tick_counter = 0;
+	// --- Performance: minimum detection interval ---
+	std::atomic<int> detection_interval_ms{0}; // 0 = process every frame
 	uint64_t last_detection_time_ns = 0;
+
+	// --- Cooldown: skip detection for N ns after successful identification ---
+	int64_t cooldown_until_time_ns = 0;
 
 };
 #endif /* FILTERDATA_H */
