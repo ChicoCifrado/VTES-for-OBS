@@ -1,4 +1,4 @@
-name: Push to master
+name: Build Windows Installer
 run-name: ${{ github.ref_name }} push run 🚀
 on:
   push:
@@ -14,13 +14,6 @@ concurrency:
   group: '${{ github.workflow }} @ ${{ github.ref }}'
   cancel-in-progress: ${{ github.ref_type == 'tag' }}
 jobs:
-  check-format:
-    name: Check Formatting 🔍
-    if: github.ref_name == 'master'
-    uses: ./.github/workflows/check-format.yaml
-    permissions:
-      contents: read
-
   build-project:
     name: Build Project 🧱
     uses: ./.github/workflows/build-project.yaml
@@ -76,9 +69,6 @@ jobs:
 
           variants=(
             'windows-x64;zip|exe'
-            'macos-universal;tar.xz|pkg'
-            'ubuntu-22.04-x86_64;tar.xz|deb|ddeb'
-            'sources;tar.xz'
           )
 
           for variant_data in "${variants[@]}"; do
@@ -99,7 +89,7 @@ jobs:
           shopt -s extglob
 
           echo "### Checksums" > ${{ github.workspace }}/CHECKSUMS.txt
-          for file in ${{ github.workspace }}/@(*.exe|*.deb|*.ddeb|*.pkg|*.tar.xz|*.zip); do
+          for file in ${{ github.workspace }}/@(*.exe|*.zip); do
             echo "    ${file##*/}: $(sha256sum "${file}" | cut -d " " -f 1)" >> ${{ github.workspace }}/CHECKSUMS.txt
           done
 
@@ -116,7 +106,3 @@ jobs:
           files: |
             ${{ github.workspace }}/*.exe
             ${{ github.workspace }}/*.zip
-            ${{ github.workspace }}/*.pkg
-            ${{ github.workspace }}/*.deb
-            ${{ github.workspace }}/*.ddeb
-            ${{ github.workspace }}/*.tar.xz
