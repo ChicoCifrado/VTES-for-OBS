@@ -200,31 +200,57 @@ unset(TENSORRT_INCLUDE_DIR)
 unset(TENSORRT_LIB)
 unset(TENSORRT_PLUGIN_LIB)
 
-# ── CUDA NIS upscaler (Lanczos 4× + adaptive sharpen on GPU) ────────
+# ── CUDA kernels (NIS upscaler + Vampire classifier) ─────────────────
+# Compiled directly with nvcc to avoid VS MSBuild CUDA customizations.
 if(DEFINED ENV{CUDA_PATH})
     find_package(CUDAToolkit QUIET)
     if(CUDAToolkit_FOUND)
-        # Bypass CMake's CUDA compiler ID test (requires VS CUDA build
-        # customizations that may not be registered). We already verified
-        # the toolkit via find_package(CUDAToolkit) above.
-        set(CMAKE_CUDA_COMPILER "${CUDAToolkit_NVCC_EXECUTABLE}")
-        set(CMAKE_CUDA_COMPILER_ID "NVIDIA")
-        set(CMAKE_CUDA_COMPILER_FORCED TRUE)
-        enable_language(CUDA)
-        set(CMAKE_CUDA_STANDARD 17)
-        set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-        set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
+        set(NVCC_FLAGS
+            -c
+            "-I${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "-I${CMAKE_CURRENT_SOURCE_DIR}/vendor"
+            -DHAVE_CUDA_NIS
+            -gencode arch=compute_75,code=sm_75
+            -gencode arch=compute_86,code=sm_86
+            -gencode arch=compute_89,code=sm_89
+            -Xcompiler "/MD /O2 /std:c++17")
+
+        set(CUDA_OBJS "")
+        foreach(cu_file src/ocr/nis_upscaler.cu src/detection/vampire_classifier.cu)
+            get_filename_component(cu_name ${cu_file} NAME_WE)
+            set(obj_path "${CMAKE_CURRENT_BINARY_DIR}/cuda/${cu_name}.obj")
+            list(APPEND CUDA_OBJS ${obj_path})
+            add_custom_command(
+                OUTPUT ${obj_path}
+                COMMAND "${CUDAToolkit_NVCC_EXECUTABLE}"
+                    ${NVCC_FLAGS}
+                    -o "${obj_path}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/${cu_file}"
+                MAIN_DEPENDENCY "${CMAKE_CURRENT_SOURCE_DIR}/${cu_file}"
+                COMMENT "NVCC: ${cu_file}")
+        endforeach()
+
+        # Link compiled CUDA objects + cudart into the plugin
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${CUDA_OBJS} CUDA::cudart)
+        target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_CUDA_NIS)
+        target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        set_source_files_properties(${CUDA_OBJS} PROPERTIES GENERATED TRUE)
+
+        # List .cu files as IDE-only sources (not compiled by MSVC)
         target_sources(${CMAKE_PROJECT_NAME} PRIVATE
             src/ocr/nis_upscaler.cu
             src/detection/vampire_classifier.cu)
-        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE CUDA::cudart)
-        target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_CUDA_NIS)
-        message(STATUS "NIS CUDA upscaler + Vampire classifier enabled (CUDA ${CUDAToolkit_VERSION})")
+        set_source_files_properties(
+            src/ocr/nis_upscaler.cu
+            src/detection/vampire_classifier.cu
+            PROPERTIES HEADER_FILE_ONLY TRUE)
+
+        message(STATUS "NIS CUDA upscaler + Vampire classifier enabled (nvcc: ${CUDAToolkit_NVCC_EXECUTABLE})")
     else()
-        message(WARNING "CUDA_PATH set but CUDAToolkit not found — NIS GPU upscaler disabled")
+        message(WARNING "CUDA_PATH set but CUDAToolkit not found — CUDA kernels disabled")
     endif()
 else()
-    message(STATUS "CUDA_PATH not set — NIS GPU upscaler disabled")
+    message(STATUS "CUDA_PATH not set — CUDA kernels disabled")
 endif()
 
 # cpp-httplib needs WinSock on Windows; NO OpenSSL (leave CPPHTTPLIB_OPENSSL_SUPPORT undefined)
