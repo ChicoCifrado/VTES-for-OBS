@@ -207,6 +207,7 @@ if(DEFINED ENV{CUDA_PATH})
     if(CUDAToolkit_FOUND)
         set(NVCC_FLAGS
             -c
+            -allow-unsupported-compiler
             "-I${CMAKE_CURRENT_SOURCE_DIR}/src"
             "-I${CMAKE_CURRENT_SOURCE_DIR}/vendor"
             -DHAVE_CUDA_NIS
