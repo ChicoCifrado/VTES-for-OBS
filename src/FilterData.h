@@ -162,6 +162,7 @@ struct filter_data {
 
 	// --- OCR card name reader (Tesseract, optional) ---
 	std::unique_ptr<VtesOcrReader> ocr_reader;
+	bool upscaler_enabled = false;
 	std::vector<VTESCardNameEntry> card_name_entries;  // built from vtes_db for fuzzy matching
 	bool ocr_enabled = false;
 
@@ -207,6 +208,9 @@ struct filter_data {
 
 	// --- Cooldown: skip detection for N ns after successful identification ---
 	int64_t cooldown_until_time_ns = 0;
+
+	// --- CUDA oval/rect portrait classifier ---
+	bool vampire_cuda_enabled = true;
 
 };
 #endif /* FILTERDATA_H */

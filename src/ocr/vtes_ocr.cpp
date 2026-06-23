@@ -8,6 +8,7 @@
 #include "plugin-support.h"
 #include "vtes_ocr.hpp"
 #include "vtes_api_lookup.hpp"
+#include "nis_upscaler.hpp"
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <algorithm>
@@ -169,6 +170,20 @@ bool VtesOcrReader::init(const std::string& tessdata_path,
     return true;
 }
 
+bool VtesOcrReader::init_upscaler(int device_id)
+{
+    upscaler_ = std::make_unique<NISUpscaler>();
+    if (!upscaler_->init(device_id)) {
+        obs_log(LOG_WARNING, "[OCR] NIS CUDA upscaler init failed (device=%d)", device_id);
+        upscaler_.reset();
+        return false;
+    }
+    use_upscaler_ = true;
+    obs_log(LOG_INFO, "[OCR] NIS CUDA upscaler initialized (device=%d, scale=%d)",
+            device_id, upscaler_->scale());
+    return true;
+}
+
 bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
                               std::string& out_name,
                               std::string& out_id,
@@ -184,6 +199,17 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
     // Step 1: visually locate the card name region (instead of hardcoded crop)
     cv::Mat name_region = detectNameRegion(card_bgr, card_type_hint);
     if (name_region.empty()) return false;
+
+    // Step 2: optional NIS CUDA upscale (Lanczos 4x + adaptive sharpen)
+    if (use_upscaler_ && upscaler_) {
+        cv::Mat upscaled;
+        if (upscaler_->upscale(name_region, upscaled)) {
+            name_region = upscaled;
+            obs_log(LOG_DEBUG, "[OCR] NIS CUDA upscale: %dx%d -> %dx%d",
+                    name_region.cols, name_region.rows,
+                    upscaled.cols, upscaled.rows);
+        }
+    }
 
     cv::Mat processed = preprocessForOcr(name_region);
     if (processed.empty()) return false;
@@ -440,10 +466,14 @@ cv::Mat VtesOcrReader::preprocessForOcr(const cv::Mat& region)
     cv::Mat enhanced;
     clahe->apply(gray, enhanced);
 
-    // Step 2: 3x upscale with Lanczos (sharper than INTER_CUBIC for text)
+    // Step 2: upscale if not already large enough (NIS CUDA already did 4x)
     cv::Mat upscaled;
-    cv::resize(enhanced, upscaled, cv::Size(region.cols * 3, region.rows * 3),
-               0, 0, cv::INTER_LANCZOS4);
+    if (region.rows > 80 && region.cols > 200) {
+        upscaled = enhanced; // already upscaled by NIS CUDA
+    } else {
+        cv::resize(enhanced, upscaled, cv::Size(region.cols * 3, region.rows * 3),
+                   0, 0, cv::INTER_LANCZOS4);
+    }
 
     // Step 3: light blur to remove upscale noise
     cv::Mat blurred;

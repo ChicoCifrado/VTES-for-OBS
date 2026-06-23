@@ -28,6 +28,8 @@ static constexpr float kPI = 3.14159265358979323846f;
 #include <bitset>
 #include <cmath>
 
+#include "detection/vampire_classifier.hpp"
+
 #include <nlohmann/json.hpp>
 #include <curl/curl.h>
 
@@ -417,6 +419,13 @@ static void initOcrReader(struct filter_data *tf)
 
     auto reader = std::make_unique<VtesOcrReader>();
     if (reader->init(found_path, tf->card_name_entries)) {
+        // Try to initialize NIS CUDA upscaler (Lanczos 4× + adaptive sharpen)
+        int cuda_device = 0;
+        if (reader->init_upscaler(cuda_device)) {
+            obs_log(LOG_INFO, "[OCR] NIS CUDA upscaler enabled");
+        } else {
+            obs_log(LOG_INFO, "[OCR] NIS CUDA upscaler not available (CUDA GPU?)");
+        }
         tf->ocr_reader = std::move(reader);
         tf->ocr_enabled = true;
         obs_log(LOG_INFO, "[OCR] Tesseract initialized with tessdata: %s", found_path.c_str());
@@ -756,6 +765,8 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 
 	// OCR
 	obs_properties_add_bool(props, "ocr_enabled", "OCR (read card names with Tesseract)");
+	obs_properties_add_bool(props, "upscaler_enabled", "NIS Upscale (Lanczos 4x + adaptive sharpen via CUDA)");
+	obs_properties_add_bool(props, "vampire_cuda_enabled", "CUDA Oval/Rect Classifier (reduce false positives)");
 
 	// Card Search Web Server
 	obs_properties_add_button(props, "card_search_btn", "Open Card Search",
@@ -828,6 +839,8 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 	// Classifier defaults
 	obs_data_set_default_bool(settings, "classifier_enabled", true);
 	obs_data_set_default_bool(settings, "ocr_enabled", true);
+	obs_data_set_default_bool(settings, "upscaler_enabled", false);
+	obs_data_set_default_bool(settings, "vampire_cuda_enabled", true);
 	obs_data_set_default_double(settings, "detection_interval_seconds", 0.0);
 	obs_data_set_default_double(settings, "clf_oval_weight", 0.5);
 	obs_data_set_default_double(settings, "clf_color_weight", 0.3);
@@ -921,6 +934,19 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 	} else if (!ocr_wanted && tf->ocr_reader) {
 		tf->ocr_reader.reset();
 	}
+
+	// NIS CUDA upscaler toggle
+	bool upscaler_wanted = obs_data_get_bool(settings, "upscaler_enabled");
+	tf->upscaler_enabled = upscaler_wanted;
+	if (tf->ocr_reader) {
+		tf->ocr_reader->set_upscaler_enabled(upscaler_wanted && tf->ocr_reader->is_upscaler_enabled());
+	}
+
+	// CUDA oval/rect vampire classifier toggle
+	bool vampire_cuda_wanted = obs_data_get_bool(settings, "vampire_cuda_enabled");
+	tf->vampire_cuda_enabled = vampire_cuda_wanted;
+	obs_log(LOG_INFO, "[CUDA] Vampire oval classifier %s",
+		vampire_cuda_wanted ? "ENABLED" : "DISABLED");
 
 	// Classifier
 	tf->classifier_enabled = obs_data_get_bool(settings, "classifier_enabled");
@@ -1337,8 +1363,17 @@ static void ocr_worker_func(detect_filter_obb* tf)
 				if (is_vampire) {
 					obs_log(LOG_INFO, "[OCR] Vampire validation for '%s' (id=%s)",
 						ocr_name.c_str(), ocr_id.c_str());
-					if (!VtesOcrReader::hasVampireOval(job.card_region)) {
-						obs_log(LOG_INFO, "[OCR] Vampire REJECTED: no oval portrait found");
+					bool oval_ok = false;
+					if (tf->vampire_cuda_enabled) {
+						oval_ok = isVampireCUDA(job.card_region);
+						if (!oval_ok)
+							obs_log(LOG_INFO, "[OCR] Vampire REJECTED: CUDA oval classifier says RECT");
+					} else {
+						oval_ok = VtesOcrReader::hasVampireOval(job.card_region);
+						if (!oval_ok)
+							obs_log(LOG_INFO, "[OCR] Vampire REJECTED: no oval portrait found");
+					}
+					if (!oval_ok) {
 						accepted = false;
 					} else {
 						int detected_cap = tf->ocr_reader->detectVampireCapacity(job.card_region);
@@ -1584,6 +1619,14 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				vision_type = runVisionTypeClassifier(tf, card_regions[i]);
 			if (!vision_type.empty()) {
 				per_object_type_filter[i] = vision_type;
+
+				// CUDA oval/rect validation: reject vampires that don't look oval
+				if (tf->vampire_cuda_enabled && vision_type == "Vampire" &&
+				    !isVampireCUDA(card_regions[i])) {
+					obs_log(LOG_INFO, "[CUDA] Card %zu: type=%s but frame is RECT — rejecting",
+						i, vision_type.c_str());
+					per_object_type_filter[i] = "Reject";
+				}
 				// Map vision type to display label (for color-coded overlay)
 				static const std::unordered_map<std::string, int> type_to_label = {
 					{"Vampire", 0}, {"Master", 1}, {"LibraryAction", 2}, {"Action", 2},

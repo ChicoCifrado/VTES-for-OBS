@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <opencv2/core.hpp>
+#include <memory>
 
 struct VTESCardNameEntry {
     std::string id;
@@ -14,6 +15,7 @@ struct VTESCardNameEntry {
 
 // Opaque forward declaration of Tesseract's TessBaseAPI
 struct TessBaseAPI;
+class NISUpscaler;
 
 class VtesOcrReader {
 public:
@@ -32,6 +34,10 @@ public:
                    std::string& out_id,
                    float& out_confidence,
                    const std::string& card_type_hint = "");
+
+    bool init_upscaler(int device_id = 0);
+    void set_upscaler_enabled(bool enabled) { use_upscaler_ = enabled; }
+    bool is_upscaler_enabled() const { return use_upscaler_; }
 
     // ─── Vampire card validation ────────────────────────────────────
     // Returns true if the card has an oval portrait (vampire indicator)
@@ -57,6 +63,9 @@ private:
     void (*fnEnd)(TessBaseAPI*) = nullptr;
 
     bool loadTesseractDLL();
+
+    std::unique_ptr<NISUpscaler> upscaler_;
+    bool use_upscaler_ = false;
 
     std::vector<VTESCardNameEntry> card_names_;
 

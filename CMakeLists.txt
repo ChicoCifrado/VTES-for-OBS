@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16...3.26)
+cmake_minimum_required(VERSION 3.18...3.31)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
 
@@ -199,6 +199,27 @@ endif()
 unset(TENSORRT_INCLUDE_DIR)
 unset(TENSORRT_LIB)
 unset(TENSORRT_PLUGIN_LIB)
+
+# ── CUDA NIS upscaler (Lanczos 4× + adaptive sharpen on GPU) ────────
+if(DEFINED ENV{CUDA_PATH})
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        enable_language(CUDA)
+        set(CMAKE_CUDA_STANDARD 17)
+        set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+        set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
+        target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+            src/ocr/nis_upscaler.cu
+            src/detection/vampire_classifier.cu)
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE CUDA::cudart)
+        target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_CUDA_NIS)
+        message(STATUS "NIS CUDA upscaler + Vampire classifier enabled (CUDA ${CUDAToolkit_VERSION})")
+    else()
+        message(WARNING "CUDA_PATH set but CUDAToolkit not found — NIS GPU upscaler disabled")
+    endif()
+else()
+    message(STATUS "CUDA_PATH not set — NIS GPU upscaler disabled")
+endif()
 
 # cpp-httplib needs WinSock on Windows; NO OpenSSL (leave CPPHTTPLIB_OPENSSL_SUPPORT undefined)
 if(WIN32)
