@@ -249,7 +249,7 @@ if(DEFINED ENV{CUDA_PATH})
         endif()
 
         set(CUDA_OBJS "")
-        foreach(cu_file src/ocr/nis_upscaler.cu src/detection/vampire_classifier.cu)
+        foreach(cu_file src/ocr/nis_upscaler.cu src/ocr/nis_upscaler_kernels.cu src/detection/vampire_classifier.cu src/detection/vampire_classifier_kernels.cu)
             get_filename_component(cu_name ${cu_file} NAME_WE)
             set(obj_path "${CMAKE_CURRENT_BINARY_DIR}/cuda/${cu_name}.obj")
             list(APPEND CUDA_OBJS ${obj_path})
@@ -272,10 +272,14 @@ if(DEFINED ENV{CUDA_PATH})
         # List .cu files as IDE-only sources (not compiled by MSVC)
         target_sources(${CMAKE_PROJECT_NAME} PRIVATE
             src/ocr/nis_upscaler.cu
-            src/detection/vampire_classifier.cu)
+            src/ocr/nis_upscaler_kernels.cu
+            src/detection/vampire_classifier.cu
+            src/detection/vampire_classifier_kernels.cu)
         set_source_files_properties(
             src/ocr/nis_upscaler.cu
+            src/ocr/nis_upscaler_kernels.cu
             src/detection/vampire_classifier.cu
+            src/detection/vampire_classifier_kernels.cu
             PROPERTIES HEADER_FILE_ONLY TRUE)
 
         message(STATUS "NIS CUDA upscaler + Vampire classifier enabled (nvcc: ${CUDAToolkit_NVCC_EXECUTABLE})")
