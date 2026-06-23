@@ -221,9 +221,28 @@ if(DEFINED ENV{CUDA_PATH})
             -Xcompiler "/MD /O2 /std:c++17")
 
         # Append OpenCV include paths (needed by nis_upscaler.hpp)
-        foreach(_d ${OPENCV_NVCC_INCLUDE_DIRS})
-            list(APPEND NVCC_FLAGS "-I${_d}")
-        endforeach()
+        if(DEFINED opencv_SOURCE_DIR)
+            # Fetched OpenCV — source + binary dirs
+            foreach(_d
+                "${opencv_SOURCE_DIR}/include"
+                "${opencv_SOURCE_DIR}/modules/core/include"
+                "${opencv_SOURCE_DIR}/modules/imgproc/include"
+                "${opencv_SOURCE_DIR}/modules/imgcodecs/include"
+                "${opencv_SOURCE_DIR}/modules/video/include"
+                "${opencv_SOURCE_DIR}/modules/geometry/include"
+                "${opencv_SOURCE_DIR}/modules/dnn/include"
+                "${opencv_SOURCE_DIR}/modules/flann/include"
+                "${opencv_SOURCE_DIR}/modules/features/include"
+                "${opencv_SOURCE_DIR}/modules/features2d/include"
+                "${opencv_BINARY_DIR}")
+                list(APPEND NVCC_FLAGS "-I${_d}")
+            endforeach()
+        else()
+            # System OpenCV
+            foreach(_d ${OPENCV_NVCC_INCLUDE_DIRS})
+                list(APPEND NVCC_FLAGS "-I${_d}")
+            endforeach()
+        endif()
 
         set(CUDA_OBJS "")
         foreach(cu_file src/ocr/nis_upscaler.cu src/detection/vampire_classifier.cu)
