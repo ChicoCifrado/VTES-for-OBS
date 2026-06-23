@@ -223,7 +223,7 @@ if(DEFINED ENV{CUDA_PATH})
         # Append OpenCV include paths (needed by nis_upscaler.hpp)
         if(DEFINED opencv_SOURCE_DIR)
             # Fetched OpenCV — source + binary dirs
-            foreach(_d
+            set(_opencv_dirs
                 "${opencv_SOURCE_DIR}/include"
                 "${opencv_SOURCE_DIR}/modules/core/include"
                 "${opencv_SOURCE_DIR}/modules/imgproc/include"
@@ -235,13 +235,17 @@ if(DEFINED ENV{CUDA_PATH})
                 "${opencv_SOURCE_DIR}/modules/features/include"
                 "${opencv_SOURCE_DIR}/modules/features2d/include"
                 "${opencv_BINARY_DIR}")
+            foreach(_d ${_opencv_dirs})
                 list(APPEND NVCC_FLAGS "-I${_d}")
             endforeach()
+            message(STATUS "NVCC OpenCV include: ${opencv_BINARY_DIR}")
+            message(STATUS "NVCC OpenCV include check: ${opencv_BINARY_DIR}/opencv2/opencv_modules.hpp")
         else()
             # System OpenCV
             foreach(_d ${OPENCV_NVCC_INCLUDE_DIRS})
                 list(APPEND NVCC_FLAGS "-I${_d}")
             endforeach()
+            message(STATUS "NVCC OpenCV include (system): ${OPENCV_NVCC_INCLUDE_DIRS}")
         endif()
 
         set(CUDA_OBJS "")
