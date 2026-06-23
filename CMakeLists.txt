@@ -234,12 +234,12 @@ if(DEFINED ENV{CUDA_PATH})
                 "${opencv_SOURCE_DIR}/modules/flann/include"
                 "${opencv_SOURCE_DIR}/modules/features/include"
                 "${opencv_SOURCE_DIR}/modules/features2d/include"
-                "${opencv_BINARY_DIR}")
+                "${opencv_BINARY_DIR}"
+                "${CMAKE_BINARY_DIR}")
             foreach(_d ${_opencv_dirs})
                 list(APPEND NVCC_FLAGS "-I${_d}")
             endforeach()
             message(STATUS "NVCC OpenCV include: ${opencv_BINARY_DIR}")
-            message(STATUS "NVCC OpenCV include check: ${opencv_BINARY_DIR}/opencv2/opencv_modules.hpp")
         else()
             # System OpenCV
             foreach(_d ${OPENCV_NVCC_INCLUDE_DIRS})
