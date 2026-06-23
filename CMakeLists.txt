@@ -67,9 +67,13 @@ if(USE_SYSTEM_OPENCV)
     unset(_cv_root)
     unset(_cv_dlls)
   endif()
+  set(OPENCV_NVCC_INCLUDE_DIRS "${OpenCV_INCLUDE_DIRS}")
 else()
   include(cmake/FetchOpenCV.cmake)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OpenCV)
+  get_target_property(_opencv_inc OpenCV INTERFACE_INCLUDE_DIRECTORIES)
+  set(OPENCV_NVCC_INCLUDE_DIRS "${_opencv_inc}")
+  unset(_opencv_inc)
 endif()
 
 # add the vendor and src folders to the include path
@@ -215,6 +219,11 @@ if(DEFINED ENV{CUDA_PATH})
             -gencode arch=compute_86,code=sm_86
             -gencode arch=compute_89,code=sm_89
             -Xcompiler "/MD /O2 /std:c++17")
+
+        # Append OpenCV include paths (needed by nis_upscaler.hpp)
+        foreach(_d ${OPENCV_NVCC_INCLUDE_DIRS})
+            list(APPEND NVCC_FLAGS "-I${_d}")
+        endforeach()
 
         set(CUDA_OBJS "")
         foreach(cu_file src/ocr/nis_upscaler.cu src/detection/vampire_classifier.cu)
