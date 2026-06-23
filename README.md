@@ -1,38 +1,34 @@
-# VTES Card Scanner — OBS Plugin
+# VTES Card Scanner — Plugin para OBS Studio
 
-Real-time VTES card identification plugin for OBS Studio. Detect and identify cards from a webcam feed using YOLO detection + ArcFace embedding matching + OCR fallback.
+Identificación de cartas de **Vampire: The Eternal Struggle** en tiempo real desde cámara web. Usa detección YOLO OBB + clasificador de tipo por visión + OCR (Tesseract) como sistema de identificación principal.
 
 ## Pipeline
 
 ```
-Webcam -> YOLO OBB Detection -> Per-Card Crop -> Type Classifier
-  -> Per-Type ArcFace Embedder (14 models, 3-1703 classes each)
-  -> Global Embedder Fallback
-  -> Tesseract OCR Fallback (name crop, fuzzy match)
+Cámara web → YOLO OBB Detection → Crop por carta → Clasificador de tipo
+  → OCR Tesseract (crop del nombre, fuzzy match contra base de datos)
 ```
 
-- **Detection:** YOLO OBB (Oriented Bounding Boxes) — detects card position, angle, and type
-- **Type Classification:** Vision Transformer (ViT) — classifies into 14 VTES card types
-- **Card Identification:** ArcFace embedding matching — per-type matchers (14 ONNX models) + global fallback
-- **OCR Fallback:** Tesseract reads card name from top 10% of card image when embedding confidence < 80%
+- **Detección:** YOLO OBB (Oriented Bounding Boxes) — detecta posición, ángulo y tipo de cada carta
+- **Clasificación de tipo:** Vision Transformer (ViT) — clasifica en 14 tipos de carta VTES
+- **Identificación:** OCR Tesseract lee el nombre desde la región superior de la carta y hace fuzzy matching contra las 4149 cartas de la base de datos
+- **Cooldown:** 5 segundos de pausa tras identificar una carta para evitar bucles de detección
 
-## 14 Card Types
+## 14 Tipos de Carta
 
 Action, Action Modifier, Ally, Combat, Conviction, Equipment, Event, Imbued, Master, Political Action, Power, Reaction, Retainer, Vampire
 
-## Requirements
+## Requisitos
 
 - **OBS Studio** 30.x+
-- **Windows 10/11** (x64) or **Linux** (x86_64)
-- **GPU:** NVIDIA (CUDA), AMD/Intel (DirectML), or CPU fallback
-- **CMake** 3.22+
-- **Visual Studio 2022+** (Windows) or **GCC** (Linux)
-- **OpenCV** 5.x (system-installed or auto-downloaded)
+- **Windows 10/11** (x64)
+- **GPU:** NVIDIA (CUDA) con TensorRT 11.1, o cualquier GPU con DirectML
+- **Tesseract OCR** 5.x (instalado automáticamente por el script)
+- **CMake** 3.22+ y **Visual Studio 2022+** (solo para compilar desde código)
 
-## Quick Start (Windows)
+## Inicio Rápido
 
 ```powershell
-# Clone and build
 git clone https://github.com/ChicoCifrado/VTES-for-OBS.git
 cd VTES-for-OBS
 .\vtes-grimoire.ps1 build
@@ -62,97 +58,101 @@ Q. QUIT
 .\vtes-grimoire.ps1 all         # Build + Deploy
 ```
 
-### Instalador NSIS
+## Instalador NSIS
 
 La opción **7** (o `.ps1 package`) genera un `.exe` redistribuible con:
 
-- DLL del plugin + todas las dependencias de ejecución (ONNX Runtime, CUDA, TensorRT, OpenCV)
-- Archivos de datos (modelos, embeddings, configs)
+- DLL del plugin + todas las dependencias de ejecución (ONNX Runtime, TensorRT, OpenCV)
+- Archivos de datos (modelos, clasificador, base de datos de cartas)
 - Entrada en Agregar o Quitar Programas de Windows
 - Desinstalador que limpia todos los archivos de VTES
 
-El instalador usa como destino `C:\Program Files\obs-studio` y detecta la ubicación de OBS desde el registro.
+El instalador usa como destino `C:\Program Files\obs-studio` y detecta la ubicación de OBS desde el registro de Windows.
 
-### Desinstalación
+## Configuración en OBS
+
+1. Añade una fuente **Video Capture Device** (cámara web) a tu escena
+2. Añade el filtro **VTES Card Scanner** a la fuente de cámara
+3. Selecciona dispositivo de inferencia: **CUDA** (NVIDIA), **DirectML** (cualquier GPU), o **CPU**
+4. Apunta la cámara a las cartas — aparecerán las bounding boxes con el nombre de cada carta
+
+### Controles del filtro
+
+| Control | Descripción |
+|---|---|
+| **Show Bounding Boxes** | Muestra/oculta los rectángulos y etiquetas sobre las cartas detectadas |
+| **Always Active** | Mantiene la detección activa aunque las bounding boxes estén ocultas |
+| **Confidence Threshold** | Umbral de confianza del detector YOLO (0.0–1.0, defecto 0.5) |
+| **Detection Interval** | Intervalo mínimo entre detecciones (0–5 segundos, 0 = cada frame) |
+| **Inference Device** | CUDA (NVIDIA), DirectML (GPU genérica), o CPU |
+
+## Compilar desde Código
+
+```powershell
+cmake --preset windows-x64 -DUSE_SYSTEM_OPENCV=ON
+cmake --build --preset windows-x64 --config RelWithDebInfo --parallel
+cmake --install build_x64 --prefix release/RelWithDebInfo --config RelWithDebInfo
+```
+
+### Opciones de CMake
+
+| Flag | Descripción |
+|---|---|
+| `-DUSE_SYSTEM_OPENCV=ON` | Usar OpenCV del sistema en vez de descargarlo |
+| `-DUSE_SYSTEM_TESSERACT=ON` | Usar Tesseract del sistema |
+| `-DOpenCV_DIR=C:/opencv/build` | Ruta al config de CMake de OpenCV |
+
+## Estructura del Proyecto
+
+```
+src/
+  plugin-main.c                 — Punto de entrada del plugin OBS
+  detect-filter-obb.cpp         — Filtro principal: YOLO OBB + OCR pipeline
+  FilterData.h                  — Estructura de datos del filtro
+  detection/
+    yolo_detector.cpp           — Inferencia YOLO OBB (DirectML)
+    tensorrt_detector.cpp       — Inferencia YOLO OBB (TensorRT CUDA)
+    contour_detector.cpp        — Detección por contornos (sin IA)
+    detector_base.hpp           — Interfaz base de detectores
+    detection_types.hpp         — Tipos comunes (OBBObject, etc.)
+  classifier/
+    vtes_card_classifier.cpp    — Clasificador de tipo por visión (ViT)
+  ocr/
+    vtes_ocr.cpp                — OCR Tesseract + fuzzy matching
+    vtes_api_lookup.cpp         — Búsqueda de cartas por nombre
+  embedding_matcher.h           — Matcher por embeddings (ArcFace, actualmente sin modelos)
+cmake/
+  FetchOpenCV.cmake             — Dependencia OpenCV (auto-descarga o sistema)
+  FetchOnnxruntime.cmake        — Dependencia ONNX Runtime
+scripts/                        — Scripts de entrenamiento y utilidades
+vtes-grimoire.ps1               — TUI/CLI unificada para build/deploy/verify
+```
+
+## Modelos
+
+Los modelos **no están incluidos** en el repositorio por tamaño. Deben obtenerse por separado:
+
+- **Detección:** YOLO26 OBB ONNX o TensorRT engine (`vtes.engine`)
+- **Clasificador de tipo:** ViT ONNX (`vtes_type_classifier.onnx`)
+- **Base de datos de cartas:** `vtes.json` (incluida en el repositorio)
+
+Colocar en `data/obs-plugins/vtes-card-scanner/models/` (o usar el script `vtes-grimoire.ps1` opción 3 para sincronizar desde WSL).
+
+## Desinstalación
 
 1. Cierra OBS Studio
 2. Ve a **Agregar o Quitar Programas** → **VTES Card Scanner OBS Plugin** → **Desinstalar**
 3. O ejecuta `uninstall-vtes-card-scanner.exe` en `obs-plugins\64bit\`
 
 El desinstalador elimina:
-- DLL del plugin + PDB de `obs-plugins\64bit\`
-- Todas las DLLs de ejecución (ONNX, CUDA, TensorRT, OpenCV, DirectML)
-- Directorio de datos (`data\obs-plugins\vtes-card-scanner\`) — modelos, embeddings, logs
-- Directorios vacíos sobrantes, entrada del registro de Windows
+- DLL del plugin + PDB
+- DLLs de ejecución (ONNX Runtime, TensorRT, CUDA, OpenCV)
+- Datos del plugin (modelos, base de datos, logs)
+- Entrada del registro de Windows
 
-### OBS Setup
+## Licencia
 
-1. Add a **Video Capture Device** (webcam) to your scene
-2. Add **VTES Card Scanner** filter to the webcam source
-3. Select inference device: **CUDA** (NVIDIA), **DirectML** (any GPU), or **CPU**
-4. Point camera at VTES cards — bounding boxes with card names appear
-
-## Building from Source
-
-### Windows (MSVC)
-
-```powershell
-cmake --preset windows-x64 -DUSE_SYSTEM_OPENCV=ON -DOpenCV_DIR=C:/opencv/build
-cmake --build --preset windows-x64 --config RelWithDebInfo --parallel
-cmake --install build_x64 --prefix release/RelWithDebInfo --config RelWithDebInfo
-```
-
-### Linux
-
-```bash
-cmake --preset linux-x86_64
-cmake --build --preset linux-x86_64 --config RelWithDebInfo --parallel
-```
-
-### Options
-
-| CMake Flag | Description |
-|---|---|
-| `-DUSE_SYSTEM_OPENCV=ON` | Use system OpenCV instead of downloading |
-| `-DUSE_SYSTEM_TESSERACT=ON` | Enable OCR via system Tesseract |
-| `-DOpenCV_DIR=C:/opencv/build` | Path to OpenCV cmake config |
-| `-DUSE_SYSTEM_ONNXRUNTIME=ON` | Use system ONNX Runtime (Linux only) |
-
-## Project Structure
-
-```
-src/
-  plugin-main.c              — OBS plugin entry point
-  detect-filter-obb.cpp      — Main filter: YOLO OBB + embedding + OCR pipeline
-  detect-filter.cpp          — Original detection filter (non-OBB)
-  ort-model/ONNXRuntimeModel.cpp — ONNX Runtime wrapper with GPU provider support
-  yolov8/yolov8_obb_yolo26.cpp  — YOLO26 OBB inference
-  classifier/vtes_card_classifier.cpp — Vision Transformer type classifier
-  ocr/vtes_ocr.cpp           — Tesseract OCR + fuzzy card name matching
-  detection/contour_detector.cpp — Contour-based card detection (no ML)
-cmake/
-  FetchOpenCV.cmake          — OpenCV dependency (auto-download or system)
-  FetchOnnxruntime.cmake     — ONNX Runtime dependency
-  common/FindTesseract.cmake — Tesseract find module
-vendor/                      — Vendored dependencies
-scripts/                     — Training & utility scripts
-vtes-grimoire.ps1            — Unified TUI/CLI for build/deploy/verify
-```
-
-## Models
-
-Models are **not** included in the git repository. Obtain them separately:
-
-- **Detection model:** YOLO26 OBB ONNX (from training)
-- **Type classifier:** ViT ONNX
-- **Per-type embedders:** 14 ArcFace ONNX models + embedding banks
-- **Global embedder:** ArcFace ONNX + embedding bank
-
-Place in `data/per_type/` or use `Invoke-CopyPerType` (option 3 in the grimorie) to sync from a WSL training environment.
-
-## License
-
-GNU General Public License v2.0 — see [LICENSE](LICENSE)
+GNU General Public License v2.0 — ver [LICENSE](LICENSE)
 
 ---
 
