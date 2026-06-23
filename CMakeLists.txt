@@ -204,8 +204,12 @@ unset(TENSORRT_PLUGIN_LIB)
 if(DEFINED ENV{CUDA_PATH})
     find_package(CUDAToolkit QUIET)
     if(CUDAToolkit_FOUND)
-        # Set nvcc path explicitly so CMake doesn't need VS CUDA integration
-        set(CMAKE_CUDA_COMPILER "${CUDAToolkit_NVCC_EXECUTABLE}" CACHE FILEPATH "CUDA compiler")
+        # Bypass CMake's CUDA compiler ID test (requires VS CUDA build
+        # customizations that may not be registered). We already verified
+        # the toolkit via find_package(CUDAToolkit) above.
+        set(CMAKE_CUDA_COMPILER "${CUDAToolkit_NVCC_EXECUTABLE}")
+        set(CMAKE_CUDA_COMPILER_ID "NVIDIA")
+        set(CMAKE_CUDA_COMPILER_FORCED TRUE)
         enable_language(CUDA)
         set(CMAKE_CUDA_STANDARD 17)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
