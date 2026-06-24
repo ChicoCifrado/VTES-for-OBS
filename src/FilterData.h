@@ -212,5 +212,24 @@ struct filter_data {
 	// --- CUDA oval/rect portrait classifier ---
 	bool vampire_cuda_enabled = true;
 
+	// --- Web server notification flag (show popup once per filter instance) ---
+	bool web_server_notified = false;
+
+	// --- Manual overlay (triggered from web UI, overrides auto-detection) ---
+	std::string manual_overlay_url;
+	int64_t manual_overlay_set_time_ns = 0;
+	bool click_to_overlay = false;  // when true, only show cards manually clicked from web UI
+
+	// --- Detection history for web server ---
+	struct DetectedCard {
+		std::string card_name;
+		std::string card_id;
+		std::string card_url;
+		int64_t timestamp_ns;
+	};
+	std::mutex detection_history_lock;
+	std::deque<DetectedCard> detection_history;
+	static constexpr int MAX_DETECTION_HISTORY = 100;
+
 };
 #endif /* FILTERDATA_H */

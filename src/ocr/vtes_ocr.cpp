@@ -258,8 +258,8 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
             obs_log(LOG_INFO, "[OCR] Rejected: too few chars (%d)", total);
             return false;
         }
-        if (total > 55) {
-            obs_log(LOG_INFO, "[OCR] Rejected: too many chars (%d, max 55)", total);
+        if (total > 25) {
+            obs_log(LOG_INFO, "[OCR] Rejected: too many chars (%d, max 25)", total);
             return false;
         }
         if ((float)alpha / (float)total < 0.40f) {
@@ -335,17 +335,12 @@ cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr,
     cv::Mat edge_binary;
     cv::threshold(abs_edges, edge_binary, 24.0, 255.0, cv::THRESH_BINARY);
 
-    // Expected name zone (fraction of card height)
-    // Narrow bands that exclude type banner (<10%) and card art (>17%/60%)
-    bool is_vampire = (!card_type_hint.empty() && card_type_hint == "Vampire");
-    int zone_top, zone_bot;
-    if (is_vampire) {
-        zone_top = h * 53 / 100;  // 53%-60% for vampire names
-        zone_bot = h * 60 / 100;
-    } else {
-        zone_top = h * 10 / 100;  // 10%-17% for non-vamp names
-        zone_bot = h * 17 / 100;
-    }
+    // Expected name zone — ALL card types have the card name at the top-left
+    // corner, just below the top border. Search the top 2-12% of the card.
+    // (Previous per-type zones for vampires at 53-60% were incorrect — that's
+    //  the card art / text area, not the name.)
+    int zone_top = h * 2 / 100;
+    int zone_bot = h * 12 / 100;
     zone_top = std::max(0, zone_top);
     zone_bot = std::min(h, zone_bot);
 
@@ -415,21 +410,17 @@ cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr,
         name_bottom = zone_top + best_end;
     } else {
         // Fallback to fixed position if no clear text band found
-        if (is_vampire) {
-            name_top = h * 53 / 100;
-            name_bottom = h * 59 / 100;
-        } else {
-            name_top = h * 10 / 100;
-            name_bottom = h * 18 / 100;
-        }
+        name_top = h * 2 / 100;
+        name_bottom = h * 14 / 100;
     }
 
     // 2px padding
     name_top = std::max(0, name_top - 2);
     name_bottom = std::min(h, name_bottom + 2);
 
-    int name_left = (int)(w * 0.03f);
-    int name_w = (int)(w * 0.94f);
+    // Card name is at the TOP-LEFT corner, not centered. Narrow crop.
+    int name_left = (int)(w * 0.05f);
+    int name_w = (int)(w * 0.55f);
     int name_h = name_bottom - name_top;
 
     cv::Rect name_roi(name_left, name_top, name_w, name_h);

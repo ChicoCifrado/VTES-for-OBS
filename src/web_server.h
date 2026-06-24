@@ -10,6 +10,8 @@
 #include <cctype>
 #include <cstring>
 #include <cstdio>
+#include <functional>
+#include <vector>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -27,11 +29,23 @@
 #define closesocket close
 #endif
 
+struct DetectionEntry {
+    std::string card_name;
+    std::string card_id;
+    std::string card_url;
+    int64_t timestamp_ns;
+};
+
 class WebServer {
 public:
     WebServer() : running_(false), port_(8080), sock_(INVALID_SOCKET) {}
 
     ~WebServer() { stop(); }
+
+    // Callbacks to communicate with the filter instance
+    std::function<std::vector<DetectionEntry>()> get_detections_fn;
+    std::function<void(const std::string& url)> on_overlay_fn;
+    std::function<void()> on_overlay_clear_fn;
 
     bool start(int port, const VTESCardDatabase *db) {
         if (running_) stop();
@@ -151,12 +165,22 @@ private:
             serveStatus(client);
         } else if (uri == "/api/search") {
             serveJson(client, q);
+        } else if (uri == "/api/detections") {
+            serveDetectionsJson(client);
+        } else if (uri == "/api/overlay") {
+            serveOverlaySet(client, query);
+        } else if (uri == "/api/overlay/clear") {
+            serveOverlayClear(client);
         } else if (uri == "/search") {
             serveHtmlResult(client, q);
+        } else if (uri == "/detections") {
+            serveDetectionsPage(client);
         } else if (uri == "/favicon.ico") {
             send204(client);
-        } else {
+        } else if (uri == "/") {
             serveForm(client);
+        } else {
+            send404(client);
         }
     }
 
@@ -337,6 +361,120 @@ private:
         sendAll(client, body);
     }
 
+    void serveDetectionsJson(SOCKET client) {
+        nlohmann::json j = nlohmann::json::array();
+        if (get_detections_fn) {
+            auto entries = get_detections_fn();
+            for (const auto& e : entries) {
+                nlohmann::json card;
+                card["card_name"] = e.card_name;
+                card["card_id"] = e.card_id;
+                card["card_url"] = e.card_url;
+                card["timestamp_ns"] = e.timestamp_ns;
+                j.push_back(std::move(card));
+            }
+        }
+        std::string body = j.dump(2);
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    void serveOverlaySet(SOCKET client, const std::string& query) {
+        // Extract url= parameter from query string
+        std::string url;
+        size_t pos = query.find("url=");
+        if (pos != std::string::npos) {
+            url = urlDecode(query.substr(pos + 4));
+            size_t amp = url.find('&');
+            if (amp != std::string::npos) url.resize(amp);
+        }
+        if (on_overlay_fn && !url.empty()) {
+            on_overlay_fn(url);
+        }
+        std::string body = "{\"ok\":true}";
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    void serveOverlayClear(SOCKET client) {
+        if (on_overlay_clear_fn) on_overlay_clear_fn();
+        std::string body = "{\"ok\":true}";
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    void serveDetectionsPage(SOCKET client) {
+        std::ostringstream h;
+        h << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+          << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+          << "<title>VTES Detecciones del Directo</title><style>"
+          << PAGE_CSS
+          << "</style></head><body><div class=\"container\">"
+          << "<h1>Detecciones del Directo</h1>"
+          << "<div class=\"nav-bar\">"
+          << "<a href=\"/\">Buscar Cartas</a>"
+          << "<a href=\"/detections\" class=\"active\">Detecciones</a>"
+          << "<span class=\"status\" id=\"status\">Conectado</span>"
+          << "</div>"
+          << "<div id=\"grid\" class=\"detection-grid\"></div>"
+          << "<script>"
+          << "async function loadDetections(){"
+          << "const r=await fetch('/api/detections');"
+          << "const data=await r.json();"
+          << "const grid=document.getElementById('grid');"
+          << "grid.innerHTML='';"
+          << "if(data.length===0){grid.innerHTML='<div class=\"empty\">Aún no hay detecciones</div>';return}"
+          << "for(const d of data){"
+          << "const div=document.createElement('div');"
+          << "div.className='detection-card';"
+          << "const time=new Date(Number(d.timestamp_ns)/1e6);"
+          << "const timeStr=time.toLocaleTimeString();"
+          << "div.innerHTML=(d.card_url?'<img src=\"'+d.card_url+'\" alt=\"'+d.card_name+'\" loading=\"lazy\">':'')"
+          << "+'<div class=\"name\">'+d.card_name+'</div>'"
+          << "'<div class=\"time\">'+timeStr+'</div>';"
+          << "div.onclick=function(){"
+          << "fetch('/api/overlay?url='+encodeURIComponent(d.card_url));"
+          << "document.querySelectorAll('.detection-card').forEach(c=>c.classList.remove('active'));"
+          << "this.classList.add('active');"
+          << "};"
+          << "grid.appendChild(div);"
+          << "}"
+          << "}"
+          << "loadDetections();"
+          << "setInterval(loadDetections,2000);"
+          << "</script>"
+          << "<div class=\"footer\">VTES Card Scanner — Haz clic en una carta para mostrarla en el overlay de OBS</div>"
+          << "</div></body></html>";
+        std::string body = h.str();
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
     void send404(SOCKET client) {
         const char *body = "<h1>404 Not Found</h1>";
         std::string resp = "HTTP/1.1 404 Not Found\r\nContent-Length: " +
@@ -377,12 +515,14 @@ private:
           << "<form class=\"search-box\" action=\"/search\" method=\"get\">"
           << "<input type=\"text\" name=\"q\" placeholder=\"e.g. Aabbt or type:Vampire clan:Ventrue cap>5\" autofocus>"
           << "<button type=\"submit\">Search</button></form>"
-          << "<div class=\"status-bar\">Database: <span class=\"status-" << dbStatus << "\">"
+          << "<div class=\"nav-bar\">"
+          << "<a href=\"/\">Buscar</a>"
+          << "<a href=\"/detections\">Detecciones</a>"
+          << "<span class=\"status-bar\">Database: <span class=\"status-" << dbStatus << "\">"
           << dbStatus << "</span>"
           << (dbSize > 0 ? " (" + std::to_string(dbSize) + " cards)" : "")
-          << " | <a href=\"/api/status\">/api/status</a>"
-          << " | <a href=\"/api/search?q=\">/api/search?q=</a>"
-          << "</div>"
+          << " | <a href=\"/api/status\">API</a>"
+          << "</span></div>"
           << "<div class=\"legend\">"
           << "<h3>Search tips</h3>"
           << "<table><tr><td><code>Aabbt</code></td><td>by name (EN / ES / FR / variants)</td></tr>"
@@ -411,11 +551,14 @@ private:
           << "<form class=\"search-box\" action=\"/search\" method=\"get\">"
           << "<input type=\"text\" name=\"q\" value=\"" << escapeHtml(q) << "\" autofocus>"
           << "<button type=\"submit\">Search</button></form>"
-          << "<div class=\"status-bar\">Database: <span class=\"status-" << dbStatus << "\">"
+          << "<div class=\"nav-bar\">"
+          << "<a href=\"/\">Buscar</a>"
+          << "<a href=\"/detections\">Detecciones</a>"
+          << "<span class=\"status-bar\">Database: <span class=\"status-" << dbStatus << "\">"
           << dbStatus << "</span>"
           << (dbSize > 0 ? " (" + std::to_string(dbSize) + " cards)" : "")
-          << " | <a href=\"/\">search tips</a>"
-          << "</div>"
+          << " | <a href=\"/\">tips</a>"
+          << "</span></div>"
           << "<div id=\"results\">";
 
         if (!db_ || db_->is_empty()) {
@@ -545,6 +688,17 @@ private:
         ".search-box input:focus{border-color:#c9a84c}"
         ".search-box button{padding:10px 20px;background:#c9a84c;color:#1a1a2e;border:none;border-radius:6px;font-size:1rem;font-weight:600;cursor:pointer}"
         ".search-box button:hover{background:#dbb58c}"
+        ".nav-bar{display:flex;gap:12px;margin-bottom:20px;align-items:center;padding:8px 12px;background:#0d1b3e;border-radius:4px}"
+        ".nav-bar a{color:#c9a84c;text-decoration:none;padding:6px 12px;border:1px solid #333;border-radius:4px;font-size:.85rem}"
+        ".nav-bar a:hover{background:#0f3460}"
+        ".nav-bar .status-bar,.nav-bar .status{font-size:.8rem;color:#888;margin-left:auto}"
+        ".detection-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:16px;padding:0}"
+        ".detection-card{border:1px solid #333;border-radius:8px;padding:12px;background:#16213e;cursor:pointer;transition:border-color .2s}"
+        ".detection-card:hover{border-color:#c9a84c}"
+        ".detection-card img{width:100%;border-radius:4px;margin-bottom:8px}"
+        ".detection-card .name{color:#c9a84c;font-size:.85rem;text-align:center}"
+        ".detection-card .time{color:#666;font-size:.7rem;text-align:center;margin-top:4px}"
+        ".detection-card.active{border-color:#4caf50;box-shadow:0 0 12px rgba(76,175,80,.3)}"
         ".status-bar{margin-bottom:20px;font-size:.85rem;color:#888;padding:8px 12px;background:#0d1b3e;border-radius:4px}"
         ".status-bar a{color:#c9a84c;text-decoration:none}"
         ".status-bar a:hover{text-decoration:underline}"
