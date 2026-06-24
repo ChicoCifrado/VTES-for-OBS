@@ -46,6 +46,8 @@ public:
     std::function<std::vector<DetectionEntry>()> get_detections_fn;
     std::function<void(const std::string& url)> on_overlay_fn;
     std::function<void()> on_overlay_clear_fn;
+    std::function<void(int player_idx, int delta)> on_pool_fn;
+    std::function<std::vector<std::pair<std::string,int>>()> get_pool_fn;
 
     bool start(int port, const VTESCardDatabase *db) {
         if (running_) stop();
@@ -171,10 +173,16 @@ private:
             serveOverlaySet(client, query);
         } else if (uri == "/api/overlay/clear") {
             serveOverlayClear(client);
+        } else if (uri == "/api/pool") {
+            servePoolSet(client, query);
+        } else if (uri == "/api/pool/status") {
+            servePoolStatus(client);
         } else if (uri == "/search") {
             serveHtmlResult(client, q);
         } else if (uri == "/detections") {
             serveDetectionsPage(client);
+        } else if (uri == "/pool") {
+            servePoolPage(client);
         } else if (uri == "/favicon.ico") {
             send204(client);
         } else if (uri == "/") {
@@ -422,6 +430,115 @@ private:
         sendAll(client, body);
     }
 
+    void servePoolSet(SOCKET client, const std::string& query) {
+        int player = 0, delta = 0;
+        size_t pos = query.find("player=");
+        if (pos != std::string::npos) {
+            std::string val = query.substr(pos + 7);
+            size_t amp = val.find('&');
+            if (amp != std::string::npos) val.resize(amp);
+            player = atoi(val.c_str());
+        }
+        pos = query.find("delta=");
+        if (pos != std::string::npos) {
+            std::string val = query.substr(pos + 6);
+            size_t amp = val.find('&');
+            if (amp != std::string::npos) val.resize(amp);
+            delta = atoi(val.c_str());
+        }
+        if (on_pool_fn)
+            on_pool_fn(player, delta);
+        int new_pool = 0;
+        // We can't read the pool back directly, so return a dummy
+        std::string body = "{\"ok\":true,\"player\":" + std::to_string(player) +
+            ",\"delta\":" + std::to_string(delta) + "}";
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    void servePoolPage(SOCKET client) {
+        std::ostringstream h;
+        h << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+          << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+          << "<title>VTES Pool Control</title><style>"
+          << PAGE_CSS
+          << "</style></head><body><div class=\"container\">"
+          << "<h1>Control de Pool</h1>"
+          << "<div class=\"nav-bar\">"
+          << "<a href=\"/\">Buscar Cartas</a>"
+          << "<a href=\"/detections\">Detecciones</a>"
+          << "<a href=\"/pool\" class=\"active\">Pool</a>"
+          << "<span class=\"status\" id=\"status\">Conectado</span>"
+          << "</div>"
+          << "<div id=\"players\"></div>"
+          << "<script>"
+          << "async function loadPool(){"
+          << "try{"
+          << "const r=await fetch('/api/pool/status');"
+          << "const data=await r.json();"
+          << "const c=document.getElementById('players');"
+          << "c.innerHTML='<table class=\"pool-table\"><tr><th>Jugador</th><th>Pool</th><th></th></tr>';"
+          << "for(let i=0;i<data.length;i++){"
+          << "const d=data[i];"
+          << "c.innerHTML+='<tr>'"
+          << "+'<td class=\"pool-name\">'+d.name+'</td>'"
+          << "+'<td class=\"pool-val\">'+d.pool+'</td>'"
+          << "+'<td class=\"pool-btns\">'"
+          << "+'<button onclick=\"adj('+i+',-1)\">-1</button>"
+          << "+'<button onclick=\"adj('+i+',+1)\">+1</button>'"
+          << "+'</td></tr>';"
+          << "}"
+          << "c.innerHTML+='</table>';"
+          << "}catch(e){document.getElementById('status').textContent='Error'}}"
+          << "async function adj(p,d){"
+          << "await fetch('/api/pool?player='+p+'&delta='+d);"
+          << "loadPool();"
+          << "}"
+          << "loadPool();"
+          << "setInterval(loadPool,2000);"
+          << "</script>"
+          << "<div class=\"footer\">VTES Card Scanner — Pool Control</div>"
+          << "</div></body></html>";
+        std::string body = h.str();
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    void servePoolStatus(SOCKET client) {
+        nlohmann::json j = nlohmann::json::array();
+        if (get_pool_fn) {
+            auto entries = get_pool_fn();
+            for (const auto& e : entries) {
+                nlohmann::json p;
+                p["name"] = e.first;
+                p["pool"] = e.second;
+                j.push_back(std::move(p));
+            }
+        }
+        std::string body = j.dump(2);
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
     void serveDetectionsPage(SOCKET client) {
         std::ostringstream h;
         h << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
@@ -432,6 +549,7 @@ private:
           << "<h1>Detecciones del Directo</h1>"
           << "<div class=\"nav-bar\">"
           << "<a href=\"/\">Buscar Cartas</a>"
+          << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\" class=\"active\">Detecciones</a>"
           << "<span class=\"status\" id=\"status\">Conectado</span>"
           << "</div>"
@@ -517,6 +635,7 @@ private:
           << "<button type=\"submit\">Search</button></form>"
           << "<div class=\"nav-bar\">"
           << "<a href=\"/\">Buscar</a>"
+          << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">Detecciones</a>"
           << "<span class=\"status-bar\">Database: <span class=\"status-" << dbStatus << "\">"
           << dbStatus << "</span>"
@@ -553,6 +672,7 @@ private:
           << "<button type=\"submit\">Search</button></form>"
           << "<div class=\"nav-bar\">"
           << "<a href=\"/\">Buscar</a>"
+          << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">Detecciones</a>"
           << "<span class=\"status-bar\">Database: <span class=\"status-" << dbStatus << "\">"
           << dbStatus << "</span>"
@@ -605,7 +725,7 @@ private:
                 }
                 h << "</div>";
                 if (!entry.url.empty())
-                    h << "<img src=\"" << entry.url << "\" alt=\"" << escapeHtml(entry.name) << "\" loading=\"lazy\">";
+                    h << "<img src=\"" << entry.url << "\" alt=\"" << escapeHtml(entry.name) << "\" loading=\"lazy\" onclick=\"showOverlay('" << entry.url << "',this)\" class=\"clickable\">";
                 h << "</div>";
                 count++;
                 if (count >= 50) {
@@ -618,7 +738,15 @@ private:
         if (count == 0)
             h << "<div class=\"empty\">No cards found</div>";
 
-        h << "</div><div class=\"footer\">VTES Card Scanner</div></div></body></html>";
+        h << "</div><div class=\"footer\">VTES Card Scanner — Haz clic en una carta para mostrarla en el overlay de OBS</div>"
+          << "<script>"
+          << "function showOverlay(url,img){"
+          << "fetch('/api/overlay?url='+encodeURIComponent(url));"
+          << "document.querySelectorAll('.result img.clickable').forEach(function(i){i.classList.remove('active')});"
+          << "img.classList.add('active');"
+          << "}"
+          << "</script>"
+          << "</div></body></html>";
         return h.str();
     }
 
@@ -716,8 +844,21 @@ private:
         ".result .type{display:inline-block;background:#0f3460;color:#aaa;font-size:.75rem;padding:2px 8px;border-radius:3px;margin-right:4px}"
         ".result .detail{font-size:.85rem;color:#999;margin-top:4px}"
         ".result img{max-width:200px;margin-top:8px;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.4)}"
+        ".result img.clickable{cursor:pointer;border:2px solid transparent;transition:border-color .2s}"
+        ".result img.clickable:hover{border-color:#c9a84c}"
+        ".result img.clickable.active{border-color:#4caf50;box-shadow:0 0 12px rgba(76,175,80,.3)}"
         ".result a{color:#c9a84c;text-decoration:none}"
         ".result a:hover{text-decoration:underline}"
+        ".pool-table{width:100%;border-collapse:collapse;margin-top:16px}"
+        ".pool-table th,.pool-table td{padding:10px 14px;text-align:left;border-bottom:1px solid #333}"
+        ".pool-table th{color:#c9a84c;font-size:.85rem}"
+        ".pool-name{color:#e0e0e0;font-size:.95rem}"
+        ".pool-val{font-size:1.2rem;font-weight:700;color:#e0e0e0;text-align:center}"
+        ".pool-btns{white-space:nowrap}"
+        ".pool-btns button{padding:6px 14px;margin:0 4px;border:none;border-radius:4px;font-size:1rem;font-weight:700;cursor:pointer}"
+        ".pool-btns button:first-child{background:#d32f2f;color:#fff}"
+        ".pool-btns button:last-child{background:#388e3c;color:#fff}"
+        ".pool-btns button:hover{opacity:.85}"
         ".empty{text-align:center;color:#666;padding:40px;font-size:1.1rem}"
         ".error{text-align:center;color:#ff5722;padding:40px;font-size:1.1rem}"
         ".footer{text-align:center;color:#444;font-size:.75rem;margin-top:40px}";

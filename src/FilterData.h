@@ -231,5 +231,63 @@ struct filter_data {
 	std::deque<DetectedCard> detection_history;
 	static constexpr int MAX_DETECTION_HISTORY = 100;
 
+	// ================================================================
+	// v0.1.6 — VTES Game State (player zones, lock tracking, overlay)
+	// ================================================================
+
+	// Per-player zone on the source frame (normalized 0..1)
+	struct PlayerZone {
+		float nx = 0.0f, ny = 0.0f, nw = 0.0f, nh = 0.0f;
+	};
+
+	// Per-player persistent state
+	struct PlayerState {
+		std::string name = "Jugador";
+		int pool = 30;
+		PlayerZone minion_zone;  // far (top) zone
+		PlayerZone crypt_zone;   // near (bottom) zone
+	};
+
+	// Lock state — cards are Unlocked by default (straight/enderezada)
+	// and become Locked only when rotated ~90° (girada)
+	enum class CardLockState : uint8_t {
+		Unlocked = 0,
+		Locked   = 1
+	};
+
+	// Per-track persistent card state
+	struct TrackedCardState {
+		int track_id = -1;
+		std::string card_id, card_name, card_url;
+		cv::Mat card_image;
+
+		// Lock state (default = Unlocked)
+		int64_t first_seen_ns   = 0;
+		float   initial_angle   = 0.0f;
+		CardLockState lock_state = CardLockState::Unlocked;
+		bool   rotation_checked = false;  // true after 1 s observation
+
+		// Player assignment (determined by zone overlap)
+		int  player_idx = -1;   // -1 = unassigned
+		bool in_crypt   = false; // false = minion zone
+
+		// Lifecycle
+		cv::Point2f last_position;
+		int64_t     last_seen_ns  = 0;
+		int         unseen_frames = 0;
+	};
+
+	static constexpr int MAX_PLAYERS = 5;
+
+	// Game-state config (read from OBS settings)
+	int                    player_count = 4;
+	PlayerState            players[MAX_PLAYERS];
+
+	// Per-track state (track_id → TrackedCardState)
+	std::unordered_map<int, TrackedCardState> tracked_cards;
+	std::mutex                                game_state_lock;
+
+	// Overlay background (loaded from data/obs-plugins/…/overlay-bg.png)
+	cv::Mat overlay_bg;
 };
 #endif /* FILTERDATA_H */

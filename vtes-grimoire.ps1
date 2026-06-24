@@ -529,8 +529,6 @@ SetCompressor lzma
 RequestExecutionLevel admin
 !include "MUI2.nsh"
 !define MUI_ABORTWARNING
-!define MUI_FINISHPAGE_RUN_TEXT "Launch OBS Studio"
-!define MUI_FINISHPAGE_RUN "$INSTDIR\bin\64bit\obs64.exe"
 !define MUI_FINISHPAGE_NOREBOOTSUPPORT
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "__PROJECT_ROOT__\LICENSE"

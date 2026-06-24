@@ -765,9 +765,9 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	obs_properties_add_bool(props, "upscaler_enabled", "NIS Upscale (Lanczos 4x + adaptive sharpen via CUDA)");
 	obs_properties_add_bool(props, "vampire_cuda_enabled", "CUDA Oval/Rect Classifier (reduce false positives)");
 
-	// Detection interval (ignored when Always Active is on)
+	// Detection interval (0 = continuous, no logging)
 	obs_properties_add_float_slider(props, "detection_interval_seconds",
-		"Detection interval (seconds, 0 = every frame, ignored when Always Active)",
+		"Detection interval",
 		0.0, 5.0, 0.1);
 
 	// Click-to-overlay: manual from web UI
@@ -805,6 +805,31 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	std::string basic_info =
 		std::regex_replace(PLUGIN_INFO_TEMPLATE, std::regex("%1"), PLUGIN_VERSION);
 	obs_properties_add_text(props, "info", basic_info.c_str(), OBS_TEXT_INFO);
+
+	// ─── Game State: Player configuration ───────────────────────────────
+	obs_properties_add_int_slider(props, "player_count", "Player count", 4, 5, 1);
+
+	for (int i = 0; i < filter_data::MAX_PLAYERS; i++) {
+		std::string prefix = "player_" + std::to_string(i);
+		std::string label = "Player " + std::to_string(i + 1);
+
+		obs_property_t *grp = obs_properties_create();
+		obs_properties_add_text(grp, (prefix + "_name").c_str(), "Name", OBS_TEXT_DEFAULT);
+		obs_properties_add_int(grp, (prefix + "_pool").c_str(), "Initial Pool", 0, 99, 1);
+
+		obs_properties_add_float(grp, (prefix + "_minion_x").c_str(), "Minion X (norm)", 0.0, 1.0, 0.01);
+		obs_properties_add_float(grp, (prefix + "_minion_y").c_str(), "Minion Y (norm)", 0.0, 1.0, 0.01);
+		obs_properties_add_float(grp, (prefix + "_minion_w").c_str(), "Minion W (norm)", 0.0, 1.0, 0.01);
+		obs_properties_add_float(grp, (prefix + "_minion_h").c_str(), "Minion H (norm)", 0.0, 1.0, 0.01);
+
+		obs_properties_add_float(grp, (prefix + "_crypt_x").c_str(), "Crypt X (norm)", 0.0, 1.0, 0.01);
+		obs_properties_add_float(grp, (prefix + "_crypt_y").c_str(), "Crypt Y (norm)", 0.0, 1.0, 0.01);
+		obs_properties_add_float(grp, (prefix + "_crypt_w").c_str(), "Crypt W (norm)", 0.0, 1.0, 0.01);
+		obs_properties_add_float(grp, (prefix + "_crypt_h").c_str(), "Crypt H (norm)", 0.0, 1.0, 0.01);
+
+		obs_properties_add_group(props, (prefix + "_group").c_str(),
+			label.c_str(), OBS_GROUP_NORMAL, grp);
+	}
 
 	UNUSED_PARAMETER(data);
 	return props;
@@ -855,6 +880,26 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "clf_oval_thresh", 0.6);
 	obs_data_set_default_double(settings, "clf_color_thresh", 0.55);
 	obs_data_set_default_double(settings, "clf_oval_reject_master", 0.4);
+
+	// Game state defaults
+	obs_data_set_default_int(settings, "player_count", 4);
+	for (int i = 0; i < filter_data::MAX_PLAYERS; i++) {
+		std::string p = "player_" + std::to_string(i);
+		obs_data_set_default_string(settings, (p + "_name").c_str(), ("Jugador " + std::to_string(i + 1)).c_str());
+		obs_data_set_default_int(settings, (p + "_pool").c_str(), 30);
+
+		// Default zones: divide screen width into MAX_PLAYERS columns
+		float col_w = 1.0f / filter_data::MAX_PLAYERS;
+		float col_x = i * col_w;
+		obs_data_set_default_double(settings, (p + "_minion_x").c_str(), col_x);
+		obs_data_set_default_double(settings, (p + "_minion_y").c_str(), 0.0);
+		obs_data_set_default_double(settings, (p + "_minion_w").c_str(), col_w);
+		obs_data_set_default_double(settings, (p + "_minion_h").c_str(), 0.45);
+		obs_data_set_default_double(settings, (p + "_crypt_x").c_str(), col_x);
+		obs_data_set_default_double(settings, (p + "_crypt_y").c_str(), 0.55);
+		obs_data_set_default_double(settings, (p + "_crypt_w").c_str(), col_w);
+		obs_data_set_default_double(settings, (p + "_crypt_h").c_str(), 0.45);
+	}
 }
 
 void detect_filter_obb_update(void *data, obs_data_t *settings)
@@ -934,6 +979,28 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		if (!per_type_attempted) {
 			per_type_attempted = true;
 			loadPerTypeEmbedders(tf);
+		}
+	}
+
+	// ─── Game state: player config ─────────────────────────────────
+	{
+		int new_count = (int)obs_data_get_int(settings, "player_count");
+		if (new_count < 4) new_count = 4;
+		if (new_count > filter_data::MAX_PLAYERS) new_count = filter_data::MAX_PLAYERS;
+		tf->player_count = new_count;
+
+		for (int i = 0; i < filter_data::MAX_PLAYERS; i++) {
+			std::string p = "player_" + std::to_string(i);
+			tf->players[i].name = obs_data_get_string(settings, (p + "_name").c_str());
+			tf->players[i].pool = (int)obs_data_get_int(settings, (p + "_pool").c_str());
+			tf->players[i].minion_zone.nx = (float)obs_data_get_double(settings, (p + "_minion_x").c_str());
+			tf->players[i].minion_zone.ny = (float)obs_data_get_double(settings, (p + "_minion_y").c_str());
+			tf->players[i].minion_zone.nw = (float)obs_data_get_double(settings, (p + "_minion_w").c_str());
+			tf->players[i].minion_zone.nh = (float)obs_data_get_double(settings, (p + "_minion_h").c_str());
+			tf->players[i].crypt_zone.nx = (float)obs_data_get_double(settings, (p + "_crypt_x").c_str());
+			tf->players[i].crypt_zone.ny = (float)obs_data_get_double(settings, (p + "_crypt_y").c_str());
+			tf->players[i].crypt_zone.nw = (float)obs_data_get_double(settings, (p + "_crypt_w").c_str());
+			tf->players[i].crypt_zone.nh = (float)obs_data_get_double(settings, (p + "_crypt_h").c_str());
 		}
 	}
 
@@ -1318,6 +1385,24 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 		tf->manual_overlay_set_time_ns = 0;
 		obs_log(LOG_INFO, "[WebServer] Manual overlay cleared");
 	};
+	tf->web_server->on_pool_fn = [tf](int player_idx, int delta) {
+		if (player_idx >= 0 && player_idx < tf->player_count) {
+			tf->players[player_idx].pool += delta;
+			if (tf->players[player_idx].pool < 0)
+				tf->players[player_idx].pool = 0;
+			if (tf->players[player_idx].pool > 99)
+				tf->players[player_idx].pool = 99;
+			obs_log(LOG_INFO, "[WebServer] Pool: %s = %d (delta %+d)",
+				tf->players[player_idx].name.c_str(),
+				tf->players[player_idx].pool, delta);
+		}
+	};
+	tf->web_server->get_pool_fn = [tf]() -> std::vector<std::pair<std::string,int>> {
+		std::vector<std::pair<std::string,int>> out;
+		for (int i = 0; i < tf->player_count; i++)
+			out.push_back({tf->players[i].name, tf->players[i].pool});
+		return out;
+	};
 	bool ws_ok = tf->web_server->start(tf->web_server_port, &tf->vtes_db);
 	if (ws_ok) {
 		obs_log(LOG_INFO, "[WebServer] Started on http://localhost:%d (filter=%s)",
@@ -1330,7 +1415,8 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 				+ std::to_string(tf->web_server_port)
 				+ "\n\nBusca cartas desde tu navegador.\n"
 				"Marca 'Always Active' para detección continua.\n"
-				"Ajusta el intervalo de detección para evitar spam.";
+				"Ajusta el intervalo de detección para evitar spam.\n"
+				"Intervalo 0 = detección continua sin límite.";
 			MessageBoxA(NULL, msg.c_str(), "VTES Card Scanner",
 				MB_OK | MB_ICONINFORMATION | MB_TASKMODAL);
 #else
@@ -1565,21 +1651,19 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	// ─── Preview + Always Active: stop detection when hidden ─────────
 	bool should_detect = tf->preview || tf->always_active;
 
-	// ─── Detection interval & cooldown: bypass when Always Active ───
+	// ─── Detection interval: minimum time between detection runs ───
+	// 0 = disabled (continuous), no logging
 	auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count();
-	if (should_detect && !tf->always_active) {
-		// Detection interval: minimum time between detection runs
-		if (tf->detection_interval_ms > 0) {
-			uint64_t interval_ns = (uint64_t)tf->detection_interval_ms * 1000000ULL;
-			if (now_ns - tf->last_detection_time_ns < interval_ns) {
-				should_detect = false;
-			} else {
-				tf->last_detection_time_ns = now_ns;
-			}
+	if (should_detect && tf->detection_interval_ms > 0) {
+		uint64_t interval_ns = (uint64_t)tf->detection_interval_ms * 1000000ULL;
+		if (now_ns - tf->last_detection_time_ns < interval_ns) {
+			should_detect = false;
 		} else {
 			tf->last_detection_time_ns = now_ns;
 		}
+	} else if (should_detect) {
+		tf->last_detection_time_ns = now_ns;
 	}
 
 	cv::Mat imageBGRA;
@@ -1850,6 +1934,126 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			final_objects.end());
 	}
 
+	// ─── Game state: lock tracking & player assignment ─────────────
+	{
+		int fw = imageBGRA.cols;
+		int fh = imageBGRA.rows;
+		auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+
+		// Increment unseen counter for all tracked cards
+		{
+			std::lock_guard<std::mutex> lock(tf->game_state_lock);
+			for (auto& [tid, card] : tf->tracked_cards)
+				card.unseen_frames++;
+		}
+
+		for (const auto& obj : final_objects) {
+			std::lock_guard<std::mutex> lock(tf->game_state_lock);
+			auto it = tf->tracked_cards.find(obj.id);
+
+			if (it == tf->tracked_cards.end()) {
+				// New track
+				filter_data::TrackedCardState tc;
+				tc.track_id = obj.id;
+				tc.card_id = obj.card_id;
+				tc.card_name = obj.card_name;
+				tc.first_seen_ns = now_ns;
+				tc.initial_angle = obj.angle;
+				tc.lock_state = filter_data::CardLockState::Unlocked;
+				tc.last_seen_ns = now_ns;
+				tc.last_position = cv::Point2f(
+					obj.rect.x + obj.rect.width / 2,
+					obj.rect.y + obj.rect.height / 2);
+				tc.unseen_frames = 0;
+
+				// Look up card URL + pre-cache image
+				if (!obj.card_id.empty()) {
+					auto cit = tf->card_info_by_id.find(obj.card_id);
+					if (cit != tf->card_info_by_id.end()) {
+						tc.card_url = cit->second.url;
+						if (!tc.card_url.empty() &&
+							tf->card_image_cache.find(tc.card_url) == tf->card_image_cache.end()) {
+							std::vector<uchar> img_data;
+							if (downloadImageToMemory(tc.card_url, img_data)) {
+								cv::Mat img = cv::imdecode(img_data, cv::IMREAD_COLOR);
+								if (!img.empty())
+									tf->card_image_cache[tc.card_url] = img;
+							}
+						}
+						auto cit2 = tf->card_image_cache.find(tc.card_url);
+						if (cit2 != tf->card_image_cache.end())
+							tc.card_image = cit2->second.clone();
+					}
+				}
+
+				// Assign to player by zone overlap
+				cv::Point2f c = tc.last_position;
+				tc.player_idx = -1;
+				for (int pi = 0; pi < tf->player_count; pi++) {
+					auto& pl = tf->players[pi];
+					auto checkZone = [&](const filter_data::PlayerZone& z, bool crypt) {
+						float zx = z.nx * fw, zy = z.ny * fh;
+						float zw = z.nw * fw, zh = z.nh * fh;
+						if (c.x >= zx && c.x <= zx + zw &&
+							c.y >= zy && c.y <= zy + zh) {
+							tc.player_idx = pi;
+							tc.in_crypt = crypt;
+							return true;
+						}
+						return false;
+					};
+					if (checkZone(pl.minion_zone, false)) break;
+					if (checkZone(pl.crypt_zone, true)) break;
+				}
+
+				tf->tracked_cards[obj.id] = std::move(tc);
+			} else {
+				// Existing track
+				auto& tc = it->second;
+				tc.last_seen_ns = now_ns;
+				tc.last_position = cv::Point2f(
+					obj.rect.x + obj.rect.width / 2,
+					obj.rect.y + obj.rect.height / 2);
+				tc.unseen_frames = 0;
+
+				// Update card info if newly identified
+				if (tc.card_id.empty() && !obj.card_id.empty()) {
+					tc.card_id = obj.card_id;
+					tc.card_name = obj.card_name;
+					auto cit = tf->card_info_by_id.find(obj.card_id);
+					if (cit != tf->card_info_by_id.end())
+						tc.card_url = cit->second.url;
+				}
+
+				// Lock state: after 1 s, check if rotated ~90°
+				if (!tc.rotation_checked) {
+					int64_t elapsed_ns = now_ns - tc.first_seen_ns;
+					if (elapsed_ns > 1000000000LL) {
+						float delta = obj.angle - tc.initial_angle;
+						while (delta > 180.0f) delta -= 360.0f;
+						while (delta < -180.0f) delta += 360.0f;
+						if (fabs(delta) >= 60.0f && fabs(delta) <= 120.0f)
+							tc.lock_state = filter_data::CardLockState::Locked;
+						tc.rotation_checked = true;
+					}
+				}
+			}
+		}
+
+		// Remove stale tracks (unseen > 120 frames ≈ 4 s at 30 fps)
+		{
+			std::lock_guard<std::mutex> lock(tf->game_state_lock);
+			auto it = tf->tracked_cards.begin();
+			while (it != tf->tracked_cards.end()) {
+				if (it->second.unseen_frames > 120)
+					it = tf->tracked_cards.erase(it);
+				else
+					++it;
+			}
+		}
+	}
+
 	if (!tf->saveDetectionsPath.empty()) {
 		std::ofstream detectionsFile(tf->saveDetectionsPath);
 		if (detectionsFile.is_open()) {
@@ -1946,85 +2150,167 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			}
 		}
 
-		// ─── Card image overlay with fade ──────────────────────────────
-		// When click_to_overlay is enabled, auto-detected cards are NOT shown.
-		// Only cards manually selected from the web UI are displayed.
+		// ─── Game state overlay: background, player pool, tracked cards ──
 		{
-			std::string detected_url;
+			std::vector<uchar> img_data;
 
-			// Manual overlay from web UI takes priority
+			// 1. Load background image if not loaded
+			if (tf->overlay_bg.empty()) {
+				char *bgPath = obs_module_file("overlay-bg.png");
+				if (bgPath) {
+					tf->overlay_bg = cv::imread(bgPath, cv::IMREAD_COLOR);
+					bfree(bgPath);
+				}
+			}
+
+			int fw = frame.cols, fh = frame.rows;
+
+			// 2. Create display: background as base, source on top as centered window
+			cv::Mat display;
+			if (!tf->overlay_bg.empty()) {
+				cv::resize(tf->overlay_bg, display, cv::Size(fw, fh));
+			} else {
+				display = cv::Mat(fh, fw, CV_8UC3, cv::Scalar(15, 15, 40));
+			}
+
+			// Place source frame (with detection boxes) into display as centered area
+			{
+				int margin_pct = 5;
+				int sw = fw * (100 - 2 * margin_pct) / 100;
+				int sh = fh * (100 - 2 * margin_pct) / 100;
+				int sx = (fw - sw) / 2;
+				int sy = (fh - sh) / 2;
+				cv::Mat src_resized;
+				cv::resize(frame, src_resized, cv::Size(sw, sh));
+				src_resized.copyTo(display(cv::Rect(sx, sy, sw, sh)));
+			}
+
+			// 3. Draw player pool & names on left side (on display)
+			int pool_left = 8;
+			int pool_top = (int)(fh * 0.02f);
+			int pool_line_h = (int)(fh * 0.045f);
+			if (pool_line_h < 18) pool_line_h = 18;
+			int pool_bar_h = (int)(fh * 0.025f);
+			if (pool_bar_h < 6) pool_bar_h = 6;
+
+			for (int pi = 0; pi < tf->player_count; pi++) {
+				auto& pl = tf->players[pi];
+				int y = pool_top + pi * pool_line_h;
+
+				int bar_w = (int)(fw * 0.04f);
+				if (bar_w < 40) bar_w = 40;
+				cv::Rect bar_bg(pool_left, y, bar_w, pool_bar_h);
+				cv::rectangle(display, bar_bg, cv::Scalar(40, 40, 40), -1);
+
+				float pool_frac = std::min(1.0f, pl.pool / 30.0f);
+				cv::Scalar bar_color(
+					(int)(255 * (1.0f - pool_frac)),
+					(int)(255 * pool_frac),
+					0);
+				int fill_w = (int)(bar_w * pool_frac);
+				if (fill_w > 0) {
+					cv::Rect bar_fill(pool_left, y, fill_w, pool_bar_h);
+					cv::rectangle(display, bar_fill, bar_color, -1);
+				}
+
+				std::string pool_text = pl.name + ": " + std::to_string(pl.pool);
+				cv::putText(display, pool_text,
+					cv::Point2f((float)(pool_left + bar_w + 6), (float)(y + pool_bar_h - 2)),
+					cv::FONT_HERSHEY_SIMPLEX, 0.4f, cv::Scalar(200, 200, 200), 1);
+			}
+
+			// 4. Draw tracked cards in their player zones (on display)
+			{
+				std::lock_guard<std::mutex> lock(tf->game_state_lock);
+				for (auto& [tid, tc] : tf->tracked_cards) {
+					if (tc.player_idx < 0 || tc.player_idx >= tf->player_count)
+						continue;
+					auto& zone = tc.in_crypt
+						? tf->players[tc.player_idx].crypt_zone
+						: tf->players[tc.player_idx].minion_zone;
+
+					int zx = (int)(zone.nx * fw);
+					int zy = (int)(zone.ny * fh);
+					int zw = (int)(zone.nw * fw);
+					int zh = (int)(zone.nh * fh);
+
+					cv::Rect zone_rect(zx, zy, zw, zh);
+					zone_rect &= cv::Rect(0, 0, fw, fh);
+					if (zone_rect.width < 8 || zone_rect.height < 8)
+						continue;
+
+					if (!tc.card_image.empty()) {
+						cv::Mat card_resized;
+						cv::resize(tc.card_image, card_resized,
+							cv::Size(zone_rect.width, zone_rect.height));
+						cv::addWeighted(
+							display(zone_rect), 1.0,
+							card_resized, 0.85,
+							0.0, display(zone_rect));
+					}
+
+					if (tf->preview) {
+						cv::Scalar lock_color = (tc.lock_state == filter_data::CardLockState::Unlocked)
+							? cv::Scalar(0, 220, 0)
+							: cv::Scalar(0, 0, 220);
+						cv::rectangle(display, zone_rect, lock_color, 2);
+
+						const char* icon = (tc.lock_state == filter_data::CardLockState::Unlocked)
+							? "U" : "L";
+						cv::putText(display, icon,
+							cv::Point2f((float)(zone_rect.x + 4), (float)(zone_rect.y + 16)),
+							cv::FONT_HERSHEY_SIMPLEX, 0.5f, lock_color, 2);
+						cv::putText(display, tc.card_name.empty() ? "?" : tc.card_name,
+							cv::Point2f((float)(zone_rect.x + 20), (float)(zone_rect.y + 16)),
+							cv::FONT_HERSHEY_SIMPLEX, 0.4f, cv::Scalar(220, 220, 220), 1);
+					}
+				}
+			}
+
+			// 5. Manual overlay from web UI (on display)
 			if (!tf->manual_overlay_url.empty()) {
-				detected_url = tf->manual_overlay_url;
-			}
-			// Auto-detect only when click_to_overlay is disabled
-			if (detected_url.empty() && !tf->click_to_overlay) {
-				for (const auto& obj : final_objects) {
-					if (obj.card_id.empty()) continue;
-					auto it = tf->card_info_by_id.find(obj.card_id);
-					if (it != tf->card_info_by_id.end() && !it->second.url.empty()) {
-						detected_url = it->second.url;
-						break;
-					}
-				}
-			}
-
-			if (!detected_url.empty()) {
-				tf->last_overlay_detection_time = std::chrono::steady_clock::now();
-				tf->current_overlay_card_url = detected_url;
-				if (tf->card_image_cache.find(detected_url) == tf->card_image_cache.end()) {
-					std::vector<uchar> img_data;
-					if (downloadImageToMemory(detected_url, img_data)) {
-						cv::Mat img = cv::imdecode(img_data, cv::IMREAD_COLOR);
-						if (!img.empty())
-							tf->card_image_cache[detected_url] = img;
-					}
-				}
-			}
-
-			if (!tf->current_overlay_card_url.empty()) {
 				auto now = std::chrono::steady_clock::now();
 				auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 					now - tf->last_overlay_detection_time).count();
 				float elapsed_sec = elapsed_ms / 1000.0f;
+				float alpha = std::max(0.0f, 1.0f - (elapsed_sec / 30.0f));
 
-				// Manual overlay: persist until cleared (30s timeout as safety)
-				// Auto overlay: fade out over card_overlay_duration
-				float alpha;
-				if (!tf->manual_overlay_url.empty()) {
-					alpha = std::max(0.0f, 1.0f - (elapsed_sec / 30.0f));
-				} else {
-					alpha = std::max(0.0f, 1.0f - (elapsed_sec / tf->card_overlay_duration));
-				}
-
-				if (alpha > 0.0f) {
+				if (alpha > 0.0f && !tf->current_overlay_card_url.empty()) {
 					auto cache_it = tf->card_image_cache.find(tf->current_overlay_card_url);
+					if (cache_it == tf->card_image_cache.end() && !tf->manual_overlay_url.empty()) {
+						if (downloadImageToMemory(tf->manual_overlay_url, img_data)) {
+							cv::Mat img = cv::imdecode(img_data, cv::IMREAD_COLOR);
+							if (!img.empty()) {
+								tf->card_image_cache[tf->manual_overlay_url] = img;
+								cache_it = tf->card_image_cache.find(tf->manual_overlay_url);
+							}
+						}
+					}
+
 					if (cache_it != tf->card_image_cache.end()) {
-						int overlay_w = 180;
-						int overlay_h = (int)(overlay_w * 88.0 / 63.0 + 0.5f);
-						int pad = 10;
-						int x = frame.cols - overlay_w - pad;
-						int y = frame.rows - overlay_h - pad;
+						int banner_left = (int)(fw * 0.02f);
+						int banner_top = pool_top + tf->player_count * pool_line_h + (int)(fh * 0.02f);
+						int banner_w = (int)(fw * 0.24f);
+						int banner_h = fh - banner_top - (int)(fh * 0.02f);
 
 						cv::Mat overlay_resized;
-						cv::resize(cache_it->second, overlay_resized, cv::Size(overlay_w, overlay_h));
-
-					cv::Rect roi(x, y, overlay_w, overlay_h);
-						cv::Rect roi_clamped = roi & cv::Rect(0, 0, frame.cols, frame.rows);
-						if (roi_clamped.width > 0 && roi_clamped.height > 0) {
-							int ox = roi_clamped.x - x;
-							int oy = roi_clamped.y - y;
-							cv::Mat overlay_cropped = overlay_resized(cv::Rect(ox, oy, roi_clamped.width, roi_clamped.height));
-							cv::addWeighted(frame(roi_clamped), 1.0 - alpha, overlay_cropped, alpha, 0.0, frame(roi_clamped));
+						cv::resize(cache_it->second, overlay_resized, cv::Size(banner_w, banner_h));
+						cv::Rect roi(banner_left, banner_top, banner_w, banner_h);
+						roi &= cv::Rect(0, 0, fw, fh);
+						if (roi.width > 0 && roi.height > 0) {
+							cv::Mat overlay_cropped = overlay_resized(
+								cv::Rect(0, 0, roi.width, roi.height));
+							cv::addWeighted(display(roi), 1.0 - alpha, overlay_cropped, alpha, 0.0, display(roi));
 						}
 					}
 				} else {
 					tf->current_overlay_card_url.clear();
-					if (!tf->manual_overlay_url.empty()) {
-						// Manual overlay timed out — clear it
-						tf->manual_overlay_url.clear();
-					}
+					tf->manual_overlay_url.clear();
 				}
 			}
+
+			// Replace frame with display for subsequent drawing
+			frame = display;
 		}
 
 		// ─── GPU indicator ─────────────────────────────────────────────────
