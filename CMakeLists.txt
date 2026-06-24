@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16...3.26)
+cmake_minimum_required(VERSION 3.18...3.31)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
 
@@ -199,6 +199,40 @@ endif()
 unset(TENSORRT_INCLUDE_DIR)
 unset(TENSORRT_LIB)
 unset(TENSORRT_PLUGIN_LIB)
+
+# ── CUDA kernels (pre-compiled PTX, loaded at runtime via Driver API) ──
+# The PTX is generated offline on a Linux dev machine and checked into
+# the repo.  At runtime vtes_cuda_kernels_ptx.h is compiled as a C string
+# and loaded via cuModuleLoadData.  No nvcc invocation during build.
+if(DEFINED ENV{CUDA_PATH})
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        # Host wrappers compiled by MSVC (no CUDA keywords)
+        target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+            src/ocr/nis_upscaler.cpp
+            src/detection/vampire_classifier.cpp
+            src/cuda/cuda_kernel_launcher.cpp)
+
+        target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE CUDA::cudart)
+
+        # CUDA Driver API (cuModuleLoadData, cuLaunchKernel, etc.)
+        find_library(CUDA_DRIVER_LIB NAMES cuda PATHS ${CUDAToolkit_LIBRARY_DIR})
+        if(CUDA_DRIVER_LIB)
+            target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${CUDA_DRIVER_LIB})
+            target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_CUDA_NIS)
+            message(STATUS "CUDA Driver API found at ${CUDA_DRIVER_LIB}")
+        else()
+            message(WARNING "CUDA Driver library (cuda.lib / libcuda.so) not found — CUDA PTX kernels disabled")
+        endif()
+
+        message(STATUS "CUDA PTX kernel loader enabled (CUDA ${CUDAToolkit_VERSION})")
+    else()
+        message(WARNING "CUDA_PATH set but CUDAToolkit not found — CUDA kernels disabled")
+    endif()
+else()
+    message(STATUS "CUDA_PATH not set — CUDA kernels disabled")
+endif()
 
 # cpp-httplib needs WinSock on Windows; NO OpenSSL (leave CPPHTTPLIB_OPENSSL_SUPPORT undefined)
 if(WIN32)

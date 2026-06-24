@@ -162,6 +162,7 @@ struct filter_data {
 
 	// --- OCR card name reader (Tesseract, optional) ---
 	std::unique_ptr<VtesOcrReader> ocr_reader;
+	bool upscaler_enabled = false;
 	std::vector<VTESCardNameEntry> card_name_entries;  // built from vtes_db for fuzzy matching
 	bool ocr_enabled = false;
 
@@ -207,6 +208,28 @@ struct filter_data {
 
 	// --- Cooldown: skip detection for N ns after successful identification ---
 	int64_t cooldown_until_time_ns = 0;
+
+	// --- CUDA oval/rect portrait classifier ---
+	bool vampire_cuda_enabled = true;
+
+	// --- Web server notification flag (show popup once per filter instance) ---
+	bool web_server_notified = false;
+
+	// --- Manual overlay (triggered from web UI, overrides auto-detection) ---
+	std::string manual_overlay_url;
+	int64_t manual_overlay_set_time_ns = 0;
+	bool click_to_overlay = false;  // when true, only show cards manually clicked from web UI
+
+	// --- Detection history for web server ---
+	struct DetectedCard {
+		std::string card_name;
+		std::string card_id;
+		std::string card_url;
+		int64_t timestamp_ns;
+	};
+	std::mutex detection_history_lock;
+	std::deque<DetectedCard> detection_history;
+	static constexpr int MAX_DETECTION_HISTORY = 100;
 
 };
 #endif /* FILTERDATA_H */
