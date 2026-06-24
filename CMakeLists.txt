@@ -212,6 +212,7 @@ if(DEFINED ENV{CUDA_PATH})
         set(NVCC_FLAGS
             -c
             -allow-unsupported-compiler
+            --cl-version 2022
             "-I${CMAKE_CURRENT_SOURCE_DIR}/src"
             "-I${CMAKE_CURRENT_SOURCE_DIR}/vendor"
             -DHAVE_CUDA_NIS
