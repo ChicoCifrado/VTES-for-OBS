@@ -1,15 +1,30 @@
 #include "vampire_classifier.hpp"
-#include "vampire_classifier_kernels.h"
+#include "cuda/cuda_kernel_launcher.hpp"
+#include "cuda/vtes_cuda_kernels_ptx.h"
 #include "ocr/cuda_debug.hpp"
 #include <cuda_runtime.h>
 #include <opencv2/imgproc.hpp>
 #include <cmath>
+
+// Shared launcher initialized once per process
+static CudaKernelLauncher& get_vampire_launcher()
+{
+    static CudaKernelLauncher launcher;
+    static bool inited = false;
+    if (!inited) {
+        inited = launcher.init(VTES_CUDA_PTX);
+    }
+    return launcher;
+}
 
 float computeVampireScoreCUDA(const cv::Mat& card_bgr,
                               float edge_threshold,
                               int device_id)
 {
     if (card_bgr.empty()) return -1.0f;
+
+    CudaKernelLauncher& launcher = get_vampire_launcher();
+    if (!launcher.is_available()) return -1.0f;
 
     int H = card_bgr.rows;
     int W = card_bgr.cols;
@@ -28,29 +43,33 @@ float computeVampireScoreCUDA(const cv::Mat& card_bgr,
         gray = card_bgr;
 
     cudaSetDevice(device_id);
-    uint8_t* d_gray = nullptr;
+    unsigned char* d_gray = nullptr;
     CUDA_SAFE(cudaMalloc(&d_gray, H * W));
     CUDA_SAFE(cudaMemcpy(d_gray, gray.data, H * W, cudaMemcpyHostToDevice));
 
     int* d_hist = nullptr;
-    CUDA_SAFE(cudaMalloc(&d_hist, NUM_BINS * sizeof(int)));
-    CUDA_SAFE(cudaMemset(d_hist, 0, NUM_BINS * sizeof(int)));
+    CUDA_SAFE(cudaMalloc(&d_hist, CUDA_HISTOGRAM_BINS * sizeof(int)));
+    CUDA_SAFE(cudaMemset(d_hist, 0, CUDA_HISTOGRAM_BINS * sizeof(int)));
 
-    CUDA_SAFE(nv_edge_orientation_histogram(
+    bool ok = launcher.edge_orientation_histogram(
         d_gray, W, W, H,
         roi_x, roi_y, roi_w, roi_h,
         edge_threshold,
-        d_hist));
+        d_hist);
 
-    int hist[NUM_BINS];
-    CUDA_SAFE(cudaMemcpy(hist, d_hist, NUM_BINS * sizeof(int),
-                         cudaMemcpyDeviceToHost));
+    int hist[CUDA_HISTOGRAM_BINS];
+    if (ok) {
+        CUDA_SAFE(cudaMemcpy(hist, d_hist, CUDA_HISTOGRAM_BINS * sizeof(int),
+                             cudaMemcpyDeviceToHost));
+    }
 
     cudaFree(d_gray);
     cudaFree(d_hist);
 
+    if (!ok) return -1.0f;
+
     float total = 0.0f;
-    for (int i = 0; i < NUM_BINS; i++)
+    for (int i = 0; i < CUDA_HISTOGRAM_BINS; i++)
         total += (float)hist[i];
 
     if (total < 10.0f) return 0.5f;
@@ -73,8 +92,6 @@ bool isVampireCUDA(const cv::Mat& card_bgr,
                    int device_id)
 {
     float score = computeVampireScoreCUDA(card_bgr, edge_threshold, device_id);
-    if (score < 0.0f) {
-        return false;
-    }
+    if (score < 0.0f) return false;
     return score > threshold;
 }

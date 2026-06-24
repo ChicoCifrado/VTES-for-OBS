@@ -1,5 +1,5 @@
 #include "nis_upscaler.hpp"
-#include "nis_upscaler_kernels.h"
+#include "cuda/vtes_cuda_kernels_ptx.h"
 #include "cuda_debug.hpp"
 #include <opencv2/imgproc.hpp>
 
@@ -35,6 +35,11 @@ bool NISUpscaler::init(int device_id)
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess)
         return false;
+
+    if (!launcher_.init(VTES_CUDA_PTX)) {
+        fprintf(stderr, "[NIS] Failed to load CUDA kernel PTX\n");
+        return false;
+    }
 
     available_ = true;
     return true;
@@ -84,15 +89,17 @@ bool NISUpscaler::upscale(const cv::Mat& bgr_input, cv::Mat& bgr_output)
     size_t buf_size = h * w * 3 * sizeof(float);
     CUDA_SAFE(cudaMemcpy(d_input_, rgb_float.ptr<float>(), buf_size, cudaMemcpyHostToDevice));
 
-    CUDA_SAFE(nv_lanczos_upscale((const float*)d_input_, w, h,
-                                  (float*)d_output_, out_w, out_h, 3));
+    if (!launcher_.lanczos_upscale((const float*)d_input_, w, h,
+                                    (float*)d_output_, out_w, out_h, 3))
+        return false;
 
     CUDA_SAFE(cudaMemcpy(d_temp_, d_output_, out_h * out_w * 3 * sizeof(float),
                         cudaMemcpyDeviceToDevice));
 
-    CUDA_SAFE(nv_adaptive_sharpen((const float*)d_temp_,
-                                   (float*)d_output_,
-                                   out_w, out_h, 3));
+    if (!launcher_.adaptive_sharpen((const float*)d_temp_,
+                                     (float*)d_output_,
+                                     out_w, out_h, 3))
+        return false;
 
     cv::Mat out_rgb(out_h, out_w, CV_32FC3);
     CUDA_SAFE(cudaMemcpy(out_rgb.ptr<float>(), d_output_,

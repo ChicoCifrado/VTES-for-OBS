@@ -67,13 +67,9 @@ if(USE_SYSTEM_OPENCV)
     unset(_cv_root)
     unset(_cv_dlls)
   endif()
-  set(OPENCV_NVCC_INCLUDE_DIRS "${OpenCV_INCLUDE_DIRS}")
 else()
   include(cmake/FetchOpenCV.cmake)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OpenCV)
-  get_target_property(_opencv_inc OpenCV INTERFACE_INCLUDE_DIRECTORIES)
-  set(OPENCV_NVCC_INCLUDE_DIRS "${_opencv_inc}")
-  unset(_opencv_inc)
 endif()
 
 # add the vendor and src folders to the include path
@@ -204,88 +200,33 @@ unset(TENSORRT_INCLUDE_DIR)
 unset(TENSORRT_LIB)
 unset(TENSORRT_PLUGIN_LIB)
 
-# ── CUDA kernels (NIS upscaler + Vampire classifier) ─────────────────
-# Compiled directly with nvcc to avoid VS MSBuild CUDA customizations.
+# ── CUDA kernels (pre-compiled PTX, loaded at runtime via Driver API) ──
+# The PTX is generated offline on a Linux dev machine and checked into
+# the repo.  At runtime vtes_cuda_kernels_ptx.h is compiled as a C string
+# and loaded via cuModuleLoadData.  No nvcc invocation during build.
 if(DEFINED ENV{CUDA_PATH})
     find_package(CUDAToolkit QUIET)
     if(CUDAToolkit_FOUND)
-        set(NVCC_FLAGS
-            -c
-            -allow-unsupported-compiler
-            --cl-version 2022
-            "-I${CMAKE_CURRENT_SOURCE_DIR}/src"
-            "-I${CMAKE_CURRENT_SOURCE_DIR}/vendor"
-            -DHAVE_CUDA_NIS
-            -gencode arch=compute_75,code=sm_75
-            -gencode arch=compute_86,code=sm_86
-            -gencode arch=compute_89,code=sm_89
-            -Xcompiler "/MD /O2 /std:c++17")
-
-        # Append OpenCV include paths (needed by nis_upscaler.hpp)
-        if(DEFINED opencv_SOURCE_DIR)
-            # Fetched OpenCV — source + binary dirs
-            set(_opencv_dirs
-                "${opencv_SOURCE_DIR}/include"
-                "${opencv_SOURCE_DIR}/modules/core/include"
-                "${opencv_SOURCE_DIR}/modules/imgproc/include"
-                "${opencv_SOURCE_DIR}/modules/imgcodecs/include"
-                "${opencv_SOURCE_DIR}/modules/video/include"
-                "${opencv_SOURCE_DIR}/modules/geometry/include"
-                "${opencv_SOURCE_DIR}/modules/dnn/include"
-                "${opencv_SOURCE_DIR}/modules/flann/include"
-                "${opencv_SOURCE_DIR}/modules/features/include"
-                "${opencv_SOURCE_DIR}/modules/features2d/include"
-                "${opencv_BINARY_DIR}"
-                "${CMAKE_BINARY_DIR}")
-            foreach(_d ${_opencv_dirs})
-                list(APPEND NVCC_FLAGS "-I${_d}")
-            endforeach()
-            message(STATUS "NVCC OpenCV include: ${opencv_BINARY_DIR}")
-        else()
-            # System OpenCV
-            foreach(_d ${OPENCV_NVCC_INCLUDE_DIRS})
-                list(APPEND NVCC_FLAGS "-I${_d}")
-            endforeach()
-            message(STATUS "NVCC OpenCV include (system): ${OPENCV_NVCC_INCLUDE_DIRS}")
-        endif()
-
-        # Compile pure-CUDA kernel files with nvcc (no OpenCV, no C++ stdlib)
-        set(CUDA_OBJS "")
-        foreach(cu_file src/ocr/nis_upscaler_kernels.cu src/detection/vampire_classifier_kernels.cu)
-            get_filename_component(cu_name ${cu_file} NAME_WE)
-            set(obj_path "${CMAKE_CURRENT_BINARY_DIR}/cuda/${cu_name}.obj")
-            list(APPEND CUDA_OBJS ${obj_path})
-            add_custom_command(
-                OUTPUT ${obj_path}
-                COMMAND "${CUDAToolkit_NVCC_EXECUTABLE}"
-                    ${NVCC_FLAGS}
-                    -o "${obj_path}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/${cu_file}"
-                MAIN_DEPENDENCY "${CMAKE_CURRENT_SOURCE_DIR}/${cu_file}"
-                COMMENT "NVCC: ${cu_file}")
-        endforeach()
-
-        # Host wrappers compiled by MSVC as regular C++ sources
+        # Host wrappers compiled by MSVC (no CUDA keywords)
         target_sources(${CMAKE_PROJECT_NAME} PRIVATE
             src/ocr/nis_upscaler.cpp
-            src/detection/vampire_classifier.cpp)
+            src/detection/vampire_classifier.cpp
+            src/cuda/cuda_kernel_launcher.cpp)
 
-        # Link compiled CUDA objects + cudart into the plugin
-        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${CUDA_OBJS} CUDA::cudart)
         target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_CUDA_NIS)
         target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-        set_source_files_properties(${CUDA_OBJS} PROPERTIES GENERATED TRUE)
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE CUDA::cudart)
 
-        # List .cu files as IDE-only sources (not compiled by MSVC)
-        target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-            src/ocr/nis_upscaler_kernels.cu
-            src/detection/vampire_classifier_kernels.cu)
-        set_source_files_properties(
-            src/ocr/nis_upscaler_kernels.cu
-            src/detection/vampire_classifier_kernels.cu
-            PROPERTIES HEADER_FILE_ONLY TRUE)
+        # CUDA Driver API (cuModuleLoadData, cuLaunchKernel, etc.)
+        find_library(CUDA_DRIVER_LIB NAMES cuda PATHS ${CUDAToolkit_LIBRARY_DIR})
+        if(CUDA_DRIVER_LIB)
+            target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${CUDA_DRIVER_LIB})
+            message(STATUS "CUDA Driver API found at ${CUDA_DRIVER_LIB}")
+        else()
+            message(WARNING "CUDA Driver library (cuda.lib / libcuda.so) not found — CUDA PTX kernels disabled")
+        endif()
 
-        message(STATUS "NIS CUDA upscaler + Vampire classifier enabled (nvcc: ${CUDAToolkit_NVCC_EXECUTABLE})")
+        message(STATUS "CUDA PTX kernel loader enabled (CUDA ${CUDAToolkit_VERSION})")
     else()
         message(WARNING "CUDA_PATH set but CUDAToolkit not found — CUDA kernels disabled")
     endif()

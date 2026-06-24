@@ -2,6 +2,7 @@
 #define NIS_UPSCALER_HPP
 
 #include <opencv2/core.hpp>
+#include "cuda/cuda_kernel_launcher.hpp"
 #include <memory>
 
 class NISUpscaler {
@@ -18,8 +19,8 @@ public:
 private:
     bool available_ = false;
     int device_id_ = 0;
+    CudaKernelLauncher launcher_;
 
-    // CUDA device buffers (lazily allocated, grow on demand)
     void* d_input_ = nullptr;
     void* d_temp_ = nullptr;
     void* d_output_ = nullptr;

@@ -3,8 +3,6 @@
 
 #include <opencv2/core.hpp>
 
-#define NUM_BINS 36
-
 #ifdef HAVE_CUDA_NIS
 // ─── CUDA-based oval vs rectangular portrait classifier ──────────────
 // VTES vampire cards have an oval painted portrait frame.
