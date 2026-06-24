@@ -213,7 +213,6 @@ if(DEFINED ENV{CUDA_PATH})
             src/detection/vampire_classifier.cpp
             src/cuda/cuda_kernel_launcher.cpp)
 
-        target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_CUDA_NIS)
         target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
         target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE CUDA::cudart)
 
@@ -221,6 +220,7 @@ if(DEFINED ENV{CUDA_PATH})
         find_library(CUDA_DRIVER_LIB NAMES cuda PATHS ${CUDAToolkit_LIBRARY_DIR})
         if(CUDA_DRIVER_LIB)
             target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${CUDA_DRIVER_LIB})
+            target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_CUDA_NIS)
             message(STATUS "CUDA Driver API found at ${CUDA_DRIVER_LIB}")
         else()
             message(WARNING "CUDA Driver library (cuda.lib / libcuda.so) not found — CUDA PTX kernels disabled")

@@ -119,7 +119,7 @@ bool CudaKernelLauncher::edge_orientation_histogram(
 {
     dim3 block(16, 16);
     dim3 grid((roi_w + 15) / 16, (roi_h + 15) / 16);
-    unsigned int shared_mem = NUM_BINS * sizeof(int);
+    unsigned int shared_mem = CUDA_HISTOGRAM_BINS * sizeof(int);
 
     void* args[] = {
         &gray, &stride, &imgW, &imgH,
