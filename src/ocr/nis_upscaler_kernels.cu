@@ -94,3 +94,28 @@ __global__ void adaptiveSharpenKernel(
         dst[(y * W + x) * channels + c] = fminf(fmaxf(out, 0.0f), 1.0f);
     }
 }
+
+// ─── C-linkage launch wrappers (callable from regular C++ host code) ───
+
+extern "C" cudaError_t nv_lanczos_upscale(const float* d_in, int w, int h,
+                                          float* d_out, int out_w, int out_h,
+                                          int channels)
+{
+    dim3 block(16, 16);
+    dim3 grid((out_w + 15) / 16, (out_h + 15) / 16);
+    lanczosUpscaleKernel<<<grid, block>>>(d_in, w, h, d_out, out_w, out_h, channels);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    return cudaDeviceSynchronize();
+}
+
+extern "C" cudaError_t nv_adaptive_sharpen(const float* d_src, float* d_dst,
+                                           int W, int H, int channels)
+{
+    dim3 block(16, 16);
+    dim3 grid((W + 15) / 16, (H + 15) / 16);
+    adaptiveSharpenKernel<<<grid, block>>>(d_src, d_dst, W, H, channels);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    return cudaDeviceSynchronize();
+}

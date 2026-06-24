@@ -1,15 +1,5 @@
-// Kernel declarations (defined in nis_upscaler_kernels.cu, linked at device-link time)
-__global__ void lanczosUpscaleKernel(
-    const float* src, int srcW, int srcH,
-    float* dst, int dstW, int dstH,
-    int channels);
-
-__global__ void adaptiveSharpenKernel(
-    const float* src,
-    float* dst,
-    int W, int H, int channels);
-
 #include "nis_upscaler.hpp"
+#include "nis_upscaler_kernels.h"
 #include "cuda_debug.hpp"
 #include <opencv2/imgproc.hpp>
 
@@ -94,24 +84,15 @@ bool NISUpscaler::upscale(const cv::Mat& bgr_input, cv::Mat& bgr_output)
     size_t buf_size = h * w * 3 * sizeof(float);
     CUDA_SAFE(cudaMemcpy(d_input_, rgb_float.ptr<float>(), buf_size, cudaMemcpyHostToDevice));
 
-    {
-        dim3 block(16, 16);
-        dim3 grid((out_w + 15) / 16, (out_h + 15) / 16);
-        CUDA_LAUNCH(lanczosUpscaleKernel, grid, block,
-            (const float*)d_input_, w, h,
-            (float*)d_output_, out_w, out_h, 3);
-    }
+    CUDA_SAFE(nv_lanczos_upscale((const float*)d_input_, w, h,
+                                  (float*)d_output_, out_w, out_h, 3));
 
-    {
-        dim3 block(16, 16);
-        dim3 grid((out_w + 15) / 16, (out_h + 15) / 16);
-        CUDA_SAFE(cudaMemcpy(d_temp_, d_output_, out_h * out_w * 3 * sizeof(float),
-                            cudaMemcpyDeviceToDevice));
-        CUDA_LAUNCH(adaptiveSharpenKernel, grid, block,
-            (const float*)d_temp_,
-            (float*)d_output_,
-            out_w, out_h, 3);
-    }
+    CUDA_SAFE(cudaMemcpy(d_temp_, d_output_, out_h * out_w * 3 * sizeof(float),
+                        cudaMemcpyDeviceToDevice));
+
+    CUDA_SAFE(nv_adaptive_sharpen((const float*)d_temp_,
+                                   (float*)d_output_,
+                                   out_w, out_h, 3));
 
     cv::Mat out_rgb(out_h, out_w, CV_32FC3);
     CUDA_SAFE(cudaMemcpy(out_rgb.ptr<float>(), d_output_,

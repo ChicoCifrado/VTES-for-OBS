@@ -62,3 +62,24 @@ __global__ void edgeOrientationHistogramKernel(
         }
     }
 }
+
+extern "C" cudaError_t nv_edge_orientation_histogram(
+    const uint8_t* gray, int stride,
+    int imgW, int imgH,
+    int roi_x, int roi_y, int roi_w, int roi_h,
+    float edge_threshold,
+    int* global_hist)
+{
+    dim3 block(16, 16);
+    dim3 grid((roi_w + 15) / 16, (roi_h + 15) / 16);
+    size_t shared_bytes = NUM_BINS * sizeof(int);
+
+    edgeOrientationHistogramKernel<<<grid, block, shared_bytes>>>(
+        gray, stride, imgW, imgH,
+        roi_x, roi_y, roi_w, roi_h,
+        edge_threshold,
+        global_hist);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    return cudaDeviceSynchronize();
+}

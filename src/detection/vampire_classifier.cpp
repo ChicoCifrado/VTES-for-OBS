@@ -1,17 +1,9 @@
-__global__ void edgeOrientationHistogramKernel(
-    const uint8_t* gray, int stride,
-    int W, int H,
-    int roi_x, int roi_y, int roi_w, int roi_h,
-    float edge_threshold,
-    int* global_hist);
-
 #include "vampire_classifier.hpp"
+#include "vampire_classifier_kernels.h"
 #include "ocr/cuda_debug.hpp"
 #include <cuda_runtime.h>
 #include <opencv2/imgproc.hpp>
 #include <cmath>
-
-// ─── C++ wrapper ──────────────────────────────────────────────────────
 
 float computeVampireScoreCUDA(const cv::Mat& card_bgr,
                               float edge_threshold,
@@ -44,17 +36,11 @@ float computeVampireScoreCUDA(const cv::Mat& card_bgr,
     CUDA_SAFE(cudaMalloc(&d_hist, NUM_BINS * sizeof(int)));
     CUDA_SAFE(cudaMemset(d_hist, 0, NUM_BINS * sizeof(int)));
 
-    dim3 block(16, 16);
-    dim3 grid((roi_w + 15) / 16, (roi_h + 15) / 16);
-    size_t shared_bytes = NUM_BINS * sizeof(int);
-
-    edgeOrientationHistogramKernel<<<grid, block, shared_bytes>>>(
+    CUDA_SAFE(nv_edge_orientation_histogram(
         d_gray, W, W, H,
         roi_x, roi_y, roi_w, roi_h,
         edge_threshold,
-        d_hist);
-    CUDA_SAFE(cudaGetLastError());
-    CUDA_SAFE(cudaDeviceSynchronize());
+        d_hist));
 
     int hist[NUM_BINS];
     CUDA_SAFE(cudaMemcpy(hist, d_hist, NUM_BINS * sizeof(int),

@@ -248,8 +248,9 @@ if(DEFINED ENV{CUDA_PATH})
             message(STATUS "NVCC OpenCV include (system): ${OPENCV_NVCC_INCLUDE_DIRS}")
         endif()
 
+        # Compile pure-CUDA kernel files with nvcc (no OpenCV, no C++ stdlib)
         set(CUDA_OBJS "")
-        foreach(cu_file src/ocr/nis_upscaler.cu src/ocr/nis_upscaler_kernels.cu src/detection/vampire_classifier.cu src/detection/vampire_classifier_kernels.cu)
+        foreach(cu_file src/ocr/nis_upscaler_kernels.cu src/detection/vampire_classifier_kernels.cu)
             get_filename_component(cu_name ${cu_file} NAME_WE)
             set(obj_path "${CMAKE_CURRENT_BINARY_DIR}/cuda/${cu_name}.obj")
             list(APPEND CUDA_OBJS ${obj_path})
@@ -263,6 +264,11 @@ if(DEFINED ENV{CUDA_PATH})
                 COMMENT "NVCC: ${cu_file}")
         endforeach()
 
+        # Host wrappers compiled by MSVC as regular C++ sources
+        target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+            src/ocr/nis_upscaler.cpp
+            src/detection/vampire_classifier.cpp)
+
         # Link compiled CUDA objects + cudart into the plugin
         target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${CUDA_OBJS} CUDA::cudart)
         target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_CUDA_NIS)
@@ -271,14 +277,10 @@ if(DEFINED ENV{CUDA_PATH})
 
         # List .cu files as IDE-only sources (not compiled by MSVC)
         target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-            src/ocr/nis_upscaler.cu
             src/ocr/nis_upscaler_kernels.cu
-            src/detection/vampire_classifier.cu
             src/detection/vampire_classifier_kernels.cu)
         set_source_files_properties(
-            src/ocr/nis_upscaler.cu
             src/ocr/nis_upscaler_kernels.cu
-            src/detection/vampire_classifier.cu
             src/detection/vampire_classifier_kernels.cu
             PROPERTIES HEADER_FILE_ONLY TRUE)
 
