@@ -209,7 +209,6 @@ if(DEFINED ENV{CUDA_PATH})
     if(CUDAToolkit_FOUND)
         # Host wrappers compiled by MSVC (no CUDA keywords)
         target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-            src/ocr/nis_upscaler.cpp
             src/detection/vampire_classifier.cpp
             src/cuda/cuda_kernel_launcher.cpp)
 
@@ -263,7 +262,10 @@ target_sources(
           src/sort/Sort.cpp
           src/classifier/vtes_card_classifier.cpp
           src/ocr/vtes_ocr.cpp
-          src/ocr/vtes_api_lookup.cpp)
+          src/ocr/vtes_api_lookup.cpp
+          src/ocr/nis_upscaler.cpp)
+
+
 
 # Configure plugin target properties (install, resources, etc.)
 set_target_properties_plugin(${CMAKE_PROJECT_NAME})
