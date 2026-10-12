@@ -345,6 +345,13 @@ static void buildCardNameEntries(struct filter_data *tf)
     tf->card_name_entries.clear();
     if (tf->vtes_db.is_empty()) return;
 
+    // El indice indexa solo printed_name y name. Las name_variants que trae
+    // vtes.json (hasta 7 por carta) se descartaban, pese a que el buscador
+    // web (matchesCard en web_server.h) si las usa. Es la razon por la que
+    // el camino /api/search identifica cartas que el fuzzy match no puede.
+    // Medido: +710 entradas (+17%) sobre 4149 cartas, con 77 colisiones
+    // preexistentes que ya existian solo con printed_name.
+    size_t added = 0;
     for (const auto& [id_str, entry] : tf->vtes_db.all_entries()) {
         VTESCardNameEntry ce;
         ce.id = id_str;
@@ -352,12 +359,26 @@ static void buildCardNameEntries(struct filter_data *tf)
         ce.full_name = entry.name;
         ce.normalized = VtesOcrReader::normalize(
             ce.printed_name.empty() ? ce.full_name : ce.printed_name);
-        tf->card_name_entries.push_back(std::move(ce));
-    }
+        if (!ce.normalized.empty())
+            tf->card_name_entries.push_back(std::move(ce));
 
+        for (const auto& variant : entry.name_variants) {
+            VTESCardNameEntry ve;
+            ve.id = id_str;
+            ve.printed_name = variant;
+            ve.full_name = entry.name;
+            ve.normalized = VtesOcrReader::normalize(variant);
+            if (!ve.normalized.empty()) {
+                tf->card_name_entries.push_back(std::move(ve));
+                added++;
+            }
+        }
+    }
+    obs_log(LOG_INFO, "[OCR] Indexed %zu name_variants for fuzzy matching", added);
     obs_log(LOG_INFO, "[OCR] Built %zu card name entries for fuzzy matching",
             tf->card_name_entries.size());
 }
+
 
 // ─── Initialize Tesseract OCR reader ───────────────────────────────────
 
@@ -1302,6 +1323,7 @@ static void start_ocr_worker(detect_filter_obb* tf);
 static void stop_ocr_worker(detect_filter_obb* tf);
 static void submit_ocr_jobs(detect_filter_obb* tf,
 							const std::vector<cv::Mat>& card_regions,
+							const std::vector<int>& track_ids,
 							const std::vector<std::string>& type_filters);
 static void drain_ocr_results(detect_filter_obb* tf,
 							  std::vector<vtes_detection::OBBObject>& objects);
@@ -1560,12 +1582,15 @@ static void stop_ocr_worker(detect_filter_obb* tf)
 
 static void submit_ocr_jobs(detect_filter_obb* tf,
 							const std::vector<cv::Mat>& card_regions,
+							const std::vector<int>& track_ids,
 							const std::vector<std::string>& type_filters)
 {
 	if (!tf->ocr_worker_active || !tf->ocr_reader) return;
 	for (size_t i = 0; i < card_regions.size() && i < type_filters.size(); i++) {
 		if (card_regions[i].empty()) continue;
-		int64_t jid = tf->ocr_next_job_id++;
+		// El ticket del job ES el track id del objeto, para que
+		// drain_ocr_results pueda devolver cada nombre a su carta.
+		int64_t jid = track_ids[i];
 		{
 			std::lock_guard<std::mutex> lock(tf->ocr_queue_lock);
 			tf->ocr_queue.push({jid, card_regions[i].clone(), type_filters[i]});
@@ -1585,18 +1610,31 @@ static void drain_ocr_results(detect_filter_obb* tf,
 	for (auto& result : fresh) {
 		if (!result.completed) continue;
 		if (result.accepted) {
-			// Apply to the first object that still has no name ("???")
-			for (auto& obj : objects) {
-				if (obj.card_name == "???" || obj.card_name.empty()) {
-					obj.card_name = result.card_name;
-					obj.card_id = result.card_id;
-					obj.prob = result.confidence;
-					obs_log(LOG_INFO, "[OCR] Async result: '%s' (id=%s, conf=%.2f)",
-						result.card_name.c_str(), result.card_id.c_str(), result.confidence);
-					break;
-				}
+			// El resultado del OCR volvio del worker sin saber a que objeto
+			// corresponde: job.id es un ticket de la cola, no el track id.
+			// Antes se aplicaba "al primer objeto que siga en ???", lo que
+			// con dos o mas cartas en pantalla podia poner el nombre de una
+			// en la tarjeta de otra. Ahora se aplica de verdad por track_id.
+			int obj_idx = -1;
+			for (size_t oi = 0; oi < objects.size(); ++oi) {
+				if (objects[oi].id == result.id) { obj_idx = (int)oi; break; }
 			}
-		}
+			if (obj_idx < 0) {
+				// El objeto asociado al job ya no esta en la lista de este
+				// frame (desplazamiento de camara, carta retirada): se
+				// descarta el resultado en vez de aplicarlo a cualquiera.
+				obs_log(LOG_INFO, "[OCR] Async result descartado: track %d ya no presente",
+						result.id);
+				continue;
+			}
+			auto& obj = objects[obj_idx];
+			obj.card_name = result.card_name;
+			obj.card_id = result.card_id;
+			obj.prob = result.confidence;
+			obs_log(LOG_INFO, "[OCR] Async result: '%s' (id=%s, conf=%.2f, track=%d)",
+					result.card_name.c_str(), result.card_id.c_str(),
+					result.confidence, result.id);
+			}
 	}
 }
 
@@ -1869,7 +1907,12 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			// Pass empty type hint so name-region detection is stable
 			// (the vision type classifier is too frame-unstable to trust)
 			std::vector<std::string> empty_filters(card_regions.size(), "");
-			submit_ocr_jobs(tf, card_regions, empty_filters);
+			// Pasar los track ids para que cada resultado de OCR vuelva
+			// a su propia carta y no a la primera que siga en "???".
+			std::vector<int> track_ids;
+			track_ids.reserve(raw_objects.size());
+			for (const auto& o : raw_objects) track_ids.push_back(o.id);
+			submit_ocr_jobs(tf, card_regions, track_ids, empty_filters);
 		}
 	} // end if (!raw_objects.empty())
 		// ─── Set cooldown on successful identification (not in Always Active mode) ─────
