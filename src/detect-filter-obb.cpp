@@ -14,6 +14,19 @@
 #include <opencv2/dnn.hpp>
 
 static constexpr float kPI = 3.14159265358979323846f;
+// ─── Overlay: geometria de referencia ───────────────────────────────────────
+// Dimensiones de la escena para las que se ajusto el diseño del overlay.
+// La imagen original es 1536x1024 (3:2) y se escala entera para caber,
+// dejando bandas negras a los lados en una escena 16:9.
+static constexpr int kOverlayRefW = 1920;
+static constexpr int kOverlayRefH = 1080;
+// Caja del simbolo ankh sobre la que se coloca la carta detectada,
+// medida sobre el diseño escalado a 1920x1080. La carta lo tapa por completo
+// y no sobresale del panel izquierdo.
+static constexpr int kAnkhX = 192;
+static constexpr int kAnkhY = 507;
+static constexpr int kAnkhW = 200;
+static constexpr int kAnkhH = 508;
 
 #include <numeric>
 #include <memory>
@@ -2201,7 +2214,9 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			if (tf->overlay_bg.empty()) {
 				char *bgPath = obs_module_file("overlay-bg.png");
 				if (bgPath) {
-					tf->overlay_bg = cv::imread(bgPath, cv::IMREAD_COLOR);
+					// IMREAD_UNCHANGED conserva el canal alfa: esta imagen es 67% transparente,
+					// con IMREAD_COLOR el centro vacio se volveria negro opaco y taparia la camara.
+					tf->overlay_bg = cv::imread(bgPath, cv::IMREAD_UNCHANGED);
 					bfree(bgPath);
 				}
 			}
@@ -2209,9 +2224,29 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			int fw = frame.cols, fh = frame.rows;
 
 			// 2. Create display: background as base, source on top as centered window
-			cv::Mat display;
 			if (!tf->overlay_bg.empty()) {
-				cv::resize(tf->overlay_bg, display, cv::Size(fw, fh));
+				// El overlay se escala ENTERO para caber en la escena: nada se recorta y
+				// sobran bandas negras a los lados. Se respeta el 3:2 del diseño.
+				cv::Mat display = cv::Mat::zeros(fh, fw, CV_8UC3);
+				const int bw = tf->overlay_bg.cols, bh = tf->overlay_bg.rows;
+				if (bw > 0 && bh > 0) {
+					// Escalar al mayor tamaño que quepa, conservando la proporcion
+					const double esc = std::min((double)fw / bw, (double)fh / bh);
+					const int dw = (int)(bw * esc + 0.5), dh = (int)(bh * esc + 0.5);
+					cv::Mat overlay;
+					cv::resize(tf->overlay_bg, overlay, cv::Size(dw, dh), 0, 0, cv::INTER_AREA);
+					const int ox = (fw - dw) / 2, oy = (fh - dh) / 2;
+					if (overlay.channels() == 4) {
+						cv::Mat bgr3, alfa;
+						cv::cvtColor(overlay, bgr3, cv::COLOR_BGRA2BGR);
+						cv::extractChannels(overlay, alfa, 3);
+						cv::Mat mascara;
+						cv::threshold(alfa, mascara, 0, 255, cv::THRESH_BINARY);
+						bgr3.copyTo(display(cv::Rect(ox, oy, dw, dh)), mascara);
+					} else {
+						overlay.copyTo(display(cv::Rect(ox, oy, dw, dh)));
+					}
+				}
 			} else {
 				display = cv::Mat(fh, fw, CV_8UC3, cv::Scalar(15, 15, 40));
 			}
@@ -2308,6 +2343,66 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 							cv::FONT_HERSHEY_SIMPLEX, 0.4f, cv::Scalar(220, 220, 220), 1);
 					}
 				}
+
+			// 4b. Carta principal sobre el ankh del overlay
+			// Se coloca la ultima carta detectada sobre el simbolo, tapandolo por
+			// completo y sin sobresalir del panel izquierdo.
+			{
+				std::lock_guard<std::mutex> lock(tf->game_state_lock);
+				// Escala del overlay respecto a su diseno de referencia: si la escena
+				// no es 1920x1080, la caja del ankh se reescala con la misma proporcion.
+				const double osx = (double)fw / kOverlayRefW;
+				const double osy = (double)fh / kOverlayRefH;
+				int ax = (int)(kAnkhX * osx + 0.5);
+				int ay = (int)(kAnkhY * osy + 0.5);
+				int aw = (int)(kAnkhW * osx + 0.5);
+				int ah = (int)(kAnkhH * osy + 0.5);
+
+				// Ultima carta detectada (la de track_id mas alto, la mas reciente).
+				filter_data::TrackedCardState *principal = nullptr;
+				for (auto& [tid, tc] : tf->tracked_cards) {
+					if (tc.card_image.empty())
+						continue;
+					if (!principal || tid > principal->track_id)
+						principal = &tc;
+				}
+
+				if (principal) {
+					// La carta se escala hasta cubrir el ankh. Se respeta su proporcion
+					// real y se recorta lo que sobresalga, de modo que el ankh queda
+					// siempre tapado y la carta jamas se sale del panel.
+					const double cw = principal->card_image.cols;
+					const double ch = principal->card_image.rows;
+					if (cw > 0 && ch > 0) {
+						// Escalar para que cubra: se usa el factor mayor de los dos.
+						const double esc = std::max((double)aw / cw, (double)ah / ch);
+						int rw = (int)(cw * esc + 0.5);
+						int rh = (int)(ch * esc + 0.5);
+						cv::Mat carta;
+						cv::resize(principal->card_image, carta, cv::Size(rw, rh), 0, 0,
+						            cv::INTER_AREA);
+
+						// Centrada sobre la caja del ankh
+						int cx = ax + (aw - rw) / 2;
+						int cy = ay + (ah - rh) / 2;
+
+						// Recorte visible dentro de la caja del ankh
+						int vx0 = std::max(cx, ax), vy0 = std::max(cy, ay);
+						int vx1 = std::min(cx + rw, ax + aw);
+						int vy1 = std::min(cy + rh, ay + ah);
+						if (vx1 > vx0 && vy1 > vy0) {
+							cv::Rect destino(vx0, vy0, vx1 - vx0, vy1 - vy0);
+							destino &= cv::Rect(0, 0, fw, fh);
+							if (destino.width > 0 && destino.height > 0) {
+								cv::Rect fuente(vx0 - cx, vy0 - cy, destino.width,
+								               destino.height);
+								carta(fuente).copyTo(display(destino));
+							}
+						}
+					}
+				}
+			}
+
 			}
 
 			// 5. Manual overlay from web UI (on display)
