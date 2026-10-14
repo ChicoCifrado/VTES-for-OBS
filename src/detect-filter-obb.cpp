@@ -2449,9 +2449,12 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			}
 
 			// 6. Rulings de la carta principal, en la banda libre del panel
-			// El panel es opaco de x=150 a 509 sobre la referencia 1920x1080; el
-			// pool ocupa la franja alta y la carta tapa el ankh desde y=507, asi que
-			// la caja de rulings vive en la franja que queda entre ambas.
+			// El panel no tiene ningun hueco libre: la rejilla de ranuras ocupa
+			// y=86..518 y el ankh (donde va la carta) y=507..1015 sobre la
+			// referencia 1920x1080. Decision actual: los rulings se dibujan sobre
+			// la propia carta, con un velo oscuro detras para que el texto se lea
+			// sobre la ilustracion. Es provisional y basta cambiar esta caja para
+			// moverlos.
 			//
 			// No se dibujan con el overlay manual de la web activo: ese banner ocupa
 			// casi todo el panel y el texto quedaria ilegible encima de la carta.
@@ -2479,20 +2482,16 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 						const double osy = (double)fh / kOverlayRefH;
 						const double osx = (double)fw / kOverlayRefW;
 
-						// La caja se calcula, no se toma fija: nace bajo la ultima fila del
-						// pool (que crece con player_count: 4 filas llegan a y=213 y 5 a
-						// y=261 en la referencia 1920x1080) y acaba antes de que empiece la
-						// carta sobre el ankh. Asi no pisa ninguno de los dos.
+						// La caja es la de la carta: mismos kAnkhX/Y/W/H que usa el bloque
+						// 4b, con 2 px de margen, escalados con la misma proporcion que el
+						// resto del overlay. Los rulings se dibujan despues de la carta,
+						// asi que quedan encima.
+						const int pad = 2;
 						vtes_overlay::RulingsBox box;
-						box.x = (int)(box.x * osx + 0.5);
-						box.w = (int)(box.w * osx + 0.5);
-						const int pool_bottom = pool_top + tf->player_count * pool_line_h;
-						int box_top = (int)(pool_bottom * osy + 0.5) + 10;
-						const int box_bottom = (int)((kAnkhY - 7) * osy + 0.5);
-						if (box_bottom - box_top < vtes_overlay::kRulingsLineHeight)
-							box_top = box_bottom;  // sin sitio: caja vacia, no se dibuja
-						box.y = box_top;
-						box.h = box_bottom - box_top;
+						box.x = (int)((kAnkhX + pad) * osx + 0.5);
+						box.y = (int)((kAnkhY + pad) * osy + 0.5);
+						box.w = (int)((kAnkhW - 2 * pad) * osx + 0.5);
+						box.h = (int)((kAnkhH - 2 * pad) * osy + 0.5);
 
 						const int adv = (int)(vtes_overlay::kRulingsCharAdvance * osy + 0.5);
 						const int lh = (int)(vtes_overlay::kRulingsLineHeight * osy + 0.5);
@@ -2500,6 +2499,29 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 
 							const vtes_overlay::RulingsLayout layout =
 								vtes_overlay::buildRulingsLayout(entry, box, adv, lh);
+
+							// El texto va sobre la ilustracion de la carta, asi que se pone
+							// un velo oscuro detras: sin el, las zonas claras del arte se
+							// comen el texto gris. Se limita a la zona que realmente se usa,
+							// no a toda la carta, para no taparla mas de lo necesario.
+							{
+								const int usadas = (int)layout.lines.size();
+								// El velo cubre las lineas y, si hay recorte, una mas para
+								// el aviso "+N mas".
+								const int lineas_velo =
+									usadas + (layout.truncated ? 1 : 0);
+								const int alto_velo =
+									std::min(box.h, lineas_velo * lh + lh);
+								if (alto_velo > 0) {
+									cv::Rect velo(box.x - 2, box.y - 2, box.w + 4, alto_velo + 2);
+									velo &= cv::Rect(0, 0, fw, fh);
+									if (velo.width > 0 && velo.height > 0) {
+										cv::Mat roi = display(velo);
+										// 0.72 de opacidad: oscurece el arte sin volverlo un bloque plano
+										cv::addWeighted(roi, 0.28, cv::Scalar(8, 8, 12), 0.0, 0.0, roi);
+									}
+								}
+							}
 
 							const double fs = vtes_overlay::kRulingsFontScale * osy;
 							const cv::Scalar kBodyColor(200, 205, 215);
