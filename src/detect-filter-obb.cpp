@@ -847,7 +847,7 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 		std::string prefix = "player_" + std::to_string(i);
 		std::string label = "Player " + std::to_string(i + 1);
 
-		obs_property_t *grp = obs_properties_create();
+		obs_properties_t *grp = obs_properties_create();
 		obs_properties_add_text(grp, (prefix + "_name").c_str(), "Name", OBS_TEXT_DEFAULT);
 		obs_properties_add_int(grp, (prefix + "_pool").c_str(), "Initial Pool", 0, 99, 1);
 
@@ -2223,11 +2223,11 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 
 			int fw = frame.cols, fh = frame.rows;
 
+				cv::Mat display = cv::Mat::zeros(fh, fw, CV_8UC3);
 			// 2. Create display: background as base, source on top as centered window
 			if (!tf->overlay_bg.empty()) {
 				// El overlay se escala ENTERO para caber en la escena: nada se recorta y
 				// sobran bandas negras a los lados. Se respeta el 3:2 del diseño.
-				cv::Mat display = cv::Mat::zeros(fh, fw, CV_8UC3);
 				const int bw = tf->overlay_bg.cols, bh = tf->overlay_bg.rows;
 				if (bw > 0 && bh > 0) {
 					// Escalar al mayor tamaño que quepa, conservando la proporcion
@@ -2239,7 +2239,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 					if (overlay.channels() == 4) {
 						cv::Mat bgr3, alfa;
 						cv::cvtColor(overlay, bgr3, cv::COLOR_BGRA2BGR);
-						cv::extractChannels(overlay, alfa, 3);
+						cv::extractChannel(overlay, alfa, 3);
 						cv::Mat mascara;
 						cv::threshold(alfa, mascara, 0, 255, cv::THRESH_BINARY);
 						bgr3.copyTo(display(cv::Rect(ox, oy, dw, dh)), mascara);
