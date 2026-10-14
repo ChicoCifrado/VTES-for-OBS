@@ -167,6 +167,10 @@ private:
             serveStatus(client);
         } else if (uri == "/api/search") {
             serveJson(client, q);
+        } else if (uri == "/api/card") {
+            serveCardJson(client, query);
+        } else if (uri == "/card") {
+            serveCardPage(client, query);
         } else if (uri == "/api/detections") {
             serveDetectionsJson(client);
         } else if (uri == "/api/overlay") {
@@ -344,7 +348,33 @@ private:
         card["url"] = entry.url;
         if (!entry.name_es.empty()) card["name_es"] = entry.name_es;
         if (!entry.name_fr.empty()) card["name_fr"] = entry.name_fr;
+        card["ruling_count"] = (int)entry.rulings.size();
+        rulingsToJson(card["rulings"], entry);
         j.push_back(std::move(card));
+    }
+
+    // Rulings as a JSON array. The citation is already embedded in the ruling
+    // text (e.g. "[LSJ 20011022]"), so only the link target is emitted per
+    // reference — that is why the plain text is kept intact.
+    static void rulingsToJson(nlohmann::json &j, const VTESCardEntry &entry) {
+        j = nlohmann::json::array();
+        for (const auto &r : entry.rulings) {
+            if (r.text.empty()) continue;
+            nlohmann::json rj;
+            rj["text"] = r.text;
+            if (!r.group.empty()) rj["group"] = r.group;
+            if (!r.references.empty()) {
+                nlohmann::json refs = nlohmann::json::array();
+                for (const auto &ref : r.references) {
+                    nlohmann::json refj;
+                    refj["label"] = ref.label;
+                    refj["url"] = ref.url;
+                    refs.push_back(std::move(refj));
+                }
+                rj["references"] = std::move(refs);
+            }
+            j.push_back(std::move(rj));
+        }
     }
 
     void serveJson(SOCKET client, const std::string &q) {
@@ -362,6 +392,151 @@ private:
         std::string header =
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    // Extract a numeric "id=" parameter from a query string ("" when absent).
+    static std::string paramId(const std::string& query) {
+        size_t pos = query.find("id=");
+        if (pos == std::string::npos) return "";
+        std::string val = urlDecode(query.substr(pos + 3));
+        size_t amp = val.find('&');
+        if (amp != std::string::npos) val.resize(amp);
+        // The database keys cards by their decimal id.
+        for (char c : val)
+            if (c < '0' || c > '9') return "";
+        return val;
+    }
+
+    // /api/card?id=N — one full card record, rulings included.
+    void serveCardJson(SOCKET client, const std::string& query) {
+        const std::string id = paramId(query);
+        const VTESCardEntry* entry = (db_ && !id.empty()) ? db_->get_by_id(id) : nullptr;
+
+        nlohmann::json out;
+        if (entry) {
+            nlohmann::json arr = nlohmann::json::array();
+            toJson(arr, *entry);
+            out = arr[0];
+        } else {
+            out["error"] = id.empty() ? "missing id parameter" : "card not found";
+        }
+
+        std::string body = out.dump(2);
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    // Rulings of a card as an HTML block, grouped by the ruling group heading.
+    static std::string rulingsHtml(const VTESCardEntry& entry) {
+        std::ostringstream h;
+        if (entry.rulings.empty()) {
+            h << "<div class=\"rulings-empty\">Esta carta no tiene rulings.</div>";
+            return h.str();
+        }
+
+        h << "<div class=\"rulings\">"
+          << "<div class=\"rulings-count\">" << (int)entry.rulings.size()
+          << (entry.rulings.size() == 1 ? " ruling" : " rulings") << "</div>";
+        std::string last_group;
+        bool open_list = false;
+        for (const auto& r : entry.rulings) {
+            if (r.text.empty()) continue;
+            if (r.group != last_group) {
+                if (open_list) { h << "</div>"; open_list = false; }
+                last_group = r.group;
+                if (!r.group.empty()) {
+                    h << "<div class=\"ruling-group\">" << escapeHtml(r.group) << "</div>";
+                }
+                h << "<div class=\"ruling-list\">";
+                open_list = true;
+            }
+            h << "<div class=\"ruling\">" << escapeHtml(r.text);
+            // The citation is already inside the text; only the link is added.
+            for (const auto& ref : r.references) {
+                if (ref.url.empty()) continue;
+                h << " <a class=\"ruling-ref\" href=\"" << escapeHtml(ref.url)
+                  << "\" target=\"_blank\" rel=\"noopener\">"
+                  << (ref.label.empty() ? "ref" : escapeHtml(ref.label)) << "</a>";
+            }
+            h << "</div>";
+        }
+        if (open_list) h << "</div>";
+        h << "</div>";
+        return h.str();
+    }
+
+    // /card?id=N — readable page with the card and its rulings.
+    void serveCardPage(SOCKET client, const std::string& query) {
+        const std::string id = paramId(query);
+        const VTESCardEntry* entry = (db_ && !id.empty()) ? db_->get_by_id(id) : nullptr;
+
+        std::string title = entry
+            ? (entry->printed_name.empty() ? entry->name : entry->printed_name)
+            : "Carta no encontrada";
+
+        std::ostringstream h;
+        h << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+          << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+          << "<title>" << escapeHtml(title) << " — VTES</title><style>" << PAGE_CSS
+          << "</style></head><body><div class=\"container\">"
+          << "<div class=\"nav-bar\">"
+          << "<a href=\"/\">Buscar</a>"
+          << "<a href=\"/pool\">Pool</a>"
+          << "<a href=\"/detections\">Detecciones</a>"
+          << "<span class=\"status-bar\">Rulings</span></div>";
+
+        if (!entry) {
+            h << "<h1>Carta no encontrada</h1>"
+              << "<div class=\"error\">No hay ninguna carta con id "
+              << escapeHtml(id.empty() ? "(vacío)" : id) << ".</div>";
+        } else {
+            h << "<h1>" << escapeHtml(title) << "</h1>";
+            if (!entry->name_es.empty() || !entry->name_fr.empty()) {
+                h << "<div class=\"result i18n\">";
+                if (!entry->name_es.empty()) h << "ES: " << escapeHtml(entry->name_es);
+                if (!entry->name_es.empty() && !entry->name_fr.empty()) h << " &middot; ";
+                if (!entry->name_fr.empty()) h << "FR: " << escapeHtml(entry->name_fr);
+                h << "</div>";
+            }
+            h << "<div>";
+            for (const auto& t : entry->types)
+                h << "<span class=\"type\">" << escapeHtml(t) << "</span>";
+            for (const auto& c : entry->clans)
+                h << "<span class=\"type\">" << escapeHtml(c) << "</span>";
+            if (entry->capacity > 0)
+                h << "<span class=\"type\">Cap " << entry->capacity << "</span>";
+            if (entry->group > 0)
+                h << "<span class=\"type\">G" << entry->group << "</span>";
+            h << "</div>";
+            if (!entry->url.empty())
+                h << "<div class=\"result\"><img src=\"" << escapeHtml(entry->url)
+                  << "\" alt=\"" << escapeHtml(title) << "\"></div>";
+            if (!entry->card_text.empty())
+                h << "<div class=\"result\"><div class=\"detail\">"
+                  << escapeHtml(entry->card_text) << "</div></div>";
+
+            h << "<h2>Rulings</h2>" << rulingsHtml(*entry);
+        }
+
+        h << "<div class=\"footer\">VTES Card Scanner</div>"
+          << "</div></body></html>";
+
+        std::string body = h.str();
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
             "Content-Length: " + std::to_string(body.size()) + "\r\n"
             "Connection: close\r\n"
             "\r\n";
@@ -851,6 +1026,14 @@ private:
         ".result a:hover{text-decoration:underline}"
         ".pool-table{width:100%;border-collapse:collapse;margin-top:16px}"
         ".pool-table th,.pool-table td{padding:10px 14px;text-align:left;border-bottom:1px solid #333}"
+        ".rulings{margin-top:8px}"
+        ".rulings-count{font-size:.8rem;color:#888;margin-bottom:12px}"
+        ".rulings-empty{color:#888;font-size:.85rem}"
+        ".ruling-group{color:#c9a84c;font-size:.85rem;font-weight:600;margin:16px 0 8px}"
+        ".ruling-list{border-left:2px solid #0f3460;padding-left:14px}"
+        ".ruling{font-size:.85rem;color:#ccc;margin-bottom:10px;line-height:1.5}"
+        ".ruling-ref{color:#7ea6ff;font-size:.75rem;margin-left:4px}"
+        ".ruling-ref:hover{text-decoration:underline}"
         ".pool-table th{color:#c9a84c;font-size:.85rem}"
         ".pool-name{color:#e0e0e0;font-size:.95rem}"
         ".pool-val{font-size:1.2rem;font-weight:700;color:#e0e0e0;text-align:center}"

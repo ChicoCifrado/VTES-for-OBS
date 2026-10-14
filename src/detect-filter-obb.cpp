@@ -57,6 +57,7 @@ static constexpr int kAnkhH = 508;
 #endif
 #include "detection/contour_detector.hpp"
 #include "classifier/vtes_card_classifier.hpp"
+#include "overlay/rulings_view.hpp"
 #include "base64-utils.h"
 
 #define VTES_OBB_MODEL "!!!VTES_OBB_MODEL!!!"
@@ -2446,6 +2447,107 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 					tf->manual_overlay_url.clear();
 				}
 			}
+
+			// 6. Rulings de la carta principal, en la banda libre del panel
+			// El panel es opaco de x=150 a 509 sobre la referencia 1920x1080; el
+			// pool ocupa la franja alta y la carta tapa el ankh desde y=507, asi que
+			// la caja de rulings vive en la franja que queda entre ambas.
+			//
+			// No se dibujan con el overlay manual de la web activo: ese banner ocupa
+			// casi todo el panel y el texto quedaria ilegible encima de la carta.
+			{
+				if (tf->manual_overlay_url.empty()) {
+					std::lock_guard<std::mutex> lock(tf->game_state_lock);
+
+					// Misma carta que se pinta sobre el ankh: la ultima detectada.
+					const filter_data::TrackedCardState* principal = nullptr;
+					for (auto& [tid, tc] : tf->tracked_cards) {
+						if (tc.card_image.empty())
+							continue;
+						if (!principal || tid > principal->track_id)
+							principal = &tc;
+					}
+
+					const VTESCardEntry* entry = (principal && !principal->card_id.empty())
+						? tf->vtes_db.get_by_id(principal->card_id)
+						: nullptr;
+
+					if (entry && entry->has_rulings()) {
+						// Escalar la caja y la metrica de texto con la misma proporcion
+						// que el resto del overlay, para que el ajuste de lineas
+						// coincida con lo que realmente se dibuja.
+						const double osy = (double)fh / kOverlayRefH;
+						const double osx = (double)fw / kOverlayRefW;
+
+						// La caja se calcula, no se toma fija: nace bajo la ultima fila del
+						// pool (que crece con player_count: 4 filas llegan a y=213 y 5 a
+						// y=261 en la referencia 1920x1080) y acaba antes de que empiece la
+						// carta sobre el ankh. Asi no pisa ninguno de los dos.
+						vtes_overlay::RulingsBox box;
+						box.x = (int)(box.x * osx + 0.5);
+						box.w = (int)(box.w * osx + 0.5);
+						const int pool_bottom = pool_top + tf->player_count * pool_line_h;
+						int box_top = (int)(pool_bottom * osy + 0.5) + 10;
+						const int box_bottom = (int)((kAnkhY - 7) * osy + 0.5);
+						if (box_bottom - box_top < vtes_overlay::kRulingsLineHeight)
+							box_top = box_bottom;  // sin sitio: caja vacia, no se dibuja
+						box.y = box_top;
+						box.h = box_bottom - box_top;
+
+						const int adv = (int)(vtes_overlay::kRulingsCharAdvance * osy + 0.5);
+						const int lh = (int)(vtes_overlay::kRulingsLineHeight * osy + 0.5);
+						if (adv > 0 && lh > 0) {
+
+							const vtes_overlay::RulingsLayout layout =
+								vtes_overlay::buildRulingsLayout(entry, box, adv, lh);
+
+							const double fs = vtes_overlay::kRulingsFontScale * osy;
+							const cv::Scalar kBodyColor(200, 205, 215);
+							const cv::Scalar kHeadColor(130, 225, 250);
+							const cv::Scalar kMoreColor(120, 140, 160);
+
+							// putText usa la esquina inferior izquierda: la primera linea
+							// deja un lh de holgura para las ascendentes.
+							int y = box.y + lh;
+							for (const auto& line : layout.lines) {
+								// El wrap cuenta caracteres, pero putText es proporcional: la linea
+								// mas ancha de todos los rulings mide 295 px con un avance medio de 5
+								// (son lineas de puras citas, digitos y corchetes) y se saldria del
+								// panel. OpenCV es la unica verdad sobre el ancho real, asi que se
+								// mide y se descarta lo que no quepa en lugar de dejar que el texto
+								// acabe dibujado sobre la camara.
+								int tw = 0;
+								cv::getTextSize(line.text, cv::FONT_HERSHEY_SIMPLEX, fs, 1, &tw);
+								if (tw <= 0 || tw > box.w)
+								continue;
+
+								cv::putText(display, line.text,
+								            cv::Point(box.x, y),
+								            cv::FONT_HERSHEY_SIMPLEX, fs,
+								            line.is_heading ? kHeadColor : kBodyColor, 1);
+								y += lh;
+							}
+
+							// Aviso de recorte: cuantos rulings no caben en la caja.
+							if (layout.truncated) {
+								const int restantes = layout.total - layout.shown;
+								// Solo si la linea del aviso cabe entera en la caja.
+								if (restantes > 0 && y + lh <= box.y + box.h) {
+									const std::string aviso = "+" + std::to_string(restantes) + " mas";
+									int aw = 0;
+									cv::getTextSize(aviso, cv::FONT_HERSHEY_SIMPLEX, fs, 1, &aw);
+									if (aw > 0 && aw <= box.w)
+										cv::putText(display, aviso,
+									            cv::Point(box.x, y),
+									            cv::FONT_HERSHEY_SIMPLEX, fs,
+									            kMoreColor, 1);
+								}
+							}
+						}
+					}
+				}
+			}
+
 
 			// Replace frame with display for subsequent drawing
 			frame = display;

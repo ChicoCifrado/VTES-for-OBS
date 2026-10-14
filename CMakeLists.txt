@@ -263,7 +263,8 @@ target_sources(
           src/sort/Sort.cpp
           src/classifier/vtes_card_classifier.cpp
           src/ocr/vtes_ocr.cpp
-          src/ocr/vtes_api_lookup.cpp)
+          src/ocr/vtes_api_lookup.cpp
+          src/overlay/rulings_view.cpp)
 
 # Configure plugin target properties (install, resources, etc.)
 set_target_properties_plugin(${CMAKE_PROJECT_NAME})
