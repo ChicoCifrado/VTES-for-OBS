@@ -281,6 +281,13 @@ struct filter_data {
 
 	// Game-state config (read from OBS settings)
 	int                    player_count = 4;
+
+	// Vertical scroll of the rulings block, as a percentage (0..100) of
+	// the maximum scroll of the current card. It is a percentage and not a
+	// pixel offset so that the OBS slider keeps a fixed range: a card with
+	// two rulings barely scrolls and one with eighteen scrolls a lot, and
+	// the property cannot depend on what is detected.
+	int                    rulings_scroll = 0;
 	PlayerState            players[MAX_PLAYERS];
 
 	// Per-track state (track_id → TrackedCardState)

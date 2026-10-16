@@ -806,6 +806,13 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 		0.0, 5.0, 0.1);
 
 	// Click-to-overlay: manual from web UI
+	// Desplazamiento vertical de los rulings. Se expone como porcentaje y no
+	// como pixeles porque el rango de OBS es fijo, mientras que lo que se
+	// puede desplazar depende de cada carta: con dos rulings apenas se mueve
+	// y con dieciocho se mueve mucho.
+	obs_properties_add_int_slider(props, "rulings_scroll",
+	                              "Rulings scroll (0..100%)", 0, 100, 1);
+
 	obs_properties_add_bool(props, "click_to_overlay",
 		"Click to Overlay (show cards only when clicked from web UI)");
 
@@ -952,6 +959,7 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 	tf->always_active = obs_data_get_bool(settings, "always_active");
 	tf->click_to_overlay = obs_data_get_bool(settings, "click_to_overlay");
 	tf->conf_threshold = (float)obs_data_get_double(settings, "threshold");
+	tf->rulings_scroll = (int)obs_data_get_int(settings, "rulings_scroll");
 	tf->sortTracking = obs_data_get_bool(settings, "sort_tracking");
 	size_t maxUnseenFrames = (size_t)obs_data_get_int(settings, "max_unseen_frames");
 	if (tf->tracker.getMaxUnseenFrames() != maxUnseenFrames) {
@@ -2451,127 +2459,171 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				}
 			}
 
-			// 6. Rulings de la carta principal, en la banda libre del panel
-			// El panel no tiene ningun hueco libre: la rejilla de ranuras ocupa
-			// y=86..518 y el ankh (donde va la carta) y=507..1015 sobre la
-			// referencia 1920x1080. Decision actual: los rulings se dibujan sobre
-			// la propia carta, con un velo oscuro detras para que el texto se lea
-			// sobre la ilustracion. Es provisional y basta cambiar esta caja para
-			// moverlos.
-			//
-			// No se dibujan con el overlay manual de la web activo: ese banner ocupa
-			// casi todo el panel y el texto quedaria ilegible encima de la carta.
-			{
-				if (tf->manual_overlay_url.empty()) {
-					std::lock_guard<std::mutex> lock(tf->game_state_lock);
+		// 6. Rulings de la carta principal, sobre la propia carta
+		//
+		// El panel no tiene ningun hueco libre: la rejilla de 10 ranuras ocupa
+		// y=86..518 y el ankh (donde va la carta) y=507..1015 sobre la
+		// referencia 1920x1080. Decision actual: los rulings se dibujan sobre
+		// la carta, en una caja que abarca el interior del panel, con un velo
+		// oscuro detras para que el texto se lea sobre la ilustracion.
+		//
+		// El texto no se recorta por abajo: la caja es un viewport sobre el
+		// texto completo y cuanto se ve de el lo mueve el slider
+		// "Rulings scroll" del filtro. Cambiar donde se muestran es cambiar
+		// esta caja.
+		{
+			if (tf->manual_overlay_url.empty()) {
+				std::lock_guard<std::mutex> lock(tf->game_state_lock);
 
-					// Misma carta que se pinta sobre el ankh: la ultima detectada.
-					const filter_data::TrackedCardState* principal = nullptr;
-					for (auto& [tid, tc] : tf->tracked_cards) {
-						if (tc.card_image.empty())
-							continue;
-						if (!principal || tid > principal->track_id)
-							principal = &tc;
-					}
+				// Misma carta que se pinta sobre el ankh: la ultima detectada.
+				const filter_data::TrackedCardState* principal = nullptr;
+				for (auto& [tid, tc] : tf->tracked_cards) {
+					if (tc.card_image.empty())
+						continue;
+					if (!principal || tid > principal->track_id)
+						principal = &tc;
+				}
 
-					const VTESCardEntry* entry = (principal && !principal->card_id.empty())
-						? tf->vtes_db.get_by_id(principal->card_id)
-						: nullptr;
+				const VTESCardEntry* entry = (principal && !principal->card_id.empty())
+					? tf->vtes_db.get_by_id(principal->card_id)
+					: nullptr;
 
-					if (entry && entry->has_rulings()) {
-						// Escalar la caja y la metrica de texto con la misma proporcion
-						// que el resto del overlay, para que el ajuste de lineas
-						// coincida con lo que realmente se dibuja.
-						const double osy = (double)fh / kOverlayRefH;
-						const double osx = (double)fw / kOverlayRefW;
+				if (entry && entry->has_rulings()) {
+					// Escalar la caja y la metrica de texto con la misma proporcion
+					// que el resto del overlay, para que el ajuste de lineas
+					// coincida con lo que realmente se dibuja.
+					const double osy = (double)fh / kOverlayRefH;
+					const double osx = (double)fw / kOverlayRefW;
 
-						// La caja es la de la carta: mismos kAnkhX/Y/W/H que usa el bloque
-						// 4b, con 2 px de margen, escalados con la misma proporcion que el
-						// resto del overlay. Los rulings se dibujan despues de la carta,
-						// asi que quedan encima.
-						const int pad = 2;
-						vtes_overlay::RulingsBox box;
-						box.x = (int)((kAnkhX + pad) * osx + 0.5);
-						box.y = (int)((kAnkhY + pad) * osy + 0.5);
-						box.w = (int)((kAnkhW - 2 * pad) * osx + 0.5);
-						box.h = (int)((kAnkhH - 2 * pad) * osy + 0.5);
+					// La caja nace donde empieza la carta sobre el ankh y mide lo
+					// que mide el ankh, para quedarse sobre la carta. El ancho es
+					// el del interior del panel, mas ancho que la carta, porque a
+					// 0.55 de escala de fuente 196 px dan unas 21 letras por
+					// linea y los rulings se vuelven ilegibles.
+					const int pad = 2;
+					// x y w se escalan con osx igual que y y h con osy: el ankh
+					// del bloque 4b se escala con los dos, y si aqui solo se usara
+					// osy la caja se desviaria en horizontal en cualquier escena que
+					// no sea 1920x1080.
+					vtes_overlay::RulingsBox box;
+					box.x = (int)(158 * osx + 0.5);
+					box.w = (int)(280 * osx + 0.5);
+					box.y = (int)((kAnkhY + pad) * osy + 0.5);
+					box.h = (int)((kAnkhH - 2 * pad) * osy + 0.5);
 
-						const int adv = (int)(vtes_overlay::kRulingsCharAdvance * osy + 0.5);
-						const int lh = (int)(vtes_overlay::kRulingsLineHeight * osy + 0.5);
-						if (adv > 0 && lh > 0) {
+					const int lh = (int)(vtes_overlay::kRulingsLineHeight * osy + 0.5);
+					const double fs = vtes_overlay::kRulingsFontScale * osy;
 
-							const vtes_overlay::RulingsLayout layout =
-								vtes_overlay::buildRulingsLayout(entry, box, adv, lh);
+					// El ancho real de cada linea solo lo sabe OpenCV: putText es
+					// proporcional y un avance fijo por caracter se pasa de ancho.
+					// A esta escala el glifo medio mide 7.07 px con el OpenCV 5.0.0
+					// que enlaza el plugin (9.15 con el 4.13 de otro entorno: un 30%
+					// mas ancho por el mismo tamano de fuente), asi que no hay
+					// constante que valga para todos. La unidad de rulings recibe
+					vtes_overlay::RulingsMeasure measure =
+						[fs](const std::string& s) -> int {
+							if (s.empty())
+								return 0;
+							int tw = 0;
+							cv::getTextSize(s, cv::FONT_HERSHEY_SIMPLEX,
+							                fs, 1, &tw);
+							return tw;
+						};
 
-							// El texto va sobre la ilustracion de la carta, asi que se pone
-							// un velo oscuro detras: sin el, las zonas claras del arte se
-							// comen el texto gris. Se limita a la zona que realmente se usa,
-							// no a toda la carta, para no taparla mas de lo necesario.
-							{
-								const int usadas = (int)layout.lines.size();
-								// El velo cubre las lineas y, si hay recorte, una mas para
-								// el aviso "+N mas".
-								const int lineas_velo =
-									usadas + (layout.truncated ? 1 : 0);
-								const int alto_velo =
-									std::min(box.h, lineas_velo * lh + lh);
-								if (alto_velo > 0) {
-									cv::Rect velo(box.x - 2, box.y - 2, box.w + 4, alto_velo + 2);
-									velo &= cv::Rect(0, 0, fw, fh);
-									if (velo.width > 0 && velo.height > 0) {
-										cv::Mat roi = display(velo);
-										// 0.72 de opacidad: oscurece el arte sin volverlo un bloque plano
-										cv::addWeighted(roi, 0.28, cv::Scalar(8, 8, 12), 0.0, 0.0, roi);
-									}
-								}
+					const vtes_overlay::RulingsLayout layout =
+						vtes_overlay::buildRulingsLayout(entry, box, measure);
+
+					if (!layout.lines.empty() && lh > 0 && box.w > 0) {
+						// El velo se limita a la franja que ocupan las lineas
+						// (mas una para el aviso), no a la caja entera: una
+						// carta con dos rulings ocupa 10 lineas y oscurecer los
+						// 504 px taparia la ilustracion sin motivo. Sin el, las
+						// zonas claras de la ilustracion se comen el texto gris.
+						{
+							const int alto_velo = std::min(
+								box.h, ((int)layout.lines.size() + 1) * lh);
+							cv::Rect velo(box.x - 2, box.y - 2,
+							              box.w + 4, alto_velo + 4);
+							velo &= cv::Rect(0, 0, fw, fh);
+							if (velo.width > 0 && velo.height > 0) {
+								cv::Mat roi = display(velo);
+								cv::addWeighted(roi, 0.28,
+								                cv::Scalar(8, 8, 12),
+								                0.0, 0.0, roi);
 							}
+						}
 
-							const double fs = vtes_overlay::kRulingsFontScale * osy;
-							const cv::Scalar kBodyColor(200, 205, 215);
-							const cv::Scalar kHeadColor(130, 225, 250);
-							const cv::Scalar kMoreColor(120, 140, 160);
+						// El slider es un porcentaje del desplazamiento maximo
+						// de esta carta: con dos rulings el maximo es 0 y el
+						// slider no hace nada, con dieciocho recorre todo.
+						const int max_scroll =
+							vtes_overlay::maxScroll(layout, box, lh);
+						double frac = tf->rulings_scroll / 100.0;
+						if (frac < 0.0)
+							frac = 0.0;
+						if (frac > 1.0)
+							frac = 1.0;
+						const int scroll_px = (int)(max_scroll * frac + 0.5);
 
-							// putText usa la esquina inferior izquierda: la primera linea
-							// deja un lh de holgura para las ascendentes.
-							int y = box.y + lh;
-							for (const auto& line : layout.lines) {
-								// El wrap cuenta caracteres, pero putText es proporcional: la linea
-								// mas ancha de todos los rulings mide 295 px con un avance medio de 5
-								// (son lineas de puras citas, digitos y corchetes) y se saldria del
-								// panel. OpenCV es la unica verdad sobre el ancho real, asi que se
-								// mide y se descarta lo que no quepa en lugar de dejar que el texto
-								// acabe dibujado sobre la camara.
-								int tw = 0;
-								cv::getTextSize(line.text, cv::FONT_HERSHEY_SIMPLEX, fs, 1, &tw);
-								if (tw <= 0 || tw > box.w)
+						std::pair<size_t, size_t> range =
+							vtes_overlay::visibleLineRange(layout, box,
+							                               lh, scroll_px);
+
+						// Barra de desplazamiento a la derecha de la caja: sin
+						// ella no hay forma de saber cuanto texto queda detras,
+						// porque el slider de OBS no muestra nada.
+						if (max_scroll > 0) {
+							const int track_x = box.x + box.w + 2;
+							const int track_w = 3;
+							const int content = vtes_overlay::contentHeight(
+								layout, lh);
+							cv::rectangle(display,
+							              cv::Rect(track_x, box.y,
+							                       track_w, box.h),
+							              cv::Scalar(40, 40, 48),
+							              cv::FILLED);
+							int thumb_h = (int)((double)box.h * box.h /
+							                        std::max(1, content) + 0.5);
+							thumb_h = std::max(4, std::min(thumb_h, box.h));
+							const int thumb_y = (int)((double)(box.h - thumb_h)
+							                          * frac + 0.5);
+							cv::rectangle(display,
+							              cv::Rect(track_x,
+							                       box.y + thumb_y,
+							                       track_w, thumb_h),
+							              cv::Scalar(120, 140, 160),
+							              cv::FILLED);
+						}
+
+						const cv::Scalar kBodyColor(200, 205, 215);
+						const cv::Scalar kHeadColor(130, 225, 250);
+
+						for (size_t i = range.first; i < range.second; ++i) {
+							const vtes_overlay::RulingsLine& line =
+								layout.lines[i];
+							// La linea ya se midio al ajustarla, pero se vuelve
+							// a comprobar: si algo la deja larga, se descarta
+							// antes de que se salga de la caja.
+							int tw = 0;
+							cv::getTextSize(line.text,
+							                cv::FONT_HERSHEY_SIMPLEX,
+							                fs, 1, &tw);
+							if (tw <= 0 || tw > box.w)
 								continue;
 
-								cv::putText(display, line.text,
-								            cv::Point(box.x, y),
-								            cv::FONT_HERSHEY_SIMPLEX, fs,
-								            line.is_heading ? kHeadColor : kBodyColor, 1);
-								y += lh;
-							}
-
-							// Aviso de recorte: cuantos rulings no caben en la caja.
-							if (layout.truncated) {
-								const int restantes = layout.total - layout.shown;
-								// Solo si la linea del aviso cabe entera en la caja.
-								if (restantes > 0 && y + lh <= box.y + box.h) {
-									const std::string aviso = "+" + std::to_string(restantes) + " mas";
-									int aw = 0;
-									cv::getTextSize(aviso, cv::FONT_HERSHEY_SIMPLEX, fs, 1, &aw);
-									if (aw > 0 && aw <= box.w)
-										cv::putText(display, aviso,
-									            cv::Point(box.x, y),
-									            cv::FONT_HERSHEY_SIMPLEX, fs,
-									            kMoreColor, 1);
-								}
-							}
+							const int y = box.y + lh + (int)i * lh - scroll_px;
+							cv::putText(display, line.text,
+							            cv::Point(box.x, y),
+							            cv::FONT_HERSHEY_SIMPLEX, fs,
+							            line.is_heading ? kHeadColor
+							                            : kBodyColor,
+							            1);
 						}
 					}
 				}
 			}
+		}
+
 
 
 			// Replace frame with display for subsequent drawing

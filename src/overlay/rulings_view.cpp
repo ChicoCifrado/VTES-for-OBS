@@ -1,93 +1,108 @@
 #include "rulings_view.hpp"
 
+#include <string>
+#include <vector>
+
 namespace vtes_overlay {
 
-std::vector<std::string> wrapWords(const std::string& text, size_t max_cols) {
+std::vector<std::string> wrapWords(const std::string& text, int max_px,
+                                   const RulingsMeasure& measure) {
     std::vector<std::string> out;
-    if (text.empty()) return out;
-    if (max_cols == 0) {
-        // No room to wrap: hand the text back whole and let the caller decide.
-        out.push_back(text);
-        return out;
-    }
+    if (text.empty() || max_px <= 0) return out;
 
-    const size_t n = text.size();
+    // A stubbed caller must still wrap conservatively: the fallback estimate is
+    // deliberately wider than the mean glyph, so a test never wraps tighter
+    // than the real renderer would.
+    const RulingsMeasure width =
+        measure ? measure : RulingsMeasure([](const std::string& s) {
+            return (int)(s.size() * kRulingsFallbackAdvance);
+        });
+
+    // Split on runs of spaces; the source texts use single spaces, but any
+    // number of them is treated as one separator.
+    std::vector<std::string> words;
     size_t i = 0;
-    while (i < n) {
-        while (i < n && text[i] == ' ') i++;
-        if (i >= n) break;
+    while (i < text.size()) {
+        while (i < text.size() && text[i] == ' ') ++i;
+        if (i >= text.size()) break;
+        const size_t start = i;
+        while (i < text.size() && text[i] != ' ') ++i;
+        words.push_back(text.substr(start, i - start));
+    }
+    if (words.empty()) return out;
 
-        size_t line_end = i + max_cols;
-        if (line_end > n) line_end = n;
+    std::string current;
+    auto close_line = [&out, &current]() {
+        if (!current.empty()) {
+            out.push_back(current);
+            current.clear();
+        }
+    };
 
-        // A break is needed only if the text continues past the window. When
-        // the window ends exactly on a space (or on the end of the text) the
-        // whole window is word content and fits as is: breaking there would
-        // drop usable characters from the line.
-        size_t brk = line_end;
-        if (line_end < n && text[line_end] != ' ') {
-            // Break on the last space inside the window. If there is none, the
-            // word is longer than the line and has to be hard-broken.
-            size_t sp = text.rfind(' ', line_end - 1);
-            if (sp != std::string::npos && sp > i) brk = sp;
+    for (const auto& word : words) {
+        const std::string candidate =
+            current.empty() ? word : current + " " + word;
+        if (width(candidate) <= max_px) {
+            current = candidate;
+            continue;
         }
 
-        while (brk > i && text[brk - 1] == ' ') brk--;
-        out.push_back(text.substr(i, brk - i));
-        i = brk;
+        // The word does not fit after what the line already holds.
+        close_line();
+        if (width(word) <= max_px) {
+            current = word;
+            continue;
+        }
+
+        // The word alone is wider than the whole box: break it by characters.
+        std::string chunk;
+        for (char c : word) {
+            const std::string grown = chunk + c;
+            if (!chunk.empty() && width(grown) > max_px) {
+                out.push_back(chunk);
+                chunk.clear();
+            }
+            chunk += c;
+        }
+        current = chunk;
     }
+    close_line();
+
     return out;
 }
 
 RulingsLayout buildRulingsLayout(const VTESCardEntry* card,
                                  const RulingsBox& box,
-                                 int char_advance,
-                                 int line_height) {
+                                 const RulingsMeasure& measure) {
     RulingsLayout out;
-    if (!card) return out;
+    if (!card || box.w <= 0) return out;
 
     out.total = (int)card->rulings.size();
 
-    const int cols = charsPerLine(box.w, char_advance);
-    const int room = linesPerBox(box.h, line_height);
-    if (cols <= 0 || room <= 0) return out;
-
     std::string last_group;
-    int used = 0;
-
     for (const auto& r : card->rulings) {
         // A group heading is emitted only when it changes: 145 distinct groups
         // exist and repeating the heading on every ruling would waste the box.
-        // The heading is wrapped like the text because 53 of the 145 groups are
-        // longer than one panel line (longest is 56 chars).
         const bool new_group = !r.group.empty() && r.group != last_group;
-        std::vector<std::string> head =
-            new_group ? wrapWords(r.group, (size_t)cols) : std::vector<std::string>{};
-
-        std::vector<std::string> body = wrapWords(r.text, (size_t)cols);
-        const int need = (int)head.size() + (int)body.size();
-
-        if (used + need > room) {
-            out.truncated = true;
-            break;
-        }
+        const std::vector<std::string> head =
+            new_group ? wrapWords(r.group, box.w, measure)
+                      : std::vector<std::string>{};
+        const std::vector<std::string> body = wrapWords(r.text, box.w, measure);
 
         for (auto& h : head) {
             RulingsLine line;
             line.text = std::move(h);
             line.is_heading = true;
             out.lines.push_back(std::move(line));
-            used++;
         }
         if (new_group) last_group = r.group;
 
-        for (auto& l : body) {
+        for (auto& b : body) {
             RulingsLine line;
-            line.text = std::move(l);
+            line.text = std::move(b);
+            line.is_heading = false;
             out.lines.push_back(std::move(line));
         }
-        used += (int)body.size();
-        out.shown++;
     }
 
     return out;
