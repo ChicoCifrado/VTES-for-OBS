@@ -76,9 +76,9 @@ set(WITH_OPENCL OFF CACHE BOOL "" FORCE)
 set(WITH_OPENCLAMDBLAS OFF CACHE BOOL "" FORCE)
 set(WITH_OPENCLAMDFFT OFF CACHE BOOL "" FORCE)
 set(WITH_OPENCL_SVM OFF CACHE BOOL "" FORCE)
-set(WITH_ONNXRUNTIME ON CACHE BOOL "" FORCE)
-set(DOWNLOAD_ONNXRUNTIME ON CACHE BOOL "" FORCE)
-set(DOWNLOAD_ONNXRUNTIME_GPU ON CACHE BOOL "" FORCE)
+set(WITH_ONNXRUNTIME OFF CACHE BOOL "" FORCE)
+set(DOWNLOAD_ONNXRUNTIME OFF CACHE BOOL "" FORCE)
+set(DOWNLOAD_ONNXRUNTIME_GPU OFF CACHE BOOL "" FORCE)
 set(OPENCV_DNN_CUDA OFF CACHE BOOL "" FORCE)
 set(WITH_OPENEXR OFF CACHE BOOL "" FORCE)
 set(WITH_OPENGL OFF CACHE BOOL "" FORCE)
@@ -177,7 +177,60 @@ if(NOT opencv_POPULATED)
   # Only affects cv::putText with Unicode strings (we only need ASCII/Hershey).
   set(WITH_UNIFONT OFF CACHE BOOL "" FORCE)
 
+  # ── Disable MLAS on MSVC, fix paths on other platforms ──
+  # MLAS (Microsoft Linear Algebra Subprograms) is an ASM-optimized SGEMM.
+  # On MSVC the .S assembly files can't compile (no GNU ASM in MSBuild),
+  # and the ASM compiler found (MinGW GCC via PATH) produces .obj files
+  # that MSBuild's linker can't find. Early-return disables MLAS; DNN
+  # falls back to its built-in SGEMM (fine for blobFromImage only).
+  # On Unix: patch the path references (CMAKE_SOURCE_DIR → CMAKE_CURRENT_SOURCE_DIR)
+  # since OpenCV is a subdirectory.
+  set(_mlas_cmake "${opencv_SOURCE_DIR}/3rdparty/mlas/CMakeLists.txt")
+  file(READ "${_mlas_cmake}" _mlas_text)
+  if(MSVC)
+    set(_mlas_text "if(MSVC)\n  return()\nendif()\n${_mlas_text}")
+  else()
+    string(REPLACE
+      "\${CMAKE_SOURCE_DIR}/modules/dnn/src/layers/cpu_kernels/mlas_threading.cpp"
+      "\${CMAKE_CURRENT_SOURCE_DIR}/../../modules/dnn/src/layers/cpu_kernels/mlas_threading.cpp"
+      _mlas_text "${_mlas_text}")
+    string(REPLACE
+      "\${CMAKE_SOURCE_DIR}/modules/core/include"
+      "\${CMAKE_CURRENT_SOURCE_DIR}/../../modules/core/include"
+      _mlas_text "${_mlas_text}")
+  endif()
+  file(WRITE "${_mlas_cmake}" "${_mlas_text}")
+  unset(_mlas_cmake)
+  unset(_mlas_text)
+
   add_subdirectory(${opencv_SOURCE_DIR} ${opencv_BINARY_DIR})
+
+  # On MSVC, strip "pthread" (including $<LINK_ONLY:pthread> generator
+  # expressions) from OpenCV module INTERFACE_LINK_LIBRARIES so the MSVC
+  # linker doesn't fail with LNK1181 (pthread.lib doesn't exist on Windows).
+  if(MSVC)
+    foreach(_tgt opencv_core opencv_imgproc opencv_imgcodecs opencv_dnn
+                 opencv_video opencv_geometry opencv_flann opencv_features
+                 opencv_features2d opencv_ptcloud)
+      if(TARGET ${_tgt})
+        get_target_property(_libs ${_tgt} INTERFACE_LINK_LIBRARIES)
+        if(_libs)
+          set(_before "${_libs}")
+          list(FILTER _libs EXCLUDE REGEX "LINK_ONLY:pthread")
+          if("pthread" IN_LIST _libs)
+            list(REMOVE_ITEM _libs "pthread")
+          endif()
+          if(NOT "${_libs}" STREQUAL "${_before}")
+            set_target_properties(${_tgt} PROPERTIES INTERFACE_LINK_LIBRARIES "${_libs}")
+          endif()
+        endif()
+      endif()
+    endforeach()
+    unset(_tgt)
+    unset(_libs)
+    unset(_before)
+  endif()
+
 endif()
 
 # ── Wrap OpenCV CMake targets as the "OpenCV" interface the parent expects ──

@@ -2,8 +2,11 @@
 #define NIS_UPSCALER_HPP
 
 #include <opencv2/core.hpp>
-#include "cuda/cuda_kernel_launcher.hpp"
 #include <memory>
+
+#ifdef HAVE_CUDA_NIS
+#include "cuda/cuda_kernel_launcher.hpp"
+#endif
 
 class NISUpscaler {
 public:
@@ -19,6 +22,8 @@ public:
 private:
     bool available_ = false;
     int device_id_ = 0;
+
+#ifdef HAVE_CUDA_NIS
     CudaKernelLauncher launcher_;
 
     void* d_input_ = nullptr;
@@ -29,6 +34,7 @@ private:
 
     bool ensure_buffers(int h, int w);
     void free_buffers();
+#endif
 };
 
 #endif

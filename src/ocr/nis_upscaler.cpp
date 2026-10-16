@@ -1,17 +1,23 @@
 #include "nis_upscaler.hpp"
+#include <opencv2/imgproc.hpp>
+
+#ifdef HAVE_CUDA_NIS
 #include "cuda/vtes_cuda_kernels_ptx.h"
 #include "cuda_debug.hpp"
-#include <opencv2/imgproc.hpp>
+#endif
 
 NISUpscaler::NISUpscaler() = default;
 
 NISUpscaler::~NISUpscaler()
 {
+#ifdef HAVE_CUDA_NIS
     free_buffers();
+#endif
 }
 
 bool NISUpscaler::init(int device_id)
 {
+#ifdef HAVE_CUDA_NIS
     device_id_ = device_id;
 
     static bool log_env_set = false;
@@ -43,8 +49,13 @@ bool NISUpscaler::init(int device_id)
 
     available_ = true;
     return true;
+#else
+    (void)device_id;
+    return false;
+#endif
 }
 
+#ifdef HAVE_CUDA_NIS
 bool NISUpscaler::ensure_buffers(int h, int w)
 {
     int out_h = h * scale();
@@ -70,9 +81,11 @@ void NISUpscaler::free_buffers()
     if (d_output_) { cudaFree(d_output_); d_output_ = nullptr; }
     alloc_h_ = alloc_w_ = 0;
 }
+#endif
 
 bool NISUpscaler::upscale(const cv::Mat& bgr_input, cv::Mat& bgr_output)
 {
+#ifdef HAVE_CUDA_NIS
     if (!available_ || bgr_input.empty()) return false;
 
     int h = bgr_input.rows;
@@ -109,4 +122,9 @@ bool NISUpscaler::upscale(const cv::Mat& bgr_input, cv::Mat& bgr_output)
     out_rgb.convertTo(out_rgb, CV_8UC3, 255.0f);
     cv::cvtColor(out_rgb, bgr_output, cv::COLOR_RGB2BGR);
     return true;
+#else
+    (void)bgr_input;
+    (void)bgr_output;
+    return false;
+#endif
 }
