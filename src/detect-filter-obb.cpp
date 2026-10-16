@@ -810,7 +810,10 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 		"Click to Overlay (show cards only when clicked from web UI)");
 
 	// Card Search Web Server + Detection History
-	obs_properties_add_button(props, "card_search_btn", "Open Card Search",
+	// OBS 32 marca obs_properties_add_button como desusado: button2 con priv
+	// nullptr es identico (si priv es nulo, el callback recibe el data de la
+	// fuente, que es lo que hacia la version antigua).
+	obs_properties_add_button2(props, "card_search_btn", "Open Card Search",
 		[](obs_properties_t *, obs_property_t *, void *data) {
 			struct detect_filter_obb *tf = reinterpret_cast<detect_filter_obb *>(data);
 			if (!tf->web_server || !tf->web_server->is_running()) {
@@ -835,7 +838,7 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 #endif
 			}
 			return true;
-		});
+		}, nullptr);
 
 	std::string basic_info =
 		std::regex_replace(PLUGIN_INFO_TEMPLATE, std::regex("%1"), PLUGIN_VERSION);

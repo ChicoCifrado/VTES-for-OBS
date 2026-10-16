@@ -50,6 +50,8 @@ cmake_install.cmake
 Makefile
 *.cmake
 !cmake/**/*.cmake
+# El config del SDK local (.deps/obs-sdk) es fuente, no generado
+!scripts/obs-sdk/*.cmake
 
 # Visual Studio / MSBuild
 *.user
