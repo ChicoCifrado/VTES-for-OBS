@@ -87,3 +87,8 @@ ipch/
 *.swo
 *~
 .vscode/
+
+# Libreria de importacion de cudart generada por scripts/gen_cudart_lib.py
+# (permite enlazar sin toolkit CUDA instalado)
+!cudalib/*.lib
+!cudalib/*.exp

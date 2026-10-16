@@ -1,0 +1,2 @@
+EXPORTS
+  OrtSessionOptionsAppendExecutionProvider_DML=onnxruntime.OrtSessionOptionsAppendExecutionProvider_DML
