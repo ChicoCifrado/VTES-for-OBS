@@ -20,6 +20,8 @@
 #include <tuple>
 #include <vector>
 #include <algorithm>
+#include <cstdlib>
+#include <filesystem>
 
 // ─── Fuzzy match tuning ───────────────────────────────────────────────────
 // Umbral de aceptacion del fuzzy match. Medido sobre 4149 nombres reales
@@ -41,6 +43,45 @@ static constexpr int kMaxNameChars = 48;
 #else
 #include <dlfcn.h>
 #endif
+
+// ─── Debug de imagenes OCR ────────────────────────────────────────────────
+// Guarda los primeros recortes de cada sesion para poder inspeccionar que ve
+// realmente Tesseract (banda detectada, salida del NIS y binarizado final).
+// Antes se escribia con ruta relativa en el CWD, que en
+// C:\Program Files\obs-studio\bin\64bit falla en silencio sin admin; ahora
+// va a %APPDATA%\obs-studio\plugin_config\vtes-card-scanner\ocr_debug.
+static constexpr int kMaxOcrDebugSaves = 20;
+static int g_ocr_debug_saves = 0;
+
+static std::string ocrDebugDir()
+{
+    static std::string dir;
+    if (dir.empty()) {
+#ifdef _WIN32
+        char* appdata = nullptr;
+        size_t len = 0;
+        if (_dupenv_s(&appdata, &len, "APPDATA") == 0 && appdata && *appdata) {
+            dir = std::string(appdata) +
+                  "\\obs-studio\\plugin_config\\vtes-card-scanner\\ocr_debug";
+            free(appdata);
+        } else {
+            dir = "ocr_debug";
+        }
+#else
+        dir = "/tmp/vtes_ocr_debug";
+#endif
+    }
+    return dir;
+}
+
+static void saveOcrDebugImage(const std::string& file_name, const cv::Mat& img)
+{
+    if (img.empty()) return;
+    const std::string dir = ocrDebugDir();
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    cv::imwrite(dir + "/" + file_name, img);
+}
 
 VtesOcrReader::VtesOcrReader() {}
 
@@ -207,6 +248,11 @@ bool VtesOcrReader::init(const std::string& tessdata_path,
     fnSetVariable(tess_, "classify_bln_numeric_mode", "0");
     fnSetVariable(tess_, "tessedit_do_invert", "0");
 
+    // PSM 7 (single line): la banda del nombre contiene exactamente una linea
+    // de texto; el analisis de pagina por defecto (PSM 3) segmenta mal estas
+    // tiras cortas y baja la tasa de acierto.
+    fnSetVariable(tess_, "tessedit_pageseg_mode", "7");
+
     initialized_ = true;
     obs_log(LOG_INFO, "[OCR] Tesseract initialized (%zu card names loaded)",
             card_names_.size());
@@ -239,23 +285,34 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
 
     if (!initialized_ || card_bgr.empty()) return false;
 
+    // Indice de debug para esta lectura (-1 = ya no se guardan mas)
+    const int dbg_idx = (g_ocr_debug_saves < kMaxOcrDebugSaves) ? g_ocr_debug_saves++ : -1;
+
     // Step 1: visually locate the card name region (instead of hardcoded crop)
     cv::Mat name_region = detectNameRegion(card_bgr, card_type_hint);
     if (name_region.empty()) return false;
+    if (dbg_idx >= 0)
+        saveOcrDebugImage("vtes_ocr_name_" + std::to_string(dbg_idx) + ".png", name_region);
 
     // Step 2: optional NIS CUDA upscale (Lanczos 4x + adaptive sharpen)
+    bool used_nis = false;
     if (use_upscaler_ && upscaler_) {
         cv::Mat upscaled;
         if (upscaler_->upscale(name_region, upscaled)) {
-            name_region = upscaled;
             obs_log(LOG_DEBUG, "[OCR] NIS CUDA upscale: %dx%d -> %dx%d",
                     name_region.cols, name_region.rows,
                     upscaled.cols, upscaled.rows);
+            name_region = upscaled;
+            used_nis = true;
+            if (dbg_idx >= 0)
+                saveOcrDebugImage("vtes_ocr_nis_" + std::to_string(dbg_idx) + ".png", name_region);
         }
     }
 
-    cv::Mat processed = preprocessForOcr(name_region);
+    cv::Mat processed = preprocessForOcr(name_region, used_nis);
     if (processed.empty()) return false;
+    if (dbg_idx >= 0)
+        saveOcrDebugImage("vtes_ocr_tess_" + std::to_string(dbg_idx) + ".png", processed);
 
     fnSetImage(tess_, processed.data, processed.cols, processed.rows, 1, (int)processed.step);
 
@@ -470,9 +527,11 @@ cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr,
         name_bottom = h * 14 / 100;
     }
 
-    // 2px padding
-    name_top = std::max(0, name_top - 2);
-    name_bottom = std::min(h, name_bottom + 2);
+    // Padding proporcional al alto de la carta (antes 2 px fijos): en cartas
+    // grandes 2 px dejaban fuera ascendentes y descendentes del nombre.
+    const int pad = std::max(2, h / 100);
+    name_top = std::max(0, name_top - pad);
+    name_bottom = std::min(h, name_bottom + pad);
 
     // El nombre impreso llega hasta el borde derecho en nombres largos.
     // Medido: 195 de 4149 cartas (4.7%) tienen nombres de mas de 25 chars,
@@ -491,18 +550,10 @@ cv::Mat VtesOcrReader::detectNameRegion(const cv::Mat& card_bgr,
     obs_log(LOG_INFO, "[OCR] detectNameRegion: zone=[%d,%d] search=%dpx best_density=%d → y=[%d,%d] h=%d",
             zone_top, zone_bot, zone_h, best_density, name_top, name_bottom, name_h);
 
-    cv::Mat debug_roi = card_bgr(name_roi).clone();
-    static int debug_cnt = 0;
-    if (debug_cnt < 20) {
-        std::string debug_path = "vtes_ocr_name_" + std::to_string(debug_cnt++) + ".png";
-        cv::imwrite(debug_path, debug_roi);
-        obs_log(LOG_INFO, "[OCR] detectNameRegion: y=[%d,%d] h=%d → %s",
-                name_top, name_bottom, name_h, debug_path.c_str());
-    }
-    return debug_roi;
+    return card_bgr(name_roi).clone();
 }
 
-cv::Mat VtesOcrReader::preprocessForOcr(const cv::Mat& region)
+cv::Mat VtesOcrReader::preprocessForOcr(const cv::Mat& region, bool already_upscaled)
 {
     if (region.empty()) return {};
 
@@ -518,10 +569,14 @@ cv::Mat VtesOcrReader::preprocessForOcr(const cv::Mat& region)
     cv::Mat enhanced;
     clahe->apply(gray, enhanced);
 
-    // Step 2: upscale if not already large enough (NIS CUDA already did 4x)
+    // Step 2: si NIS CUDA ya upscalo 4x, no reescalar otra vez. El codigo
+    // anterior decidia por tamano (rows>80) y con una banda de nombre corta
+    // (18 px -> 72 px tras NIS) aplicaba ademas un resize 3x que deshacia el
+    // trabajo del NIS y dejaba el bloque del threshold minusculo para el
+    // tamano real del texto.
     cv::Mat upscaled;
-    if (region.rows > 80 && region.cols > 200) {
-        upscaled = enhanced; // already upscaled by NIS CUDA
+    if (already_upscaled) {
+        upscaled = enhanced;
     } else {
         cv::resize(enhanced, upscaled, cv::Size(region.cols * 3, region.rows * 3),
                    0, 0, cv::INTER_LANCZOS4);
@@ -532,13 +587,19 @@ cv::Mat VtesOcrReader::preprocessForOcr(const cv::Mat& region)
     cv::GaussianBlur(upscaled, blurred, cv::Size(3, 3), 0);
 
     // Step 4: Adaptive threshold instead of global OTSU
-    // Works better for variable lighting on webcam captures
+    // Works better for variable lighting on webcam captures.
+    // Bloque proporcional al alto de la imagen: un texto de ~50-70 px necesita
+    // un bloque mayor que uno de ~36 px (el valor fijo 31 anterior era valido
+    // solo para la escala del resize 3x).
+    int block = ((int)upscaled.rows / 2) | 1;
+    if (block < 25) block = 25;
+    if (block > 61) block = 61;
     cv::Mat binary;
     cv::adaptiveThreshold(blurred, binary, 255,
                           cv::ADAPTIVE_THRESH_GAUSSIAN_C,
                           cv::THRESH_BINARY_INV,
-                          31,  // block size (odd, ~3 × font size)
-                          6);  // subtract constant
+                          block,  // block size (odd, ~2-4 x stroke)
+                          6);     // subtract constant
 
     // Step 5: median blur to remove salt-and-pepper noise
     cv::Mat denoised;
@@ -688,8 +749,8 @@ int VtesOcrReader::detectVampireCapacity(const cv::Mat& card_bgr)
         } catch (...) {}
     }
 
-    // Restore PSM to SINGLE_BLOCK for subsequent name reads
-    fnSetVariable(tess_, "tessedit_pageseg_mode", "6");
+    // Restore PSM 7 (single line) for subsequent name reads
+    fnSetVariable(tess_, "tessedit_pageseg_mode", "7");
 
     obs_log(LOG_DEBUG, "[OCR] detectVampireCapacity: result=%d", result);
     return result;
