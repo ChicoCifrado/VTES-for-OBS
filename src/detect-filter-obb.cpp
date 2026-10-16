@@ -366,6 +366,7 @@ static void buildCardNameEntries(struct filter_data *tf)
     // Medido: +710 entradas (+17%) sobre 4149 cartas, con 77 colisiones
     // preexistentes que ya existian solo con printed_name.
     size_t added = 0;
+    size_t added_localized = 0;
     for (const auto& [id_str, entry] : tf->vtes_db.all_entries()) {
         VTESCardNameEntry ce;
         ce.id = id_str;
@@ -387,8 +388,29 @@ static void buildCardNameEntries(struct filter_data *tf)
                 added++;
             }
         }
+
+        // Nombres localizados: la quinta edicion espanola/francesa imprime el
+        // nombre traducido ("Ojos de Argos" donde la inglesa dice "Eyes of
+        // Argus"). Sin estas entradas, un OCR perfecto del nombre impreso
+        // puntuaba ~0.45 contra el indice ingles y se rechazaba. Se conserva
+        // el printed_name canonico como nombre reportado para que el overlay
+        // siga mostrando la carta en el idioma de la BD.
+        for (const std::string* localized : {&entry.name_es, &entry.name_fr}) {
+            if (localized->empty()) continue;
+            VTESCardNameEntry le;
+            le.id = id_str;
+            le.printed_name = entry.printed_name.empty() ? entry.name : entry.printed_name;
+            le.full_name = entry.name;
+            le.normalized = VtesOcrReader::normalize(*localized);
+            if (!le.normalized.empty()) {
+                tf->card_name_entries.push_back(std::move(le));
+                added_localized++;
+            }
+        }
     }
     obs_log(LOG_INFO, "[OCR] Indexed %zu name_variants for fuzzy matching", added);
+    obs_log(LOG_INFO, "[OCR] Indexed %zu localized (es/fr) names for fuzzy matching",
+            added_localized);
     obs_log(LOG_INFO, "[OCR] Built %zu card name entries for fuzzy matching",
             tf->card_name_entries.size());
 }

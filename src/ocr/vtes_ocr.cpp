@@ -564,6 +564,19 @@ cv::Mat VtesOcrReader::preprocessForOcr(const cv::Mat& region, bool already_upsc
         gray = region.clone();
     }
 
+    // Step 0: normalizacion de polaridad. Los disenos antiguos imprimen el
+    // nombre en tinta oscura sobre banner claro, pero la quinta edicion
+    // (V5/V5C, reediciones) lo imprime en claro sobre banner oscuro. Como
+    // Tesseract trabaja siempre con tinta oscura sobre fondo claro
+    // (tessedit_do_invert=0), se invierte la banda cuando el fondo es
+    // oscuro. Sin esto, el umbral producia una imagen casi negra con halos
+    // blancos: las letras quedaban fundidas con el fondo.
+    const double band_mean = cv::mean(gray)[0];
+    const bool inverted_polarity = band_mean < 110.0;
+    if (inverted_polarity) {
+        cv::bitwise_not(gray, gray);
+    }
+
     // Step 1: CLAHE contrast enhancement — boosts text vs. background
     cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
     cv::Mat enhanced;
@@ -586,20 +599,44 @@ cv::Mat VtesOcrReader::preprocessForOcr(const cv::Mat& region, bool already_upsc
     cv::Mat blurred;
     cv::GaussianBlur(upscaled, blurred, cv::Size(3, 3), 0);
 
-    // Step 4: Adaptive threshold instead of global OTSU
-    // Works better for variable lighting on webcam captures.
-    // Bloque proporcional al alto de la imagen: un texto de ~50-70 px necesita
-    // un bloque mayor que uno de ~36 px (el valor fijo 31 anterior era valido
-    // solo para la escala del resize 3x).
-    int block = ((int)upscaled.rows / 2) | 1;
-    if (block < 25) block = 25;
-    if (block > 61) block = 61;
+    // Step 4: umbral global por percentil sobre la banda ya normalizada.
+    // Tras el Step 0 la tinta es lo mas oscuro de la imagen, asi que el
+    // percentil 12 conserva los nucleos del texto y deja fondo y halos en
+    // blanco (polaridad que espera Tesseract con do_invert=0). El antiguo
+    // adaptiveThreshold THRESH_BINARY_INV sobre el banner oscuro producia
+    // una imagen casi negra con halos blancos donde las letras quedaban
+    // fundidas con el fondo.
+    int hist[256] = {0};
+    for (int y = 0; y < blurred.rows; ++y) {
+        const uchar *row = blurred.ptr<uchar>(y);
+        for (int x = 0; x < blurred.cols; ++x)
+            hist[row[x]]++;
+    }
+    const double total_px = (double)blurred.rows * (double)blurred.cols;
+    double acc = 0.0;
+    int pct_thresh = 0;
+    for (int v = 0; v < 256; ++v) {
+        acc += hist[v];
+        if (acc >= total_px * 0.12) {
+            pct_thresh = v;
+            break;
+        }
+    }
+
     cv::Mat binary;
-    cv::adaptiveThreshold(blurred, binary, 255,
-                          cv::ADAPTIVE_THRESH_GAUSSIAN_C,
-                          cv::THRESH_BINARY_INV,
-                          block,  // block size (odd, ~2-4 x stroke)
-                          6);     // subtract constant
+    cv::threshold(blurred, binary, pct_thresh, 255, cv::THRESH_BINARY);
+
+    // Cordura: si el percentil deja una fraccion de tinta inservible
+    // (banda vacia de texto o saturada), cae a Otsu global.
+    const double ink_ratio = 1.0 - cv::countNonZero(binary) / total_px;
+    if (ink_ratio < 0.002 || ink_ratio > 0.35) {
+        cv::threshold(blurred, binary, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+        obs_log(LOG_INFO, "[OCR] preprocesado: polaridad=%s pct=%d tinta=%.1f%% -> fallback Otsu",
+                inverted_polarity ? "invertida" : "normal", pct_thresh, ink_ratio * 100.0);
+    } else {
+        obs_log(LOG_INFO, "[OCR] preprocesado: polaridad=%s pct=%d tinta=%.1f%%",
+                inverted_polarity ? "invertida" : "normal", pct_thresh, ink_ratio * 100.0);
+    }
 
     // Step 5: median blur to remove salt-and-pepper noise
     cv::Mat denoised;
@@ -608,6 +645,61 @@ cv::Mat VtesOcrReader::preprocessForOcr(const cv::Mat& region, bool already_upsc
     // Step 6: connect broken characters with a 1×2 close kernel
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(1, 2));
     cv::morphologyEx(denoised, denoised, cv::MORPH_CLOSE, kernel);
+
+    // Step 7: recorte al cluster principal de texto.
+    // La banda es ancha (88% de la carta) e incluye decoracion del borde o
+    // reflejos que Tesseract arrastra a la lectura ("...I co 8", medido en
+    // pruebas offline): el ruido extra hunde el score fuzzy aunque el nombre
+    // se lea bien. Se localiza el tramo mas largo de columnas con tinta
+    // (uniendo huecos de palabra con un gap proporcional al alto) y se
+    // recorta a el con margen. Si el recorte no es plausible, se deja igual.
+    {
+        const int rows = denoised.rows;
+        const int cols = denoised.cols;
+        std::vector<int> col_ink(cols, 0), row_ink(rows, 0);
+        for (int y = 0; y < rows; ++y) {
+            const uchar *row = denoised.ptr<uchar>(y);
+            for (int x = 0; x < cols; ++x) {
+                if (row[x] == 0) {
+                    col_ink[x]++;
+                    row_ink[y]++;
+                }
+            }
+        }
+        const int gap = std::max(6, rows / 2);
+        int best_s = -1, best_e = -1, run_s = -1, run_e = -1;
+        for (int x = 0; x < cols; ++x) {
+            if (col_ink[x] == 0) continue;
+            if (run_s < 0) {
+                run_s = run_e = x;
+            } else if (x - run_e <= gap) {
+                run_e = x;
+            } else {
+                if (run_e - run_s > best_e - best_s) { best_s = run_s; best_e = run_e; }
+                run_s = run_e = x;
+            }
+        }
+        if (run_s >= 0 && (run_e - run_s > best_e - best_s)) { best_s = run_s; best_e = run_e; }
+        int y_first = -1, y_last = -1;
+        for (int y = 0; y < rows; ++y) {
+            if (row_ink[y] > 0) {
+                if (y_first < 0) y_first = y;
+                y_last = y;
+            }
+        }
+        if (best_s >= 0 && y_first >= 0) {
+            const int pad_x = std::max(6, rows / 3);
+            const int x0 = std::max(0, best_s - pad_x);
+            const int x1 = std::min(cols, best_e + pad_x + 1);
+            const int y0 = std::max(0, y_first - 4);
+            const int y1 = std::min(rows, y_last + 5);
+            if (x1 - x0 > 10 && y1 - y0 > 4) {
+                cv::Mat tight(y1 - y0, x1 - x0, CV_8UC1, cv::Scalar(255));
+                denoised(cv::Rect(x0, y0, x1 - x0, y1 - y0)).copyTo(tight);
+                denoised = tight;
+            }
+        }
+    }
 
     return denoised;
 }
