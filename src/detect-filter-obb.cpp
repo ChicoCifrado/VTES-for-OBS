@@ -2355,6 +2355,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 							cv::FONT_HERSHEY_SIMPLEX, 0.4f, cv::Scalar(220, 220, 220), 1);
 					}
 				}
+			}
 
 			// 4b. Carta principal sobre el ankh del overlay
 			// Se coloca la ultima carta detectada sobre el simbolo, tapandolo por
@@ -2413,8 +2414,6 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 						}
 					}
 				}
-			}
-
 			}
 
 			// 5. Manual overlay from web UI (on display)
