@@ -84,6 +84,8 @@ struct filter_data {
 	bool isDisabled;
 	bool preview;
 	bool always_active;
+	bool show_zones; // dibuja las zonas de jugadores sobre el preview
+	bool big_card;   // dibuja la carta principal a media pantalla (modo torneo)
 
 	std::mutex inputBGRALock;
 	std::mutex outputLock;
@@ -238,12 +240,14 @@ struct filter_data {
 	// Per-player zone on the source frame (normalized 0..1)
 	struct PlayerZone {
 		float nx = 0.0f, ny = 0.0f, nw = 0.0f, nh = 0.0f;
+		float angle = 0.0f; // grados; positivo = horario en pantalla
 	};
 
 	// Per-player persistent state
 	struct PlayerState {
 		std::string name = "Jugador";
 		int pool = 30;
+		bool active = true; // en partida; un ousted deja su sitio libre
 		PlayerZone minion_zone;  // far (top) zone
 		PlayerZone crypt_zone;   // near (bottom) zone
 	};

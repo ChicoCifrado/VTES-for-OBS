@@ -15,18 +15,33 @@
 
 static constexpr float kPI = 3.14159265358979323846f;
 // ─── Overlay: geometria de referencia ───────────────────────────────────────
-// Dimensiones de la escena para las que se ajusto el diseño del overlay.
-// La imagen original es 1536x1024 (3:2) y se escala entera para caber,
-// dejando bandas negras a los lados en una escena 16:9.
-static constexpr int kOverlayRefW = 1920;
-static constexpr int kOverlayRefH = 1080;
-// Caja del simbolo ankh sobre la que se coloca la carta detectada,
-// medida sobre el diseño escalado a 1920x1080. La carta lo tapa por completo
-// y no sobresale del panel izquierdo.
-static constexpr int kAnkhX = 192;
-static constexpr int kAnkhY = 507;
-static constexpr int kAnkhW = 200;
-static constexpr int kAnkhH = 508;
+// El diseño real es overlay-bg.png (1536x1024 = 3:2, con canal alfa) y se
+// escala ENTERO para caber en la escena, dejando bandas negras a los lados
+// en una escena 16:9. Todas las cajas de abajo estan medidas en pixeles del
+// diseño (1536x1024), no en pixeles de la escena.
+static constexpr int kOverlayRefW = 1536;
+static constexpr int kOverlayRefH = 1024;
+// Ventana de camara: el hueco transparente del diseño. La camara se ajusta
+// (entera, sin recorte) dentro de este hueco; el diseño se dibuja ENCIMA.
+static constexpr int kWinX = 289;
+static constexpr int kWinY = 41;
+static constexpr int kWinW = 1203;
+static constexpr int kWinH = 947;
+// Caja del simbolo ankh sobre la que se coloca la carta detectada. La carta
+// lo tapa por completo y no sobresale del panel izquierdo.
+static constexpr int kAnkhX = 28;
+static constexpr int kAnkhY = 482;
+static constexpr int kAnkhW = 204;
+static constexpr int kAnkhH = 478;
+// Casillas de jugador del panel izquierdo: una fila por jugador, con la caja
+// ancha del nombre a la izquierda y la caja pequena del pool a la derecha.
+// kSlotY es la coordenada Y del borde superior de cada fila (MAX_PLAYERS = 5).
+static constexpr int kNameX = 32;
+static constexpr int kNameW = 145;
+static constexpr int kPoolX = 184;
+static constexpr int kPoolW = 55;
+static constexpr int kSlotH = 54;
+static constexpr int kSlotY[5] = {89, 170, 249, 327, 401};
 
 #include <numeric>
 #include <memory>
@@ -49,6 +64,7 @@ static constexpr int kAnkhH = 508;
 #include <plugin-support.h>
 #include "FilterData.h"
 #include "consts.h"
+#include "i18n.h"
 #include "obs-utils/obs-utils.h"
 #include "detect-filter-utils.h"
 #include "detection/yolo_detector.hpp"
@@ -786,45 +802,59 @@ static void updateTemporalTracks(
 const char *detect_filter_obb_getname(void *unused)
 {
 	UNUSED_PARAMETER(unused);
-	return obs_module_text("VTES Card Detector (OBB)");
+	return tf_text("VTES Card Detector (OBB)");
 }
 
 obs_properties_t *detect_filter_obb_properties(void *data)
 {
 	obs_properties_t *props = obs_properties_create();
 
-	obs_properties_add_bool(props, "preview", obs_module_text("Preview"));
-	obs_properties_add_bool(props, "always_active", "Always active (detect even when boxes hidden)");
+	obs_properties_add_bool(props, "preview", tf_text("Preview"));
+	obs_properties_add_bool(props, "always_active", tf_text("AlwaysActive"));
 
-	obs_properties_add_float_slider(props, "threshold", obs_module_text("ConfThreshold"), 0.0,
+	// Idioma del plugin (nativo: espanol). Se guarda para las siguientes
+	// cargas y las etiquetas del panel se refrescan al reabrir el dialogo.
+	obs_property_t *p_lang = obs_properties_add_list(props, "language", tf_text("Language"),
+							 OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p_lang, "Español", "es");
+	obs_property_list_add_string(p_lang, "English", "en");
+	obs_property_set_modified_callback2(
+		p_lang,
+		[](void *, obs_properties_t *, obs_property_t *, obs_data_t *settings) {
+			tf_i18n_set(obs_data_get_string(settings, "language"));
+			return true;
+		},
+		nullptr);
+
+	obs_properties_add_float_slider(props, "threshold", tf_text("ConfThreshold"), 0.0,
 					1.0, 0.025);
 
 	obs_property_t *p_det_mode =
-		obs_properties_add_list(props, "detection_mode", obs_module_text("DetectionMode"),
+		obs_properties_add_list(props, "detection_mode", tf_text("DetectionMode"),
 					OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p_det_mode, obs_module_text("Shape (Contour)"), DETECT_MODE_CONTOUR);
-	obs_property_list_add_string(p_det_mode, obs_module_text("AI Model (ONNX)"), DETECT_MODE_ONNX);
+	obs_property_list_add_string(p_det_mode, tf_text("Shape (Contour)"), DETECT_MODE_CONTOUR);
+	obs_property_list_add_string(p_det_mode, tf_text("AI Model (ONNX)"), DETECT_MODE_ONNX);
 
 	obs_property_t *p_inf_dev =
-		obs_properties_add_list(props, "inference_device", obs_module_text("InferenceDevice"),
+		obs_properties_add_list(props, "inference_device", tf_text("InferenceDevice"),
 				OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 
-	obs_property_list_add_string(p_inf_dev, obs_module_text("CPU"), INFERENCE_CPU);
+	obs_property_list_add_string(p_inf_dev, tf_text("CPU"), INFERENCE_CPU);
 #if _WIN32
-	obs_property_list_add_string(p_inf_dev, obs_module_text("GPU (DirectML)"), INFERENCE_DML);
-	obs_property_list_add_string(p_inf_dev, obs_module_text("GPU (CUDA)"), INFERENCE_CUDA);
+	obs_property_list_add_string(p_inf_dev, tf_text("GPU (DirectML)"), INFERENCE_DML);
+	obs_property_list_add_string(p_inf_dev, tf_text("GPU (CUDA)"), INFERENCE_CUDA);
 #endif
 
-	obs_properties_add_bool(props, "classifier_enabled", "Type Classifier (filter by card type)");
-
+	obs_properties_add_bool(props, "classifier_enabled", tf_text("TypeClassifier"));
+	
 	// OCR
-	obs_properties_add_bool(props, "ocr_enabled", "OCR (read card names with Tesseract)");
-	obs_properties_add_bool(props, "upscaler_enabled", "NIS Upscale (Lanczos 4x + adaptive sharpen via CUDA)");
-	obs_properties_add_bool(props, "vampire_cuda_enabled", "CUDA Oval/Rect Classifier (reduce false positives)");
+	obs_properties_add_bool(props, "ocr_enabled", tf_text("OcrEnabled"));
+	obs_properties_add_bool(props, "upscaler_enabled", tf_text("NisUpscale"));
+	obs_properties_add_bool(props, "vampire_cuda_enabled", tf_text("OvalRectClassifier"));
 
 	// Detection interval (0 = continuous, no logging)
 	obs_properties_add_float_slider(props, "detection_interval_seconds",
-		"Detection interval",
+		tf_text("DetectionInterval"),
 		0.0, 5.0, 0.1);
 
 	// Click-to-overlay: manual from web UI
@@ -833,16 +863,16 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	// puede desplazar depende de cada carta: con dos rulings apenas se mueve
 	// y con dieciocho se mueve mucho.
 	obs_properties_add_int_slider(props, "rulings_scroll",
-	                              "Rulings scroll (0..100%)", 0, 100, 1);
+	                              tf_text("RulingsScroll"), 0, 100, 1);
 
 	obs_properties_add_bool(props, "click_to_overlay",
-		"Click to Overlay (show cards only when clicked from web UI)");
+		tf_text("ClickToOverlay"));
 
 	// Card Search Web Server + Detection History
 	// OBS 32 marca obs_properties_add_button como desusado: button2 con priv
 	// nullptr es identico (si priv es nulo, el callback recibe el data de la
 	// fuente, que es lo que hacia la version antigua).
-	obs_properties_add_button2(props, "card_search_btn", "Open Card Search",
+	obs_properties_add_button2(props, "card_search_btn", tf_text("OpenCardSearch"),
 		[](obs_properties_t *, obs_property_t *, void *data) {
 			struct detect_filter_obb *tf = reinterpret_cast<detect_filter_obb *>(data);
 			if (!tf->web_server || !tf->web_server->is_running()) {
@@ -874,25 +904,30 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	obs_properties_add_text(props, "info", basic_info.c_str(), OBS_TEXT_INFO);
 
 	// ─── Game State: Player configuration ───────────────────────────────
-	obs_properties_add_int_slider(props, "player_count", "Player count", 4, 5, 1);
+	obs_properties_add_int_slider(props, "player_count", tf_text("PlayerCount"), 4, 5, 1);
+	obs_properties_add_bool(props, "show_zones", tf_text("ShowZones"));
+	obs_properties_add_bool(props, "big_card", tf_text("BigCard"));
 
 	for (int i = 0; i < filter_data::MAX_PLAYERS; i++) {
 		std::string prefix = "player_" + std::to_string(i);
-		std::string label = "Player " + std::to_string(i + 1);
+		std::string label = std::string(tf_text("Player")) + " " + std::to_string(i + 1);
 
 		obs_properties_t *grp = obs_properties_create();
-		obs_properties_add_text(grp, (prefix + "_name").c_str(), "Name", OBS_TEXT_DEFAULT);
-		obs_properties_add_int(grp, (prefix + "_pool").c_str(), "Initial Pool", 0, 99, 1);
+		obs_properties_add_text(grp, (prefix + "_name").c_str(), tf_text("PlayerName"), OBS_TEXT_DEFAULT);
+		obs_properties_add_int(grp, (prefix + "_pool").c_str(), tf_text("InitialPool"), 0, 99, 1);
+		obs_properties_add_bool(grp, (prefix + "_active").c_str(), tf_text("PlayerActive"));
 
 		obs_properties_add_float(grp, (prefix + "_minion_x").c_str(), "Minion X (norm)", 0.0, 1.0, 0.01);
 		obs_properties_add_float(grp, (prefix + "_minion_y").c_str(), "Minion Y (norm)", 0.0, 1.0, 0.01);
 		obs_properties_add_float(grp, (prefix + "_minion_w").c_str(), "Minion W (norm)", 0.0, 1.0, 0.01);
 		obs_properties_add_float(grp, (prefix + "_minion_h").c_str(), "Minion H (norm)", 0.0, 1.0, 0.01);
+		obs_properties_add_int_slider(grp, (prefix + "_minion_angle").c_str(), tf_text("MinionAngle"), -180, 180, 1);
 
 		obs_properties_add_float(grp, (prefix + "_crypt_x").c_str(), "Crypt X (norm)", 0.0, 1.0, 0.01);
 		obs_properties_add_float(grp, (prefix + "_crypt_y").c_str(), "Crypt Y (norm)", 0.0, 1.0, 0.01);
 		obs_properties_add_float(grp, (prefix + "_crypt_w").c_str(), "Crypt W (norm)", 0.0, 1.0, 0.01);
 		obs_properties_add_float(grp, (prefix + "_crypt_h").c_str(), "Crypt H (norm)", 0.0, 1.0, 0.01);
+		obs_properties_add_int_slider(grp, (prefix + "_crypt_angle").c_str(), tf_text("CryptAngle"), -180, 180, 1);
 
 		obs_properties_add_group(props, (prefix + "_group").c_str(),
 			label.c_str(), OBS_GROUP_NORMAL, grp);
@@ -905,15 +940,16 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 void detect_filter_obb_defaults(obs_data_t *settings)
 {
 #if _WIN32
-	obs_data_set_default_string(settings, "inference_device", INFERENCE_DML);
+	obs_data_set_default_string(settings, "inference_device", INFERENCE_CUDA);
 #else
 	obs_data_set_default_string(settings, "inference_device", INFERENCE_CPU);
 #endif
 	obs_data_set_default_bool(settings, "sort_tracking", false);
 	obs_data_set_default_bool(settings, "preview", true);
+	obs_data_set_default_string(settings, "language", tf_i18n_code());
 	obs_data_set_default_bool(settings, "always_active", true);
 	obs_data_set_default_double(settings, "threshold", 0.5);
-	obs_data_set_default_string(settings, "detection_mode", DETECT_MODE_CONTOUR);
+	obs_data_set_default_string(settings, "detection_mode", DETECT_MODE_ONNX);
 	obs_data_set_default_bool(settings, "temporal_smoothing", true);
 
 	// Contour detection defaults
@@ -949,11 +985,14 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "clf_oval_reject_master", 0.4);
 
 	// Game state defaults
-	obs_data_set_default_int(settings, "player_count", 4);
+	obs_data_set_default_int(settings, "player_count", 5);
+	obs_data_set_default_bool(settings, "show_zones", true);
+	obs_data_set_default_bool(settings, "big_card", false);
 	for (int i = 0; i < filter_data::MAX_PLAYERS; i++) {
 		std::string p = "player_" + std::to_string(i);
 		obs_data_set_default_string(settings, (p + "_name").c_str(), ("Jugador " + std::to_string(i + 1)).c_str());
 		obs_data_set_default_int(settings, (p + "_pool").c_str(), 30);
+		obs_data_set_default_bool(settings, (p + "_active").c_str(), true);
 
 		// Default zones: divide screen width into MAX_PLAYERS columns
 		float col_w = 1.0f / filter_data::MAX_PLAYERS;
@@ -966,6 +1005,8 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 		obs_data_set_default_double(settings, (p + "_crypt_y").c_str(), 0.55);
 		obs_data_set_default_double(settings, (p + "_crypt_w").c_str(), col_w);
 		obs_data_set_default_double(settings, (p + "_crypt_h").c_str(), 0.45);
+		obs_data_set_default_int(settings, (p + "_minion_angle").c_str(), 0);
+		obs_data_set_default_int(settings, (p + "_crypt_angle").c_str(), 0);
 	}
 }
 
@@ -1056,6 +1097,8 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		if (new_count < 4) new_count = 4;
 		if (new_count > filter_data::MAX_PLAYERS) new_count = filter_data::MAX_PLAYERS;
 		tf->player_count = new_count;
+		tf->show_zones = obs_data_get_bool(settings, "show_zones");
+		tf->big_card = obs_data_get_bool(settings, "big_card");
 
 		for (int i = 0; i < filter_data::MAX_PLAYERS; i++) {
 			std::string p = "player_" + std::to_string(i);
@@ -1069,6 +1112,22 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 			tf->players[i].crypt_zone.ny = (float)obs_data_get_double(settings, (p + "_crypt_y").c_str());
 			tf->players[i].crypt_zone.nw = (float)obs_data_get_double(settings, (p + "_crypt_w").c_str());
 			tf->players[i].crypt_zone.nh = (float)obs_data_get_double(settings, (p + "_crypt_h").c_str());
+			tf->players[i].minion_zone.angle = (float)obs_data_get_int(settings, (p + "_minion_angle").c_str());
+			tf->players[i].crypt_zone.angle = (float)obs_data_get_int(settings, (p + "_crypt_angle").c_str());
+
+			// Un jugador que sale de la partida (ousted) deja su sitio libre:
+			// su zona deja de asignar cartas y se le quitan las ya asignadas.
+			const bool was_active = tf->players[i].active;
+			tf->players[i].active = obs_data_get_bool(settings, (p + "_active").c_str());
+			if (was_active && !tf->players[i].active) {
+				std::lock_guard<std::mutex> lock(tf->game_state_lock);
+				for (auto it = tf->tracked_cards.begin(); it != tf->tracked_cards.end();) {
+					if (it->second.player_idx == i)
+						it = tf->tracked_cards.erase(it);
+					else
+						++it;
+				}
+			}
 		}
 	}
 
@@ -1344,6 +1403,8 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		obs_log(LOG_INFO, "  Num Threads: %d", tf->numThreads);
 		obs_log(LOG_INFO, "  Show Boxes: %s", tf->preview ? "true" : "false");
 		obs_log(LOG_INFO, "  Always Active: %s", tf->always_active ? "true" : "false");
+		obs_log(LOG_INFO, "  Show Zones: %s", tf->show_zones ? "true" : "false");
+		obs_log(LOG_INFO, "  Big Card: %s", tf->big_card ? "true" : "false");
 		obs_log(LOG_INFO, "  Threshold: %.2f", tf->conf_threshold);
 	}
 
@@ -1479,15 +1540,24 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 		if (!tf->web_server_notified) {
 			tf->web_server_notified = true;
 #ifdef _WIN32
-			std::string msg = "Filtro VTES Card Scanner añadido correctamente.\n\n"
-				"Servidor web iniciado en http://localhost:"
-				+ std::to_string(tf->web_server_port)
-				+ "\n\nBusca cartas desde tu navegador.\n"
-				"Marca 'Always Active' para detección continua.\n"
-				"Ajusta el intervalo de detección para evitar spam.\n"
-				"Intervalo 0 = detección continua sin límite.";
-			MessageBoxA(NULL, msg.c_str(), "VTES Card Scanner",
-				MB_OK | MB_ICONINFORMATION | MB_TASKMODAL);
+			std::string msg = std::string(tf_text("PopupAdded")) + "\n\n" +
+				tf_text("PopupServer") + " http://localhost:" +
+				std::to_string(tf->web_server_port) + "\n\n" +
+				tf_text("PopupSearch") + "\n" +
+				tf_text("PopupAlwaysActive") + "\n" +
+				tf_text("PopupInterval") + "\n" +
+				tf_text("PopupIntervalZero");
+			// MessageBoxW + conversion explicita desde UTF-8: MessageBoxA
+			// interpretaria los bytes UTF-8 ("añadido", "detección") como
+			// ANSI y las tildes/eñes saldrian como mojibake (aÃ±adido).
+			int wlen = MultiByteToWideChar(CP_UTF8, 0, msg.c_str(), -1, nullptr, 0);
+			if (wlen > 0) {
+				std::wstring wmsg(wlen, L'\0');
+				MultiByteToWideChar(CP_UTF8, 0, msg.c_str(), -1, &wmsg[0], wlen);
+				wmsg.resize(wlen - 1);
+				MessageBoxW(NULL, wmsg.c_str(), L"VTES Card Scanner",
+					MB_OK | MB_ICONINFORMATION | MB_TASKMODAL);
+			}
 #else
 			obs_log(LOG_INFO, "[WebServer] Filter created (no MessageBox on this platform)");
 #endif
@@ -1714,6 +1784,101 @@ void detect_filter_obb_destroy(void *data)
 		tf->~detect_filter_obb();
 		bfree(tf);
 	}
+}
+
+// Colocacion del diseño del overlay dentro del frame: escala uniforme para
+// que quepa entero (nada se recorta) y centrado; lo que sobre son bandas.
+struct OverlayFit {
+	double esc;
+	int    ox, oy;
+};
+
+static OverlayFit overlayFit(int fw, int fh)
+{
+	const double esc = std::min((double)fw / kOverlayRefW, (double)fh / kOverlayRefH);
+	const int dw = (int)(kOverlayRefW * esc + 0.5);
+	const int dh = (int)(kOverlayRefH * esc + 0.5);
+	return {esc, (fw - dw) / 2, (fh - dh) / 2};
+}
+
+// Una caja del diseño (pixeles 1536x1024) a pixeles del frame.
+static cv::Rect designRect(const OverlayFit& fit, int x, int y, int w, int h)
+{
+	return cv::Rect(fit.ox + (int)(x * fit.esc + 0.5), fit.oy + (int)(y * fit.esc + 0.5),
+	                (int)(w * fit.esc + 0.5), (int)(h * fit.esc + 0.5));
+}
+
+// Rectangulo donde se dibuja la camara: la imagen entera ajustada (sin
+// recorte) dentro del hueco del diseño, centrada. Las zonas de jugador
+// (coords de camara 0..1) se mapean con este mismo rectangulo.
+static cv::Rect cameraFitRect(const OverlayFit& fit, int fw, int fh)
+{
+	const cv::Rect win = designRect(fit, kWinX, kWinY, kWinW, kWinH);
+	if (win.width < 8 || win.height < 8)
+		return cv::Rect(0, 0, fw, fh);
+
+	const double esc = std::min((double)win.width / fw, (double)win.height / fh);
+	const int cw = (int)(fw * esc + 0.5), ch = (int)(fh * esc + 0.5);
+	return cv::Rect(win.x + (win.width - cw) / 2, win.y + (win.height - ch) / 2, cw, ch);
+}
+
+// Texto centrado dentro de una caja, encogiendo la fuente si no cabe a lo
+// ancho (los nombres de jugador son texto libre). `scale` es la escala base.
+static void drawTextInBox(cv::Mat& img, const std::string& text, const cv::Rect& box,
+                          const cv::Scalar& color, double scale)
+{
+	if (text.empty() || box.width < 6 || box.height < 6)
+		return;
+	int baseline = 0;
+	cv::Size ts = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, scale, 1, &baseline);
+	const int avail = box.width - std::max(4, box.width / 8);
+	if (ts.width > avail && ts.width > 0)
+		scale *= (double)avail / ts.width;
+	ts = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, scale, 1, &baseline);
+	cv::putText(img, text,
+	            cv::Point(box.x + (box.width - ts.width) / 2,
+	                      box.y + (box.height + ts.height) / 2),
+	            cv::FONT_HERSHEY_SIMPLEX, scale, color, 1, cv::LINE_AA);
+}
+
+// Pega una imagen (carta) rotada y centrada en `center`, escalada a w x h.
+// angle en grados, positivo = horario en pantalla (convencion de las zonas).
+// Usa una mascara para que las esquinas del rectangulo rotado no tapen la
+// camara; sustituye al addWeighted recto cuando la zona esta girada.
+[[maybe_unused]] static void pasteRotatedImage(cv::Mat& dst, const cv::Mat& img, const cv::Point2f& center,
+                              float w, float h, float angle_deg)
+{
+	if (img.empty() || w < 2.0f || h < 2.0f)
+		return;
+
+	cv::Mat scaled;
+	cv::resize(img, scaled, cv::Size((int)(w + 0.5f), (int)(h + 0.5f)));
+
+	cv::Point2f sc(scaled.cols * 0.5f, scaled.rows * 0.5f);
+	cv::Mat m = cv::getRotationMatrix2D(sc, -angle_deg, 1.0); // + = antihorario; aqui el panel usa horario
+	cv::Rect bbox = cv::RotatedRect(sc, cv::Size2f((float)scaled.cols, (float)scaled.rows),
+	                                angle_deg)
+	                        .boundingRect();
+	m.at<double>(0, 2) += bbox.width * 0.5 - scaled.cols * 0.5;
+	m.at<double>(1, 2) += bbox.height * 0.5 - scaled.rows * 0.5;
+
+	cv::Mat rot, rotmask;
+	cv::warpAffine(scaled, rot, m, bbox.size());
+	cv::Mat mask(scaled.size(), CV_8UC1, cv::Scalar(255));
+	cv::warpAffine(mask, rotmask, m, bbox.size());
+
+	const int x0 = (int)(center.x - bbox.width * 0.5 + 0.5f);
+	const int y0 = (int)(center.y - bbox.height * 0.5 + 0.5f);
+	cv::Rect dst_r(x0, y0, bbox.width, bbox.height);
+	dst_r &= cv::Rect(0, 0, dst.cols, dst.rows);
+	if (dst_r.width <= 0 || dst_r.height <= 0)
+		return;
+	const cv::Rect src_r(dst_r.x - x0, dst_r.y - y0, dst_r.width, dst_r.height);
+
+	cv::Mat roi = dst(dst_r);
+	cv::Mat blended;
+	cv::addWeighted(roi, 1.0, rot(src_r), 0.85, 0.0, blended);
+	blended.copyTo(roi, rotmask(src_r));
 }
 
 void detect_filter_obb_video_tick(void *data, float seconds)
@@ -2086,11 +2251,24 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				tc.player_idx = -1;
 				for (int pi = 0; pi < tf->player_count; pi++) {
 					auto& pl = tf->players[pi];
+					if (!pl.active)
+						continue; // jugador fuera de partida: su sitio queda libre
 					auto checkZone = [&](const filter_data::PlayerZone& z, bool crypt) {
 						float zx = z.nx * fw, zy = z.ny * fh;
 						float zw = z.nw * fw, zh = z.nh * fh;
-						if (c.x >= zx && c.x <= zx + zw &&
-							c.y >= zy && c.y <= zy + zh) {
+						float dx = c.x - (zx + zw * 0.5f);
+						float dy = c.y - (zy + zh * 0.5f);
+						if (z.angle != 0.0f) {
+							// Zona rotada (positivo = horario): se pasa el punto
+							// al sistema de la zona aplicando el giro inverso.
+							const float ra = z.angle * kPI / 180.0f;
+							const float ca = std::cos(ra), sa = std::sin(ra);
+							const float rx = ca * dx + sa * dy;
+							const float ry = -sa * dx + ca * dy;
+							dx = rx;
+							dy = ry;
+						}
+						if (std::fabs(dx) <= zw * 0.5f && std::fabs(dy) <= zh * 0.5f) {
 							tc.player_idx = pi;
 							tc.in_crypt = crypt;
 							return true;
@@ -2252,150 +2430,183 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			if (tf->overlay_bg.empty()) {
 				char *bgPath = obs_module_file("overlay-bg.png");
 				if (bgPath) {
-					// IMREAD_UNCHANGED conserva el canal alfa: esta imagen es 67% transparente,
-					// con IMREAD_COLOR el centro vacio se volveria negro opaco y taparia la camara.
+					// IMREAD_UNCHANGED conserva el canal alfa: el hueco central
+					// (la ventana de camara) es transparente; con IMREAD_COLOR
+					// se volveria negro opaco y taparia la camara.
 					tf->overlay_bg = cv::imread(bgPath, cv::IMREAD_UNCHANGED);
 					bfree(bgPath);
 				}
 			}
 
 			int fw = frame.cols, fh = frame.rows;
+			const OverlayFit fit = overlayFit(fw, fh);
 
-				cv::Mat display = cv::Mat::zeros(fh, fw, CV_8UC3);
-			// 2. Create display: background as base, source on top as centered window
-			if (!tf->overlay_bg.empty()) {
-				// El overlay se escala ENTERO para caber en la escena: nada se recorta y
-				// sobran bandas negras a los lados. Se respeta el 3:2 del diseño.
-				const int bw = tf->overlay_bg.cols, bh = tf->overlay_bg.rows;
-				if (bw > 0 && bh > 0) {
-					// Escalar al mayor tamaño que quepa, conservando la proporcion
-					const double esc = std::min((double)fw / bw, (double)fh / bh);
-					const int dw = (int)(bw * esc + 0.5), dh = (int)(bh * esc + 0.5);
-					cv::Mat overlay;
-					cv::resize(tf->overlay_bg, overlay, cv::Size(dw, dh), 0, 0, cv::INTER_AREA);
-					const int ox = (fw - dw) / 2, oy = (fh - dh) / 2;
-					if (overlay.channels() == 4) {
-						cv::Mat bgr3, alfa;
-						cv::cvtColor(overlay, bgr3, cv::COLOR_BGRA2BGR);
-						cv::extractChannel(overlay, alfa, 3);
-						cv::Mat mascara;
-						cv::threshold(alfa, mascara, 0, 255, cv::THRESH_BINARY);
-						bgr3.copyTo(display(cv::Rect(ox, oy, dw, dh)), mascara);
-					} else {
-						overlay.copyTo(display(cv::Rect(ox, oy, dw, dh)));
-					}
-				}
-			} else {
-				display = cv::Mat(fh, fw, CV_8UC3, cv::Scalar(15, 15, 40));
-			}
-
-			// Place source frame (with detection boxes) into display as centered area
-			{
-				int margin_pct = 5;
-				int sw = fw * (100 - 2 * margin_pct) / 100;
-				int sh = fh * (100 - 2 * margin_pct) / 100;
-				int sx = (fw - sw) / 2;
-				int sy = (fh - sh) / 2;
+			cv::Mat display = cv::Mat::zeros(fh, fw, CV_8UC3);
+			// 2. Camara DENTRO del hueco del overlay y POR DEBAJO de el: se
+			// ajusta entera (sin recorte) dentro de la ventana del diseño y el
+			// overlay (marco, panel, ankh) se dibuja despues, encima. Las
+			// zonas de jugador (coords 0..1 de camara) se mapean a `cam`.
+			const cv::Rect cam = tf->overlay_bg.empty()
+				? cv::Rect(0, 0, fw, fh)
+				: cameraFitRect(fit, fw, fh);
+			if (cam.width > 4 && cam.height > 4 && !frame.empty()) {
 				cv::Mat src_resized;
-				cv::resize(frame, src_resized, cv::Size(sw, sh));
-				src_resized.copyTo(display(cv::Rect(sx, sy, sw, sh)));
+				cv::resize(frame, src_resized, cv::Size(cam.width, cam.height));
+				src_resized.copyTo(display(cam));
 			}
 
-			// 3. Draw player pool & names on left side (on display)
-			int pool_left = 8;
-			int pool_top = (int)(fh * 0.02f);
-			int pool_line_h = (int)(fh * 0.045f);
-			if (pool_line_h < 18) pool_line_h = 18;
-			int pool_bar_h = (int)(fh * 0.025f);
-			if (pool_bar_h < 6) pool_bar_h = 6;
+			// 2b. Zonas de jugadores (toggle): dibuja los rectangulos de minions
+			// y cripta de cada jugador (con su rotacion) sobre la ventana de
+			// camara para poder ajustar X/Y/W/H/angulo viendo donde caen. Las
+			// zonas van en coordenadas de camara (0..1); un jugador fuera de
+			// partida (ousted) se dibuja en gris y su zona no asigna cartas.
+			if (tf->show_zones) {
+				const cv::Scalar palette[5] = {
+					cv::Scalar(60, 220, 60),   // verde
+					cv::Scalar(255, 160, 0),   // azul
+					cv::Scalar(0, 60, 255),    // rojo
+					cv::Scalar(0, 220, 220),   // amarillo
+					cv::Scalar(220, 60, 220),  // magenta
+				};
+				for (int pi = 0; pi < tf->player_count; pi++) {
+					auto& pl = tf->players[pi];
+					const cv::Scalar col = pl.active ? palette[pi % 5]
+					                                 : cv::Scalar(140, 140, 140);
+					auto drawZone = [&](const filter_data::PlayerZone& z, const char* tag) {
+						const cv::Point2f zc(
+							(float)(cam.x + (z.nx + z.nw * 0.5) * cam.width),
+							(float)(cam.y + (z.ny + z.nh * 0.5) * cam.height));
+						const cv::Size2f zs((float)(z.nw * cam.width),
+						                    (float)(z.nh * cam.height));
+						if (zs.width < 4.0f || zs.height < 4.0f)
+							return;
+						cv::RotatedRect rr(zc, zs, z.angle);
+						cv::Point2f pts[4];
+						rr.points(pts);
 
-			for (int pi = 0; pi < tf->player_count; pi++) {
+						// Relleno translucido dentro del poligono rotado
+						cv::Rect br = rr.boundingRect() & cv::Rect(0, 0, fw, fh);
+						if (br.width < 4 || br.height < 4)
+							return;
+						cv::Point ap[4], lp[4];
+						for (int i = 0; i < 4; i++) {
+							ap[i] = cv::Point((int)(pts[i].x + 0.5f),
+							                  (int)(pts[i].y + 0.5f));
+							lp[i] = cv::Point(ap[i].x - br.x, ap[i].y - br.y);
+						}
+						cv::Mat mask(display(br).size(), CV_8UC1, cv::Scalar(0));
+						cv::fillConvexPoly(mask, lp, 4, cv::Scalar(255));
+						cv::Mat tinted;
+						cv::addWeighted(display(br), 0.88,
+						                cv::Mat(br.size(), display.type(), col), 0.12,
+						                0.0, tinted);
+						tinted.copyTo(display(br), mask);
+
+						// Borde del poligono
+						std::vector<std::vector<cv::Point>> poly = {
+							{ap[0], ap[1], ap[2], ap[3]}};
+						cv::polylines(display, poly, true, col, 2);
+
+						// Etiqueta junto al vertice superior del rectangulo
+						std::string label = pl.name + " - " + tag;
+						if (!pl.active)
+							label += std::string(" [") + tf_text("ZoneOut") + "]";
+						cv::Point2f top = pts[0];
+						for (int i = 1; i < 4; i++)
+							if (pts[i].y < top.y)
+								top = pts[i];
+						const double fs = 0.45;
+						int baseline = 0;
+						cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX,
+						                              fs, 1, &baseline);
+						cv::Rect lr((int)(top.x + 3.0f), (int)(top.y + 3.0f),
+						            ts.width + 10, ts.height + 8);
+						lr &= cv::Rect(0, 0, fw, fh);
+						if (lr.width > 0 && lr.height > 0) {
+							cv::Mat label_bg;
+							cv::addWeighted(display(lr), 0.4,
+							                cv::Mat(lr.size(), display.type(),
+							                        cv::Scalar(20, 20, 20)), 0.6,
+							                0.0, label_bg);
+							label_bg.copyTo(display(lr));
+							cv::putText(display, label,
+							            cv::Point(lr.x + 6, lr.y + ts.height + 4),
+							            cv::FONT_HERSHEY_SIMPLEX, fs, col, 1);
+						}
+					};
+					drawZone(pl.minion_zone, tf_text("ZoneMinions"));
+					drawZone(pl.crypt_zone, tf_text("ZoneCrypt"));
+				}
+			}
+
+			// 2c. El diseño del overlay ENCIMA (marco, panel, ankh): la camara
+			// queda por debajo y solo se ve por el hueco transparente. Mezcla
+			// con el canal alfa real: enmascarar en binario dejaba un reborde
+			// oscuro en el filo anti-aliaseado del hueco.
+			if (!tf->overlay_bg.empty()) {
+				const int dw = (int)(kOverlayRefW * fit.esc + 0.5);
+				const int dh = (int)(kOverlayRefH * fit.esc + 0.5);
+				cv::Rect dst = cv::Rect(fit.ox, fit.oy, dw, dh) & cv::Rect(0, 0, fw, fh);
+				if (dst.width > 4 && dst.height > 4) {
+					cv::Mat ov;
+					cv::resize(tf->overlay_bg, ov, cv::Size(dw, dh), 0, 0, cv::INTER_AREA);
+					if (ov.channels() == 4) {
+						cv::Mat ov3;
+						cv::cvtColor(ov, ov3, cv::COLOR_BGRA2BGR);
+						cv::Mat af;
+						cv::extractChannel(ov, af, 3);
+						cv::Mat af_inv;
+						cv::subtract(cv::Scalar::all(255.0), af, af_inv);
+						std::vector<cv::Mat> oc, dc;
+						cv::split(ov3, oc);
+						cv::split(display(dst), dc);
+						for (int c = 0; c < 3; c++) {
+							cv::Mat t1, t2;
+							cv::multiply(oc[c], af, t1, 1.0 / 255.0);
+							cv::multiply(dc[c], af_inv, t2, 1.0 / 255.0);
+							cv::add(t1, t2, dc[c]);
+						}
+						cv::merge(dc, ov3);
+						ov3.copyTo(display(dst));
+					} else {
+						ov.copyTo(display(dst));
+					}
+				}
+			}
+
+			// 3. Casillas de jugador del panel izquierdo: el nombre y el valor
+			// de pool van DENTRO de las casillas del diseño (el overlay ya
+			// esta dibujado debajo del texto). Un jugador fuera de partida
+			// (ousted) se muestra atenuado.
+			for (int pi = 0; pi < tf->player_count && pi < 5; pi++) {
 				auto& pl = tf->players[pi];
-				int y = pool_top + pi * pool_line_h;
-
-				int bar_w = (int)(fw * 0.04f);
-				if (bar_w < 40) bar_w = 40;
-				cv::Rect bar_bg(pool_left, y, bar_w, pool_bar_h);
-				cv::rectangle(display, bar_bg, cv::Scalar(40, 40, 40), -1);
-
-				float pool_frac = std::min(1.0f, pl.pool / 30.0f);
-				cv::Scalar bar_color(
-					(int)(255 * (1.0f - pool_frac)),
-					(int)(255 * pool_frac),
-					0);
-				int fill_w = (int)(bar_w * pool_frac);
-				if (fill_w > 0) {
-					cv::Rect bar_fill(pool_left, y, fill_w, pool_bar_h);
-					cv::rectangle(display, bar_fill, bar_color, -1);
-				}
-
-				std::string pool_text = pl.name + ": " + std::to_string(pl.pool);
-				cv::putText(display, pool_text,
-					cv::Point2f((float)(pool_left + bar_w + 6), (float)(y + pool_bar_h - 2)),
-					cv::FONT_HERSHEY_SIMPLEX, 0.4f, cv::Scalar(200, 200, 200), 1);
+				const cv::Rect name_box =
+					designRect(fit, kNameX, kSlotY[pi], kNameW, kSlotH);
+				const cv::Rect pool_box =
+					designRect(fit, kPoolX, kSlotY[pi], kPoolW, kSlotH);
+				const cv::Scalar slot_col = pl.active ? cv::Scalar(235, 228, 214)
+				                                      : cv::Scalar(115, 112, 108);
+				drawTextInBox(display, pl.name, name_box, slot_col,
+				              name_box.height * 0.42 / 22.0);
+				drawTextInBox(display, std::to_string(pl.pool), pool_box, slot_col,
+				              pool_box.height * 0.55 / 22.0);
 			}
 
-			// 4. Draw tracked cards in their player zones (on display)
+			// 4. Las cartas rastreadas ya no se pintan en su zona de jugador:
+			// la unica carta que se renderiza es la ultima detectada, sobre el
+			// ankh del panel izquierdo (bloque 4b, mas abajo).
+
+			// 4b. Carta principal: se muestra ENTERA (el escaneo completo de la
+			// cache, sin recortar los lados) sobre el ankh del panel izquierdo.
+			// Con el toggle "carta grande" se dibuja a media pantalla, centrada
+			// y por encima de todo, para retransmisiones vistas en un movil.
+			cv::Rect shown_card;       // rect de la carta mostrada (frame px)
+			double shown_metric = 1.0; // factor de metrica para el texto de rulings
 			{
 				std::lock_guard<std::mutex> lock(tf->game_state_lock);
-				for (auto& [tid, tc] : tf->tracked_cards) {
-					if (tc.player_idx < 0 || tc.player_idx >= tf->player_count)
-						continue;
-					auto& zone = tc.in_crypt
-						? tf->players[tc.player_idx].crypt_zone
-						: tf->players[tc.player_idx].minion_zone;
-
-					int zx = (int)(zone.nx * fw);
-					int zy = (int)(zone.ny * fh);
-					int zw = (int)(zone.nw * fw);
-					int zh = (int)(zone.nh * fh);
-
-					cv::Rect zone_rect(zx, zy, zw, zh);
-					zone_rect &= cv::Rect(0, 0, fw, fh);
-					if (zone_rect.width < 8 || zone_rect.height < 8)
-						continue;
-
-					if (!tc.card_image.empty()) {
-						cv::Mat card_resized;
-						cv::resize(tc.card_image, card_resized,
-							cv::Size(zone_rect.width, zone_rect.height));
-						cv::addWeighted(
-							display(zone_rect), 1.0,
-							card_resized, 0.85,
-							0.0, display(zone_rect));
-					}
-
-					if (tf->preview) {
-						cv::Scalar lock_color = (tc.lock_state == filter_data::CardLockState::Unlocked)
-							? cv::Scalar(0, 220, 0)
-							: cv::Scalar(0, 0, 220);
-						cv::rectangle(display, zone_rect, lock_color, 2);
-
-						const char* icon = (tc.lock_state == filter_data::CardLockState::Unlocked)
-							? "U" : "L";
-						cv::putText(display, icon,
-							cv::Point2f((float)(zone_rect.x + 4), (float)(zone_rect.y + 16)),
-							cv::FONT_HERSHEY_SIMPLEX, 0.5f, lock_color, 2);
-						cv::putText(display, tc.card_name.empty() ? "?" : tc.card_name,
-							cv::Point2f((float)(zone_rect.x + 20), (float)(zone_rect.y + 16)),
-							cv::FONT_HERSHEY_SIMPLEX, 0.4f, cv::Scalar(220, 220, 220), 1);
-					}
-				}
-			}
-
-			// 4b. Carta principal sobre el ankh del overlay
-			// Se coloca la ultima carta detectada sobre el simbolo, tapandolo por
-			// completo y sin sobresalir del panel izquierdo.
-			{
-				std::lock_guard<std::mutex> lock(tf->game_state_lock);
-				// Escala del overlay respecto a su diseno de referencia: si la escena
-				// no es 1920x1080, la caja del ankh se reescala con la misma proporcion.
-				const double osx = (double)fw / kOverlayRefW;
-				const double osy = (double)fh / kOverlayRefH;
-				int ax = (int)(kAnkhX * osx + 0.5);
-				int ay = (int)(kAnkhY * osy + 0.5);
-				int aw = (int)(kAnkhW * osx + 0.5);
-				int ah = (int)(kAnkhH * osy + 0.5);
+				// Caja del ankh en pixeles del frame: la misma transformacion
+				// que coloca el resto del diseño (escala + centrado).
+				const cv::Rect abox = designRect(fit, kAnkhX, kAnkhY, kAnkhW, kAnkhH);
 
 				// Ultima carta detectada (la de track_id mas alto, la mas reciente).
 				filter_data::TrackedCardState *principal = nullptr;
@@ -2407,37 +2618,52 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				}
 
 				if (principal) {
-					// La carta se escala hasta cubrir el ankh. Se respeta su proporcion
-					// real y se recorta lo que sobresalga, de modo que el ankh queda
-					// siempre tapado y la carta jamas se sale del panel.
 					const double cw = principal->card_image.cols;
 					const double ch = principal->card_image.rows;
 					if (cw > 0 && ch > 0) {
-						// Escalar para que cubra: se usa el factor mayor de los dos.
-						const double esc = std::max((double)aw / cw, (double)ah / ch);
-						int rw = (int)(cw * esc + 0.5);
-						int rh = (int)(ch * esc + 0.5);
-						cv::Mat carta;
-						cv::resize(principal->card_image, carta, cv::Size(rw, rh), 0, 0,
-						            cv::INTER_AREA);
+						// Carta completa (contain) centrada dentro de una caja:
+						// nunca se recortan los lados.
+						auto fitInto = [&](const cv::Rect& box) {
+							const double esc = std::min((double)box.width / cw,
+							                            (double)box.height / ch);
+							const int rw = (int)(cw * esc + 0.5);
+							const int rh = (int)(ch * esc + 0.5);
+							return cv::Rect(box.x + (box.width - rw) / 2,
+							                box.y + (box.height - rh) / 2, rw, rh);
+						};
+						// Referencia de metrica: la carta normal sobre el ankh
+						// (su alto fija el tamaño del texto de los rulings).
+						const cv::Rect normal = fitInto(abox);
 
-						// Centrada sobre la caja del ankh
-						int cx = ax + (aw - rw) / 2;
-						int cy = ay + (ah - rh) / 2;
-
-						// Recorte visible dentro de la caja del ankh
-						int vx0 = std::max(cx, ax), vy0 = std::max(cy, ay);
-						int vx1 = std::min(cx + rw, ax + aw);
-						int vy1 = std::min(cy + rh, ay + ah);
-						if (vx1 > vx0 && vy1 > vy0) {
-							cv::Rect destino(vx0, vy0, vx1 - vx0, vy1 - vy0);
-							destino &= cv::Rect(0, 0, fw, fh);
-							if (destino.width > 0 && destino.height > 0) {
-								cv::Rect fuente(vx0 - cx, vy0 - cy, destino.width,
-								               destino.height);
-								carta(fuente).copyTo(display(destino));
+						if (tf->big_card) {
+							// Media pantalla: alto = 50% del frame, centrada
+							// (puede tapar el resto de objetos: es lo buscado).
+							int hh = (int)(fh * 0.5 + 0.5);
+							int ww = (int)(hh * cw / ch + 0.5);
+							const int max_w = (int)(fw * 0.9);
+							if (ww > max_w) {
+								ww = max_w;
+								hh = (int)(ww * ch / cw + 0.5);
 							}
+							shown_card = cv::Rect((fw - ww) / 2, (fh - hh) / 2, ww, hh);
+						} else {
+							shown_card = normal;
 						}
+
+						const cv::Rect dst = shown_card & cv::Rect(0, 0, fw, fh);
+						if (dst.width > 0 && dst.height > 0) {
+							cv::Mat carta;
+							cv::resize(principal->card_image, carta,
+							           cv::Size(shown_card.width, shown_card.height),
+							           0, 0, cv::INTER_AREA);
+							const cv::Rect src(dst.x - shown_card.x,
+							                   dst.y - shown_card.y, dst.width,
+							                   dst.height);
+							carta(src).copyTo(display(dst));
+						}
+
+						if (normal.height > 0)
+							shown_metric = (double)shown_card.height / normal.height;
 					}
 				}
 			}
@@ -2464,7 +2690,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 
 					if (cache_it != tf->card_image_cache.end()) {
 						int banner_left = (int)(fw * 0.02f);
-						int banner_top = pool_top + tf->player_count * pool_line_h + (int)(fh * 0.02f);
+						int banner_top = (int)(fh * (0.04f + tf->player_count * 0.045f));
 						int banner_w = (int)(fw * 0.24f);
 						int banner_h = fh - banner_top - (int)(fh * 0.02f);
 
@@ -2486,11 +2712,11 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 
 		// 6. Rulings de la carta principal, sobre la propia carta
 		//
-		// El panel no tiene ningun hueco libre: la rejilla de 10 ranuras ocupa
-		// y=86..518 y el ankh (donde va la carta) y=507..1015 sobre la
-		// referencia 1920x1080. Decision actual: los rulings se dibujan sobre
-		// la carta, en una caja que abarca el interior del panel, con un velo
-		// oscuro detras para que el texto se lea sobre la ilustracion.
+		// El panel no tiene ningun hueco libre: las casillas de jugador ocupan
+		// y=89..455 y el ankh (donde va la carta) y=482..960 sobre el diseño
+		// (1536x1024). Decision actual: los rulings se dibujan directamente
+		// sobre la carta mostrada, en una caja un poco mas ancha que ella y
+		// sin recuadro de fondo.
 		//
 		// El texto no se recorta por abajo: la caja es un viewport sobre el
 		// texto completo y cuanto se ve de el lo mueve el slider
@@ -2513,29 +2739,22 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 					? tf->vtes_db.get_by_id(principal->card_id)
 					: nullptr;
 
-				if (entry && entry->has_rulings()) {
-					// Escalar la caja y la metrica de texto con la misma proporcion
-					// que el resto del overlay, para que el ajuste de lineas
-					// coincida con lo que realmente se dibuja.
-					const double osy = (double)fh / kOverlayRefH;
-					const double osx = (double)fw / kOverlayRefW;
-
-					// La caja nace donde empieza la carta sobre el ankh y mide lo
-					// que mide el ankh, para quedarse sobre la carta. El ancho es
-					// el del interior del panel, mas ancho que la carta, porque a
-					// 0.55 de escala de fuente 196 px dan unas 21 letras por
-					// linea y los rulings se vuelven ilegibles.
+				if (entry && entry->has_rulings() && shown_card.width > 0 &&
+				    shown_card.height > 0) {
+					// La caja nace donde esta la carta mostrada (sobre el ankh
+					// o a media pantalla) y es un poco mas ancha que ella,
+					// porque con la caja estrecha los rulings se volvian
+					// ilegibles. La metrica del texto escala con el tamaño de
+					// la carta (shown_metric), no con el overlay.
 					const int pad = 2;
-					// x y w se escalan con osx igual que y y h con osy: el ankh
-					// del bloque 4b se escala con los dos, y si aqui solo se usara
-					// osy la caja se desviaria en horizontal en cualquier escena que
-					// no sea 1920x1080.
+					const int side = (int)(12 * fit.esc + 0.5);
 					vtes_overlay::RulingsBox box;
-					box.x = (int)(158 * osx + 0.5);
-					box.w = (int)(280 * osx + 0.5);
-					box.y = (int)((kAnkhY + pad) * osy + 0.5);
-					box.h = (int)((kAnkhH - 2 * pad) * osy + 0.5);
+					box.x = shown_card.x - side;
+					box.w = shown_card.width + 2 * side;
+					box.y = shown_card.y + pad;
+					box.h = shown_card.height - 2 * pad;
 
+					const double osy = fit.esc * shown_metric;
 					const int lh = (int)(vtes_overlay::kRulingsLineHeight * osy + 0.5);
 					const double fs = vtes_overlay::kRulingsFontScale * osy;
 
@@ -2559,24 +2778,8 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 						vtes_overlay::buildRulingsLayout(entry, box, measure);
 
 					if (!layout.lines.empty() && lh > 0 && box.w > 0) {
-						// El velo se limita a la franja que ocupan las lineas
-						// (mas una para el aviso), no a la caja entera: una
-						// carta con dos rulings ocupa 10 lineas y oscurecer los
-						// 504 px taparia la ilustracion sin motivo. Sin el, las
-						// zonas claras de la ilustracion se comen el texto gris.
-						{
-							const int alto_velo = std::min(
-								box.h, ((int)layout.lines.size() + 1) * lh);
-							cv::Rect velo(box.x - 2, box.y - 2,
-							              box.w + 4, alto_velo + 4);
-							velo &= cv::Rect(0, 0, fw, fh);
-							if (velo.width > 0 && velo.height > 0) {
-								cv::Mat roi = display(velo);
-								cv::addWeighted(roi, 0.28,
-								                cv::Scalar(8, 8, 12),
-								                0.0, 0.0, roi);
-							}
-						}
+						// Sin recuadro de fondo: el texto se dibuja directo
+						// sobre la carta (peticion del usuario, 2026-10-17).
 
 						// El slider es un porcentaje del desplazamiento maximo
 						// de esta carta: con dos rulings el maximo es 0 y el
