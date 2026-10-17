@@ -1,15 +1,25 @@
 #ifndef VTES_CUDA_KERNEL_LAUNCHER_H
 #define VTES_CUDA_KERNEL_LAUNCHER_H
 
+// ─── PTX module loader for CUDA kernels ───────────────────────────────
+// Loads PTX at runtime via CUDA Driver API, bypassing nvcc/cudafe++.
+// All errors logged to stderr for OBS capture.
+//
+// CMake only compiles src/cuda/cuda_kernel_launcher.cpp and links the CUDA
+// runtime when the toolkit is present, and in that case defines
+// HAVE_CUDA_NIS. This header is included unconditionally from
+// nis_upscaler.hpp and vampire_classifier.cpp, so without this guard a
+// machine with no CUDA toolkit fails to build on the <cuda.h> include.
+// When the toolkit is missing a no-op stub with the same interface keeps
+// the callers compiling and the CUDA path simply disabled at runtime.
+
+#ifdef HAVE_CUDA_NIS
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cstdio>
 
 #define CUDA_HISTOGRAM_BINS 36
-
-// ─── PTX module loader for CUDA kernels ───────────────────────────────
-// Loads PTX at runtime via CUDA Driver API, bypassing nvcc/cudafe++.
-// All errors logged to stderr for OBS capture.
 
 class CudaKernelLauncher {
 public:
@@ -51,4 +61,28 @@ private:
                 void** args, unsigned int shared_mem = 0);
 };
 
-#endif
+#else  // !HAVE_CUDA_NIS — no CUDA toolkit available
+
+#include <cstdio>
+
+class CudaKernelLauncher {
+public:
+    CudaKernelLauncher() = default;
+    ~CudaKernelLauncher() = default;
+
+    // Always unavailable: the PTX module is never loaded.
+    bool init(const char*) { return false; }
+    bool is_available() const { return false; }
+
+    bool lanczos_upscale(const float*, int, int, float*, int, int, int)
+    { return false; }
+    bool adaptive_sharpen(const float*, float*, int, int, int)
+    { return false; }
+    bool edge_orientation_histogram(const unsigned char*, int, int, int,
+                                    int, int, int, int, float, int*)
+    { return false; }
+};
+
+#endif  // HAVE_CUDA_NIS
+
+#endif  // VTES_CUDA_KERNEL_LAUNCHER_H

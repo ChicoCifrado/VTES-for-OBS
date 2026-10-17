@@ -10,6 +10,20 @@
 #include <cstring>
 #include <cstdlib>
 
+// A rule reference (LSJ ruling citation). The ruling text already embeds the
+// citation between brackets, so this only carries the link target.
+struct VTESCardReference {
+    std::string label;
+    std::string url;
+};
+
+// One official ruling for a card. 5116 rulings across 2018 cards in vtes.json.
+struct VTESCardRuling {
+    std::string text;                      // full text, citation already included
+    std::string group;                     // optional grouping heading
+    std::vector<VTESCardReference> references;
+};
+
 struct VTESCardEntry {
     int id = 0;
     std::string name;
@@ -22,8 +36,11 @@ struct VTESCardEntry {
     std::vector<std::string> clans;
     std::vector<std::string> disciplines;
     std::vector<std::string> name_variants;
+    std::vector<VTESCardRuling> rulings;
     int capacity = 0;
     int group = 0;
+
+    bool has_rulings() const { return !rulings.empty(); }
 };
 
 class VTESCardDatabase {
@@ -61,6 +78,32 @@ public:
                 if (card.contains("name_variants")) {
                     for (const auto& v : card["name_variants"])
                         entry.name_variants.push_back(v.get<std::string>());
+                }
+                if (card.contains("rulings") && card["rulings"].is_array()) {
+                    for (const auto& r : card["rulings"]) {
+                        if (!r.is_object()) continue;
+                        VTESCardRuling ruling;
+                        ruling.text = r.value("text", "");
+                        ruling.group = r.value("group", "");
+
+                        // Ruling text always embeds the citation (e.g. "[LSJ 20011022]"),
+                        // so only the link target is kept from each reference.
+                        if (r.contains("references") && r["references"].is_array()) {
+                            for (const auto& ref : r["references"]) {
+                                if (!ref.is_object()) continue;
+                                VTESCardReference reference;
+                                reference.label = ref.value("label", "");
+                                reference.url = ref.value("url", "");
+                                if (!reference.url.empty())
+                                    ruling.references.push_back(std::move(reference));
+                            }
+                        }
+
+                        // Drop empty rulings: they carry no information for either
+                        // the web view or the overlay.
+                        if (!ruling.text.empty())
+                            entry.rulings.push_back(std::move(ruling));
+                    }
                 }
                 if (card.contains("_i18n") && card["_i18n"].is_object()) {
                     auto &i18n = card["_i18n"];

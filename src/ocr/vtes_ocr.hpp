@@ -74,7 +74,7 @@ private:
     // skip the card-type banner and target the actual card name below it.
     cv::Mat detectNameRegion(const cv::Mat& card_bgr,
                              const std::string& card_type_hint = "");
-    cv::Mat preprocessForOcr(const cv::Mat& region);
+    cv::Mat preprocessForOcr(const cv::Mat& region, bool already_upscaled = false);
     std::tuple<std::string, std::string, float> fuzzyMatch(const std::string& ocr_text);
 };
 

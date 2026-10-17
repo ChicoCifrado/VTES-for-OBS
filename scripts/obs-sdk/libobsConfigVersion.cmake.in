@@ -1,0 +1,16 @@
+# Version del SDK local. make_obs_sdk.bat sustituye @OBS_VERSION@ y
+# @OBS_VERSION_MAJOR@ por los de la instalacion de OBS usada para generarlo.
+set(PACKAGE_VERSION "@OBS_VERSION@")
+
+if(PACKAGE_VERSION VERSION_LESS PACKAGE_FIND_VERSION)
+  set(PACKAGE_VERSION_COMPATIBLE FALSE)
+elseif(PACKAGE_FIND_VERSION_MAJOR AND NOT PACKAGE_FIND_VERSION_MAJOR STREQUAL "@OBS_VERSION_MAJOR@")
+  # Como el libobs oficial: solo se considera compatible dentro de la misma
+  # version mayor (una ABI de libobs no promete mas que eso).
+  set(PACKAGE_VERSION_COMPATIBLE FALSE)
+else()
+  set(PACKAGE_VERSION_COMPATIBLE TRUE)
+  if(PACKAGE_VERSION VERSION_EQUAL PACKAGE_FIND_VERSION)
+    set(PACKAGE_VERSION_EXACT TRUE)
+  endif()
+endif()

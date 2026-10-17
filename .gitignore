@@ -23,6 +23,11 @@ data/models/*.onnx
 *.pth
 *.pt
 
+# Datasets de cartas descargados de krcg (para entrenar/validar)
+data/card-cache/
+data/card-cache-es/
+data/train_root/
+
 # Large dataset files
 data/vtes.json
 data/card-hash-index.json
@@ -50,6 +55,8 @@ cmake_install.cmake
 Makefile
 *.cmake
 !cmake/**/*.cmake
+# El config del SDK local (.deps/obs-sdk) es fuente, no generado
+!scripts/obs-sdk/*.cmake
 
 # Visual Studio / MSBuild
 *.user
@@ -85,3 +92,8 @@ ipch/
 *.swo
 *~
 .vscode/
+
+# Libreria de importacion de cudart generada por scripts/gen_cudart_lib.py
+# (permite enlazar sin toolkit CUDA instalado)
+!cudalib/*.lib
+!cudalib/*.exp

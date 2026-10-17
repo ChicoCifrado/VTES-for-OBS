@@ -58,19 +58,23 @@ bool NISUpscaler::init(int device_id)
 #ifdef HAVE_CUDA_NIS
 bool NISUpscaler::ensure_buffers(int h, int w)
 {
-    int out_h = h * scale();
-    int out_w = w * scale();
-    int max_in = h * w * 3 * sizeof(float);
-    int max_out = out_h * out_w * 3 * sizeof(float);
+    const size_t in_bytes = (size_t)h * w * 3 * sizeof(float);
+    const size_t out_bytes = (size_t)h * scale() * w * scale() * 3 * sizeof(float);
 
-    if (max_in > alloc_h_ * alloc_w_ * 3) {
-        free_buffers();
-        CUDA_SAFE(cudaMalloc(&d_input_, max_in));
-        CUDA_SAFE(cudaMalloc(&d_temp_, max_in));
-        CUDA_SAFE(cudaMalloc(&d_output_, max_out));
-        alloc_h_ = h;
-        alloc_w_ = w;
-    }
+    // Reusar solo si los tres buffers existen y el area de entrada no crecio.
+    // (La condicion anterior mezclaba bytes con pixeles y re-asignaba en cada
+    // frame; ademas d_temp_ se asignaba con tamano de ENTRADA pero recibe la
+    // copia del resultado 4x — 16x mayor — desbordando la memoria CUDA y
+    // corrompiendo las asignaciones vecinas, la propia imagen incluida.)
+    if (d_input_ && d_temp_ && d_output_ && (size_t)h * w <= (size_t)alloc_h_ * alloc_w_)
+        return true;
+
+    free_buffers();
+    CUDA_SAFE(cudaMalloc(&d_input_, in_bytes));
+    CUDA_SAFE(cudaMalloc(&d_temp_, out_bytes));
+    CUDA_SAFE(cudaMalloc(&d_output_, out_bytes));
+    alloc_h_ = h;
+    alloc_w_ = w;
     return true;
 }
 

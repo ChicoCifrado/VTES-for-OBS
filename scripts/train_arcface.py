@@ -213,11 +213,15 @@ def export_onnx(backbone, embedding, output_path: str, input_size: int = 224,
 
     model = Embedder(backbone, embedding).eval().to(device)
     dummy = torch.randn(1, 3, input_size, input_size).to(device)
+    # dynamo=False: el exporter TorchScript incluye kernel_shape en los Conv
+    # (el exporter dynamo por defecto lo omite y OpenCV DNN del plugin no
+    # puede parsear el grafo).
     torch.onnx.export(
         model, dummy, output_path,
         input_names=['input'], output_names=['embedding'],
         dynamic_axes={'input': {0: 'batch_size'}, 'embedding': {0: 'batch_size'}},
         opset_version=18,
+        dynamo=False,
     )
     print(f"[Export] ONNX saved: {output_path}")
 
@@ -325,6 +329,8 @@ def main():
                         help='Resume from arcface_checkpoint_last.pth')
     parser.add_argument('--no-build-index', action='store_true',
                         help='Skip embedding index rebuild after training')
+    parser.add_argument('--no-pin', action='store_true',
+                        help='Disable DataLoader pin_memory (WSL2 pinned memory limits)')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -341,7 +347,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=min(4, os.cpu_count() or 1) if os.name != 'nt' else 0,
-        pin_memory=True,
+        pin_memory=not args.no_pin,
         drop_last=True,
     )
 

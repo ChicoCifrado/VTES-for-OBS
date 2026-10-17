@@ -14,6 +14,19 @@
 #include <opencv2/dnn.hpp>
 
 static constexpr float kPI = 3.14159265358979323846f;
+// ─── Overlay: geometria de referencia ───────────────────────────────────────
+// Dimensiones de la escena para las que se ajusto el diseño del overlay.
+// La imagen original es 1536x1024 (3:2) y se escala entera para caber,
+// dejando bandas negras a los lados en una escena 16:9.
+static constexpr int kOverlayRefW = 1920;
+static constexpr int kOverlayRefH = 1080;
+// Caja del simbolo ankh sobre la que se coloca la carta detectada,
+// medida sobre el diseño escalado a 1920x1080. La carta lo tapa por completo
+// y no sobresale del panel izquierdo.
+static constexpr int kAnkhX = 192;
+static constexpr int kAnkhY = 507;
+static constexpr int kAnkhW = 200;
+static constexpr int kAnkhH = 508;
 
 #include <numeric>
 #include <memory>
@@ -44,6 +57,7 @@ static constexpr float kPI = 3.14159265358979323846f;
 #endif
 #include "detection/contour_detector.hpp"
 #include "classifier/vtes_card_classifier.hpp"
+#include "overlay/rulings_view.hpp"
 #include "base64-utils.h"
 
 #define VTES_OBB_MODEL "!!!VTES_OBB_MODEL!!!"
@@ -345,6 +359,14 @@ static void buildCardNameEntries(struct filter_data *tf)
     tf->card_name_entries.clear();
     if (tf->vtes_db.is_empty()) return;
 
+    // El indice indexa solo printed_name y name. Las name_variants que trae
+    // vtes.json (hasta 7 por carta) se descartaban, pese a que el buscador
+    // web (matchesCard en web_server.h) si las usa. Es la razon por la que
+    // el camino /api/search identifica cartas que el fuzzy match no puede.
+    // Medido: +710 entradas (+17%) sobre 4149 cartas, con 77 colisiones
+    // preexistentes que ya existian solo con printed_name.
+    size_t added = 0;
+    size_t added_localized = 0;
     for (const auto& [id_str, entry] : tf->vtes_db.all_entries()) {
         VTESCardNameEntry ce;
         ce.id = id_str;
@@ -352,12 +374,47 @@ static void buildCardNameEntries(struct filter_data *tf)
         ce.full_name = entry.name;
         ce.normalized = VtesOcrReader::normalize(
             ce.printed_name.empty() ? ce.full_name : ce.printed_name);
-        tf->card_name_entries.push_back(std::move(ce));
-    }
+        if (!ce.normalized.empty())
+            tf->card_name_entries.push_back(std::move(ce));
 
+        for (const auto& variant : entry.name_variants) {
+            VTESCardNameEntry ve;
+            ve.id = id_str;
+            ve.printed_name = variant;
+            ve.full_name = entry.name;
+            ve.normalized = VtesOcrReader::normalize(variant);
+            if (!ve.normalized.empty()) {
+                tf->card_name_entries.push_back(std::move(ve));
+                added++;
+            }
+        }
+
+        // Nombres localizados: la quinta edicion espanola/francesa imprime el
+        // nombre traducido ("Ojos de Argos" donde la inglesa dice "Eyes of
+        // Argus"). Sin estas entradas, un OCR perfecto del nombre impreso
+        // puntuaba ~0.45 contra el indice ingles y se rechazaba. Se conserva
+        // el printed_name canonico como nombre reportado para que el overlay
+        // siga mostrando la carta en el idioma de la BD.
+        for (const std::string* localized : {&entry.name_es, &entry.name_fr}) {
+            if (localized->empty()) continue;
+            VTESCardNameEntry le;
+            le.id = id_str;
+            le.printed_name = entry.printed_name.empty() ? entry.name : entry.printed_name;
+            le.full_name = entry.name;
+            le.normalized = VtesOcrReader::normalize(*localized);
+            if (!le.normalized.empty()) {
+                tf->card_name_entries.push_back(std::move(le));
+                added_localized++;
+            }
+        }
+    }
+    obs_log(LOG_INFO, "[OCR] Indexed %zu name_variants for fuzzy matching", added);
+    obs_log(LOG_INFO, "[OCR] Indexed %zu localized (es/fr) names for fuzzy matching",
+            added_localized);
     obs_log(LOG_INFO, "[OCR] Built %zu card name entries for fuzzy matching",
             tf->card_name_entries.size());
 }
+
 
 // ─── Initialize Tesseract OCR reader ───────────────────────────────────
 
@@ -478,7 +535,7 @@ static bool downloadImageToMemory(const std::string& url, std::vector<uchar>& ou
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2000L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "VTES-Card-Scanner/0.1.4");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "VTES-Card-Scanner/0.1.6");
     CURLcode res = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
     return res == CURLE_OK && !out_data.empty();
@@ -765,17 +822,27 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	obs_properties_add_bool(props, "upscaler_enabled", "NIS Upscale (Lanczos 4x + adaptive sharpen via CUDA)");
 	obs_properties_add_bool(props, "vampire_cuda_enabled", "CUDA Oval/Rect Classifier (reduce false positives)");
 
-	// Detection interval (ignored when Always Active is on)
+	// Detection interval (0 = continuous, no logging)
 	obs_properties_add_float_slider(props, "detection_interval_seconds",
-		"Detection interval (seconds, 0 = every frame, ignored when Always Active)",
+		"Detection interval",
 		0.0, 5.0, 0.1);
 
 	// Click-to-overlay: manual from web UI
+	// Desplazamiento vertical de los rulings. Se expone como porcentaje y no
+	// como pixeles porque el rango de OBS es fijo, mientras que lo que se
+	// puede desplazar depende de cada carta: con dos rulings apenas se mueve
+	// y con dieciocho se mueve mucho.
+	obs_properties_add_int_slider(props, "rulings_scroll",
+	                              "Rulings scroll (0..100%)", 0, 100, 1);
+
 	obs_properties_add_bool(props, "click_to_overlay",
 		"Click to Overlay (show cards only when clicked from web UI)");
 
 	// Card Search Web Server + Detection History
-	obs_properties_add_button(props, "card_search_btn", "Open Card Search",
+	// OBS 32 marca obs_properties_add_button como desusado: button2 con priv
+	// nullptr es identico (si priv es nulo, el callback recibe el data de la
+	// fuente, que es lo que hacia la version antigua).
+	obs_properties_add_button2(props, "card_search_btn", "Open Card Search",
 		[](obs_properties_t *, obs_property_t *, void *data) {
 			struct detect_filter_obb *tf = reinterpret_cast<detect_filter_obb *>(data);
 			if (!tf->web_server || !tf->web_server->is_running()) {
@@ -800,11 +867,36 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 #endif
 			}
 			return true;
-		});
+		}, nullptr);
 
 	std::string basic_info =
 		std::regex_replace(PLUGIN_INFO_TEMPLATE, std::regex("%1"), PLUGIN_VERSION);
 	obs_properties_add_text(props, "info", basic_info.c_str(), OBS_TEXT_INFO);
+
+	// ─── Game State: Player configuration ───────────────────────────────
+	obs_properties_add_int_slider(props, "player_count", "Player count", 4, 5, 1);
+
+	for (int i = 0; i < filter_data::MAX_PLAYERS; i++) {
+		std::string prefix = "player_" + std::to_string(i);
+		std::string label = "Player " + std::to_string(i + 1);
+
+		obs_properties_t *grp = obs_properties_create();
+		obs_properties_add_text(grp, (prefix + "_name").c_str(), "Name", OBS_TEXT_DEFAULT);
+		obs_properties_add_int(grp, (prefix + "_pool").c_str(), "Initial Pool", 0, 99, 1);
+
+		obs_properties_add_float(grp, (prefix + "_minion_x").c_str(), "Minion X (norm)", 0.0, 1.0, 0.01);
+		obs_properties_add_float(grp, (prefix + "_minion_y").c_str(), "Minion Y (norm)", 0.0, 1.0, 0.01);
+		obs_properties_add_float(grp, (prefix + "_minion_w").c_str(), "Minion W (norm)", 0.0, 1.0, 0.01);
+		obs_properties_add_float(grp, (prefix + "_minion_h").c_str(), "Minion H (norm)", 0.0, 1.0, 0.01);
+
+		obs_properties_add_float(grp, (prefix + "_crypt_x").c_str(), "Crypt X (norm)", 0.0, 1.0, 0.01);
+		obs_properties_add_float(grp, (prefix + "_crypt_y").c_str(), "Crypt Y (norm)", 0.0, 1.0, 0.01);
+		obs_properties_add_float(grp, (prefix + "_crypt_w").c_str(), "Crypt W (norm)", 0.0, 1.0, 0.01);
+		obs_properties_add_float(grp, (prefix + "_crypt_h").c_str(), "Crypt H (norm)", 0.0, 1.0, 0.01);
+
+		obs_properties_add_group(props, (prefix + "_group").c_str(),
+			label.c_str(), OBS_GROUP_NORMAL, grp);
+	}
 
 	UNUSED_PARAMETER(data);
 	return props;
@@ -855,6 +947,26 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "clf_oval_thresh", 0.6);
 	obs_data_set_default_double(settings, "clf_color_thresh", 0.55);
 	obs_data_set_default_double(settings, "clf_oval_reject_master", 0.4);
+
+	// Game state defaults
+	obs_data_set_default_int(settings, "player_count", 4);
+	for (int i = 0; i < filter_data::MAX_PLAYERS; i++) {
+		std::string p = "player_" + std::to_string(i);
+		obs_data_set_default_string(settings, (p + "_name").c_str(), ("Jugador " + std::to_string(i + 1)).c_str());
+		obs_data_set_default_int(settings, (p + "_pool").c_str(), 30);
+
+		// Default zones: divide screen width into MAX_PLAYERS columns
+		float col_w = 1.0f / filter_data::MAX_PLAYERS;
+		float col_x = i * col_w;
+		obs_data_set_default_double(settings, (p + "_minion_x").c_str(), col_x);
+		obs_data_set_default_double(settings, (p + "_minion_y").c_str(), 0.0);
+		obs_data_set_default_double(settings, (p + "_minion_w").c_str(), col_w);
+		obs_data_set_default_double(settings, (p + "_minion_h").c_str(), 0.45);
+		obs_data_set_default_double(settings, (p + "_crypt_x").c_str(), col_x);
+		obs_data_set_default_double(settings, (p + "_crypt_y").c_str(), 0.55);
+		obs_data_set_default_double(settings, (p + "_crypt_w").c_str(), col_w);
+		obs_data_set_default_double(settings, (p + "_crypt_h").c_str(), 0.45);
+	}
 }
 
 void detect_filter_obb_update(void *data, obs_data_t *settings)
@@ -869,6 +981,7 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 	tf->always_active = obs_data_get_bool(settings, "always_active");
 	tf->click_to_overlay = obs_data_get_bool(settings, "click_to_overlay");
 	tf->conf_threshold = (float)obs_data_get_double(settings, "threshold");
+	tf->rulings_scroll = (int)obs_data_get_int(settings, "rulings_scroll");
 	tf->sortTracking = obs_data_get_bool(settings, "sort_tracking");
 	size_t maxUnseenFrames = (size_t)obs_data_get_int(settings, "max_unseen_frames");
 	if (tf->tracker.getMaxUnseenFrames() != maxUnseenFrames) {
@@ -934,6 +1047,28 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		if (!per_type_attempted) {
 			per_type_attempted = true;
 			loadPerTypeEmbedders(tf);
+		}
+	}
+
+	// ─── Game state: player config ─────────────────────────────────
+	{
+		int new_count = (int)obs_data_get_int(settings, "player_count");
+		if (new_count < 4) new_count = 4;
+		if (new_count > filter_data::MAX_PLAYERS) new_count = filter_data::MAX_PLAYERS;
+		tf->player_count = new_count;
+
+		for (int i = 0; i < filter_data::MAX_PLAYERS; i++) {
+			std::string p = "player_" + std::to_string(i);
+			tf->players[i].name = obs_data_get_string(settings, (p + "_name").c_str());
+			tf->players[i].pool = (int)obs_data_get_int(settings, (p + "_pool").c_str());
+			tf->players[i].minion_zone.nx = (float)obs_data_get_double(settings, (p + "_minion_x").c_str());
+			tf->players[i].minion_zone.ny = (float)obs_data_get_double(settings, (p + "_minion_y").c_str());
+			tf->players[i].minion_zone.nw = (float)obs_data_get_double(settings, (p + "_minion_w").c_str());
+			tf->players[i].minion_zone.nh = (float)obs_data_get_double(settings, (p + "_minion_h").c_str());
+			tf->players[i].crypt_zone.nx = (float)obs_data_get_double(settings, (p + "_crypt_x").c_str());
+			tf->players[i].crypt_zone.ny = (float)obs_data_get_double(settings, (p + "_crypt_y").c_str());
+			tf->players[i].crypt_zone.nw = (float)obs_data_get_double(settings, (p + "_crypt_w").c_str());
+			tf->players[i].crypt_zone.nh = (float)obs_data_get_double(settings, (p + "_crypt_h").c_str());
 		}
 	}
 
@@ -1235,6 +1370,7 @@ static void start_ocr_worker(detect_filter_obb* tf);
 static void stop_ocr_worker(detect_filter_obb* tf);
 static void submit_ocr_jobs(detect_filter_obb* tf,
 							const std::vector<cv::Mat>& card_regions,
+							const std::vector<int>& track_ids,
 							const std::vector<std::string>& type_filters);
 static void drain_ocr_results(detect_filter_obb* tf,
 							  std::vector<vtes_detection::OBBObject>& objects);
@@ -1318,6 +1454,24 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 		tf->manual_overlay_set_time_ns = 0;
 		obs_log(LOG_INFO, "[WebServer] Manual overlay cleared");
 	};
+	tf->web_server->on_pool_fn = [tf](int player_idx, int delta) {
+		if (player_idx >= 0 && player_idx < tf->player_count) {
+			tf->players[player_idx].pool += delta;
+			if (tf->players[player_idx].pool < 0)
+				tf->players[player_idx].pool = 0;
+			if (tf->players[player_idx].pool > 99)
+				tf->players[player_idx].pool = 99;
+			obs_log(LOG_INFO, "[WebServer] Pool: %s = %d (delta %+d)",
+				tf->players[player_idx].name.c_str(),
+				tf->players[player_idx].pool, delta);
+		}
+	};
+	tf->web_server->get_pool_fn = [tf]() -> std::vector<std::pair<std::string,int>> {
+		std::vector<std::pair<std::string,int>> out;
+		for (int i = 0; i < tf->player_count; i++)
+			out.push_back({tf->players[i].name, tf->players[i].pool});
+		return out;
+	};
 	bool ws_ok = tf->web_server->start(tf->web_server_port, &tf->vtes_db);
 	if (ws_ok) {
 		obs_log(LOG_INFO, "[WebServer] Started on http://localhost:%d (filter=%s)",
@@ -1330,7 +1484,8 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 				+ std::to_string(tf->web_server_port)
 				+ "\n\nBusca cartas desde tu navegador.\n"
 				"Marca 'Always Active' para detección continua.\n"
-				"Ajusta el intervalo de detección para evitar spam.";
+				"Ajusta el intervalo de detección para evitar spam.\n"
+				"Intervalo 0 = detección continua sin límite.";
 			MessageBoxA(NULL, msg.c_str(), "VTES Card Scanner",
 				MB_OK | MB_ICONINFORMATION | MB_TASKMODAL);
 #else
@@ -1474,12 +1629,15 @@ static void stop_ocr_worker(detect_filter_obb* tf)
 
 static void submit_ocr_jobs(detect_filter_obb* tf,
 							const std::vector<cv::Mat>& card_regions,
+							const std::vector<int>& track_ids,
 							const std::vector<std::string>& type_filters)
 {
 	if (!tf->ocr_worker_active || !tf->ocr_reader) return;
 	for (size_t i = 0; i < card_regions.size() && i < type_filters.size(); i++) {
 		if (card_regions[i].empty()) continue;
-		int64_t jid = tf->ocr_next_job_id++;
+		// El ticket del job ES el track id del objeto, para que
+		// drain_ocr_results pueda devolver cada nombre a su carta.
+		int64_t jid = track_ids[i];
 		{
 			std::lock_guard<std::mutex> lock(tf->ocr_queue_lock);
 			tf->ocr_queue.push({jid, card_regions[i].clone(), type_filters[i]});
@@ -1499,18 +1657,31 @@ static void drain_ocr_results(detect_filter_obb* tf,
 	for (auto& result : fresh) {
 		if (!result.completed) continue;
 		if (result.accepted) {
-			// Apply to the first object that still has no name ("???")
-			for (auto& obj : objects) {
-				if (obj.card_name == "???" || obj.card_name.empty()) {
-					obj.card_name = result.card_name;
-					obj.card_id = result.card_id;
-					obj.prob = result.confidence;
-					obs_log(LOG_INFO, "[OCR] Async result: '%s' (id=%s, conf=%.2f)",
-						result.card_name.c_str(), result.card_id.c_str(), result.confidence);
-					break;
-				}
+			// El resultado del OCR volvio del worker sin saber a que objeto
+			// corresponde: job.id es un ticket de la cola, no el track id.
+			// Antes se aplicaba "al primer objeto que siga en ???", lo que
+			// con dos o mas cartas en pantalla podia poner el nombre de una
+			// en la tarjeta de otra. Ahora se aplica de verdad por track_id.
+			int obj_idx = -1;
+			for (size_t oi = 0; oi < objects.size(); ++oi) {
+				if (objects[oi].id == result.id) { obj_idx = (int)oi; break; }
 			}
-		}
+			if (obj_idx < 0) {
+				// El objeto asociado al job ya no esta en la lista de este
+				// frame (desplazamiento de camara, carta retirada): se
+				// descarta el resultado en vez de aplicarlo a cualquiera.
+				obs_log(LOG_INFO, "[OCR] Async result descartado: track %d ya no presente",
+						result.id);
+				continue;
+			}
+			auto& obj = objects[obj_idx];
+			obj.card_name = result.card_name;
+			obj.card_id = result.card_id;
+			obj.prob = result.confidence;
+			obs_log(LOG_INFO, "[OCR] Async result: '%s' (id=%s, conf=%.2f, track=%d)",
+					result.card_name.c_str(), result.card_id.c_str(),
+					result.confidence, result.id);
+			}
 	}
 }
 
@@ -1565,21 +1736,19 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	// ─── Preview + Always Active: stop detection when hidden ─────────
 	bool should_detect = tf->preview || tf->always_active;
 
-	// ─── Detection interval & cooldown: bypass when Always Active ───
+	// ─── Detection interval: minimum time between detection runs ───
+	// 0 = disabled (continuous), no logging
 	auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 		std::chrono::steady_clock::now().time_since_epoch()).count();
-	if (should_detect && !tf->always_active) {
-		// Detection interval: minimum time between detection runs
-		if (tf->detection_interval_ms > 0) {
-			uint64_t interval_ns = (uint64_t)tf->detection_interval_ms * 1000000ULL;
-			if (now_ns - tf->last_detection_time_ns < interval_ns) {
-				should_detect = false;
-			} else {
-				tf->last_detection_time_ns = now_ns;
-			}
+	if (should_detect && tf->detection_interval_ms > 0) {
+		uint64_t interval_ns = (uint64_t)tf->detection_interval_ms * 1000000ULL;
+		if (now_ns - tf->last_detection_time_ns < interval_ns) {
+			should_detect = false;
 		} else {
 			tf->last_detection_time_ns = now_ns;
 		}
+	} else if (should_detect) {
+		tf->last_detection_time_ns = now_ns;
 	}
 
 	cv::Mat imageBGRA;
@@ -1740,8 +1909,12 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 					thresh = pt_it->second->threshold();
 				}
 				// Fallback to global embedder
+				// NOTA: el filtro de tipo del clasificador de vision es poco fiable
+				// en frames reales (misclasifica ~100%: p.ej. Reaction -> Event),
+				// por lo que el matcher fusionado (embedding+NCC) identifica sin
+				// filtro de tipo.
 				if (!matched && tf->embedder.is_loaded()) {
-					matched = tf->embedder.identify(card_region, card_name, card_id, confidence, type_filter);
+					matched = tf->embedder.identify(card_region, card_name, card_id, confidence, "");
 					thresh = tf->embedder.threshold();
 				}
 			}
@@ -1785,7 +1958,12 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			// Pass empty type hint so name-region detection is stable
 			// (the vision type classifier is too frame-unstable to trust)
 			std::vector<std::string> empty_filters(card_regions.size(), "");
-			submit_ocr_jobs(tf, card_regions, empty_filters);
+			// Pasar los track ids para que cada resultado de OCR vuelva
+			// a su propia carta y no a la primera que siga en "???".
+			std::vector<int> track_ids;
+			track_ids.reserve(raw_objects.size());
+			for (const auto& o : raw_objects) track_ids.push_back(o.id);
+			submit_ocr_jobs(tf, card_regions, track_ids, empty_filters);
 		}
 	} // end if (!raw_objects.empty())
 		// ─── Set cooldown on successful identification (not in Always Active mode) ─────
@@ -1848,6 +2026,126 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			std::remove_if(final_objects.begin(), final_objects.end(),
 				       [](const vtes_detection::OBBObject &obj) { return obj.unseenFrames > 0; }),
 			final_objects.end());
+	}
+
+	// ─── Game state: lock tracking & player assignment ─────────────
+	{
+		int fw = imageBGRA.cols;
+		int fh = imageBGRA.rows;
+		auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+
+		// Increment unseen counter for all tracked cards
+		{
+			std::lock_guard<std::mutex> lock(tf->game_state_lock);
+			for (auto& [tid, card] : tf->tracked_cards)
+				card.unseen_frames++;
+		}
+
+		for (const auto& obj : final_objects) {
+			std::lock_guard<std::mutex> lock(tf->game_state_lock);
+			auto it = tf->tracked_cards.find(obj.id);
+
+			if (it == tf->tracked_cards.end()) {
+				// New track
+				filter_data::TrackedCardState tc;
+				tc.track_id = obj.id;
+				tc.card_id = obj.card_id;
+				tc.card_name = obj.card_name;
+				tc.first_seen_ns = now_ns;
+				tc.initial_angle = obj.angle;
+				tc.lock_state = filter_data::CardLockState::Unlocked;
+				tc.last_seen_ns = now_ns;
+				tc.last_position = cv::Point2f(
+					obj.rect.x + obj.rect.width / 2,
+					obj.rect.y + obj.rect.height / 2);
+				tc.unseen_frames = 0;
+
+				// Look up card URL + pre-cache image
+				if (!obj.card_id.empty()) {
+					auto cit = tf->card_info_by_id.find(obj.card_id);
+					if (cit != tf->card_info_by_id.end()) {
+						tc.card_url = cit->second.url;
+						if (!tc.card_url.empty() &&
+							tf->card_image_cache.find(tc.card_url) == tf->card_image_cache.end()) {
+							std::vector<uchar> img_data;
+							if (downloadImageToMemory(tc.card_url, img_data)) {
+								cv::Mat img = cv::imdecode(img_data, cv::IMREAD_COLOR);
+								if (!img.empty())
+									tf->card_image_cache[tc.card_url] = img;
+							}
+						}
+						auto cit2 = tf->card_image_cache.find(tc.card_url);
+						if (cit2 != tf->card_image_cache.end())
+							tc.card_image = cit2->second.clone();
+					}
+				}
+
+				// Assign to player by zone overlap
+				cv::Point2f c = tc.last_position;
+				tc.player_idx = -1;
+				for (int pi = 0; pi < tf->player_count; pi++) {
+					auto& pl = tf->players[pi];
+					auto checkZone = [&](const filter_data::PlayerZone& z, bool crypt) {
+						float zx = z.nx * fw, zy = z.ny * fh;
+						float zw = z.nw * fw, zh = z.nh * fh;
+						if (c.x >= zx && c.x <= zx + zw &&
+							c.y >= zy && c.y <= zy + zh) {
+							tc.player_idx = pi;
+							tc.in_crypt = crypt;
+							return true;
+						}
+						return false;
+					};
+					if (checkZone(pl.minion_zone, false)) break;
+					if (checkZone(pl.crypt_zone, true)) break;
+				}
+
+				tf->tracked_cards[obj.id] = std::move(tc);
+			} else {
+				// Existing track
+				auto& tc = it->second;
+				tc.last_seen_ns = now_ns;
+				tc.last_position = cv::Point2f(
+					obj.rect.x + obj.rect.width / 2,
+					obj.rect.y + obj.rect.height / 2);
+				tc.unseen_frames = 0;
+
+				// Update card info if newly identified
+				if (tc.card_id.empty() && !obj.card_id.empty()) {
+					tc.card_id = obj.card_id;
+					tc.card_name = obj.card_name;
+					auto cit = tf->card_info_by_id.find(obj.card_id);
+					if (cit != tf->card_info_by_id.end())
+						tc.card_url = cit->second.url;
+				}
+
+				// Lock state: after 1 s, check if rotated ~90°
+				if (!tc.rotation_checked) {
+					int64_t elapsed_ns = now_ns - tc.first_seen_ns;
+					if (elapsed_ns > 1000000000LL) {
+						float delta = obj.angle - tc.initial_angle;
+						while (delta > 180.0f) delta -= 360.0f;
+						while (delta < -180.0f) delta += 360.0f;
+						if (fabs(delta) >= 60.0f && fabs(delta) <= 120.0f)
+							tc.lock_state = filter_data::CardLockState::Locked;
+						tc.rotation_checked = true;
+					}
+				}
+			}
+		}
+
+		// Remove stale tracks (unseen > 120 frames ≈ 4 s at 30 fps)
+		{
+			std::lock_guard<std::mutex> lock(tf->game_state_lock);
+			auto it = tf->tracked_cards.begin();
+			while (it != tf->tracked_cards.end()) {
+				if (it->second.unseen_frames > 120)
+					it = tf->tracked_cards.erase(it);
+				else
+					++it;
+			}
+		}
 	}
 
 	if (!tf->saveDetectionsPath.empty()) {
@@ -1946,85 +2244,415 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			}
 		}
 
-		// ─── Card image overlay with fade ──────────────────────────────
-		// When click_to_overlay is enabled, auto-detected cards are NOT shown.
-		// Only cards manually selected from the web UI are displayed.
+		// ─── Game state overlay: background, player pool, tracked cards ──
 		{
-			std::string detected_url;
+			std::vector<uchar> img_data;
 
-			// Manual overlay from web UI takes priority
+			// 1. Load background image if not loaded
+			if (tf->overlay_bg.empty()) {
+				char *bgPath = obs_module_file("overlay-bg.png");
+				if (bgPath) {
+					// IMREAD_UNCHANGED conserva el canal alfa: esta imagen es 67% transparente,
+					// con IMREAD_COLOR el centro vacio se volveria negro opaco y taparia la camara.
+					tf->overlay_bg = cv::imread(bgPath, cv::IMREAD_UNCHANGED);
+					bfree(bgPath);
+				}
+			}
+
+			int fw = frame.cols, fh = frame.rows;
+
+				cv::Mat display = cv::Mat::zeros(fh, fw, CV_8UC3);
+			// 2. Create display: background as base, source on top as centered window
+			if (!tf->overlay_bg.empty()) {
+				// El overlay se escala ENTERO para caber en la escena: nada se recorta y
+				// sobran bandas negras a los lados. Se respeta el 3:2 del diseño.
+				const int bw = tf->overlay_bg.cols, bh = tf->overlay_bg.rows;
+				if (bw > 0 && bh > 0) {
+					// Escalar al mayor tamaño que quepa, conservando la proporcion
+					const double esc = std::min((double)fw / bw, (double)fh / bh);
+					const int dw = (int)(bw * esc + 0.5), dh = (int)(bh * esc + 0.5);
+					cv::Mat overlay;
+					cv::resize(tf->overlay_bg, overlay, cv::Size(dw, dh), 0, 0, cv::INTER_AREA);
+					const int ox = (fw - dw) / 2, oy = (fh - dh) / 2;
+					if (overlay.channels() == 4) {
+						cv::Mat bgr3, alfa;
+						cv::cvtColor(overlay, bgr3, cv::COLOR_BGRA2BGR);
+						cv::extractChannel(overlay, alfa, 3);
+						cv::Mat mascara;
+						cv::threshold(alfa, mascara, 0, 255, cv::THRESH_BINARY);
+						bgr3.copyTo(display(cv::Rect(ox, oy, dw, dh)), mascara);
+					} else {
+						overlay.copyTo(display(cv::Rect(ox, oy, dw, dh)));
+					}
+				}
+			} else {
+				display = cv::Mat(fh, fw, CV_8UC3, cv::Scalar(15, 15, 40));
+			}
+
+			// Place source frame (with detection boxes) into display as centered area
+			{
+				int margin_pct = 5;
+				int sw = fw * (100 - 2 * margin_pct) / 100;
+				int sh = fh * (100 - 2 * margin_pct) / 100;
+				int sx = (fw - sw) / 2;
+				int sy = (fh - sh) / 2;
+				cv::Mat src_resized;
+				cv::resize(frame, src_resized, cv::Size(sw, sh));
+				src_resized.copyTo(display(cv::Rect(sx, sy, sw, sh)));
+			}
+
+			// 3. Draw player pool & names on left side (on display)
+			int pool_left = 8;
+			int pool_top = (int)(fh * 0.02f);
+			int pool_line_h = (int)(fh * 0.045f);
+			if (pool_line_h < 18) pool_line_h = 18;
+			int pool_bar_h = (int)(fh * 0.025f);
+			if (pool_bar_h < 6) pool_bar_h = 6;
+
+			for (int pi = 0; pi < tf->player_count; pi++) {
+				auto& pl = tf->players[pi];
+				int y = pool_top + pi * pool_line_h;
+
+				int bar_w = (int)(fw * 0.04f);
+				if (bar_w < 40) bar_w = 40;
+				cv::Rect bar_bg(pool_left, y, bar_w, pool_bar_h);
+				cv::rectangle(display, bar_bg, cv::Scalar(40, 40, 40), -1);
+
+				float pool_frac = std::min(1.0f, pl.pool / 30.0f);
+				cv::Scalar bar_color(
+					(int)(255 * (1.0f - pool_frac)),
+					(int)(255 * pool_frac),
+					0);
+				int fill_w = (int)(bar_w * pool_frac);
+				if (fill_w > 0) {
+					cv::Rect bar_fill(pool_left, y, fill_w, pool_bar_h);
+					cv::rectangle(display, bar_fill, bar_color, -1);
+				}
+
+				std::string pool_text = pl.name + ": " + std::to_string(pl.pool);
+				cv::putText(display, pool_text,
+					cv::Point2f((float)(pool_left + bar_w + 6), (float)(y + pool_bar_h - 2)),
+					cv::FONT_HERSHEY_SIMPLEX, 0.4f, cv::Scalar(200, 200, 200), 1);
+			}
+
+			// 4. Draw tracked cards in their player zones (on display)
+			{
+				std::lock_guard<std::mutex> lock(tf->game_state_lock);
+				for (auto& [tid, tc] : tf->tracked_cards) {
+					if (tc.player_idx < 0 || tc.player_idx >= tf->player_count)
+						continue;
+					auto& zone = tc.in_crypt
+						? tf->players[tc.player_idx].crypt_zone
+						: tf->players[tc.player_idx].minion_zone;
+
+					int zx = (int)(zone.nx * fw);
+					int zy = (int)(zone.ny * fh);
+					int zw = (int)(zone.nw * fw);
+					int zh = (int)(zone.nh * fh);
+
+					cv::Rect zone_rect(zx, zy, zw, zh);
+					zone_rect &= cv::Rect(0, 0, fw, fh);
+					if (zone_rect.width < 8 || zone_rect.height < 8)
+						continue;
+
+					if (!tc.card_image.empty()) {
+						cv::Mat card_resized;
+						cv::resize(tc.card_image, card_resized,
+							cv::Size(zone_rect.width, zone_rect.height));
+						cv::addWeighted(
+							display(zone_rect), 1.0,
+							card_resized, 0.85,
+							0.0, display(zone_rect));
+					}
+
+					if (tf->preview) {
+						cv::Scalar lock_color = (tc.lock_state == filter_data::CardLockState::Unlocked)
+							? cv::Scalar(0, 220, 0)
+							: cv::Scalar(0, 0, 220);
+						cv::rectangle(display, zone_rect, lock_color, 2);
+
+						const char* icon = (tc.lock_state == filter_data::CardLockState::Unlocked)
+							? "U" : "L";
+						cv::putText(display, icon,
+							cv::Point2f((float)(zone_rect.x + 4), (float)(zone_rect.y + 16)),
+							cv::FONT_HERSHEY_SIMPLEX, 0.5f, lock_color, 2);
+						cv::putText(display, tc.card_name.empty() ? "?" : tc.card_name,
+							cv::Point2f((float)(zone_rect.x + 20), (float)(zone_rect.y + 16)),
+							cv::FONT_HERSHEY_SIMPLEX, 0.4f, cv::Scalar(220, 220, 220), 1);
+					}
+				}
+			}
+
+			// 4b. Carta principal sobre el ankh del overlay
+			// Se coloca la ultima carta detectada sobre el simbolo, tapandolo por
+			// completo y sin sobresalir del panel izquierdo.
+			{
+				std::lock_guard<std::mutex> lock(tf->game_state_lock);
+				// Escala del overlay respecto a su diseno de referencia: si la escena
+				// no es 1920x1080, la caja del ankh se reescala con la misma proporcion.
+				const double osx = (double)fw / kOverlayRefW;
+				const double osy = (double)fh / kOverlayRefH;
+				int ax = (int)(kAnkhX * osx + 0.5);
+				int ay = (int)(kAnkhY * osy + 0.5);
+				int aw = (int)(kAnkhW * osx + 0.5);
+				int ah = (int)(kAnkhH * osy + 0.5);
+
+				// Ultima carta detectada (la de track_id mas alto, la mas reciente).
+				filter_data::TrackedCardState *principal = nullptr;
+				for (auto& [tid, tc] : tf->tracked_cards) {
+					if (tc.card_image.empty())
+						continue;
+					if (!principal || tid > principal->track_id)
+						principal = &tc;
+				}
+
+				if (principal) {
+					// La carta se escala hasta cubrir el ankh. Se respeta su proporcion
+					// real y se recorta lo que sobresalga, de modo que el ankh queda
+					// siempre tapado y la carta jamas se sale del panel.
+					const double cw = principal->card_image.cols;
+					const double ch = principal->card_image.rows;
+					if (cw > 0 && ch > 0) {
+						// Escalar para que cubra: se usa el factor mayor de los dos.
+						const double esc = std::max((double)aw / cw, (double)ah / ch);
+						int rw = (int)(cw * esc + 0.5);
+						int rh = (int)(ch * esc + 0.5);
+						cv::Mat carta;
+						cv::resize(principal->card_image, carta, cv::Size(rw, rh), 0, 0,
+						            cv::INTER_AREA);
+
+						// Centrada sobre la caja del ankh
+						int cx = ax + (aw - rw) / 2;
+						int cy = ay + (ah - rh) / 2;
+
+						// Recorte visible dentro de la caja del ankh
+						int vx0 = std::max(cx, ax), vy0 = std::max(cy, ay);
+						int vx1 = std::min(cx + rw, ax + aw);
+						int vy1 = std::min(cy + rh, ay + ah);
+						if (vx1 > vx0 && vy1 > vy0) {
+							cv::Rect destino(vx0, vy0, vx1 - vx0, vy1 - vy0);
+							destino &= cv::Rect(0, 0, fw, fh);
+							if (destino.width > 0 && destino.height > 0) {
+								cv::Rect fuente(vx0 - cx, vy0 - cy, destino.width,
+								               destino.height);
+								carta(fuente).copyTo(display(destino));
+							}
+						}
+					}
+				}
+			}
+
+			// 5. Manual overlay from web UI (on display)
 			if (!tf->manual_overlay_url.empty()) {
-				detected_url = tf->manual_overlay_url;
-			}
-			// Auto-detect only when click_to_overlay is disabled
-			if (detected_url.empty() && !tf->click_to_overlay) {
-				for (const auto& obj : final_objects) {
-					if (obj.card_id.empty()) continue;
-					auto it = tf->card_info_by_id.find(obj.card_id);
-					if (it != tf->card_info_by_id.end() && !it->second.url.empty()) {
-						detected_url = it->second.url;
-						break;
-					}
-				}
-			}
-
-			if (!detected_url.empty()) {
-				tf->last_overlay_detection_time = std::chrono::steady_clock::now();
-				tf->current_overlay_card_url = detected_url;
-				if (tf->card_image_cache.find(detected_url) == tf->card_image_cache.end()) {
-					std::vector<uchar> img_data;
-					if (downloadImageToMemory(detected_url, img_data)) {
-						cv::Mat img = cv::imdecode(img_data, cv::IMREAD_COLOR);
-						if (!img.empty())
-							tf->card_image_cache[detected_url] = img;
-					}
-				}
-			}
-
-			if (!tf->current_overlay_card_url.empty()) {
 				auto now = std::chrono::steady_clock::now();
 				auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 					now - tf->last_overlay_detection_time).count();
 				float elapsed_sec = elapsed_ms / 1000.0f;
+				float alpha = std::max(0.0f, 1.0f - (elapsed_sec / 30.0f));
 
-				// Manual overlay: persist until cleared (30s timeout as safety)
-				// Auto overlay: fade out over card_overlay_duration
-				float alpha;
-				if (!tf->manual_overlay_url.empty()) {
-					alpha = std::max(0.0f, 1.0f - (elapsed_sec / 30.0f));
-				} else {
-					alpha = std::max(0.0f, 1.0f - (elapsed_sec / tf->card_overlay_duration));
-				}
-
-				if (alpha > 0.0f) {
+				if (alpha > 0.0f && !tf->current_overlay_card_url.empty()) {
 					auto cache_it = tf->card_image_cache.find(tf->current_overlay_card_url);
+					if (cache_it == tf->card_image_cache.end() && !tf->manual_overlay_url.empty()) {
+						if (downloadImageToMemory(tf->manual_overlay_url, img_data)) {
+							cv::Mat img = cv::imdecode(img_data, cv::IMREAD_COLOR);
+							if (!img.empty()) {
+								tf->card_image_cache[tf->manual_overlay_url] = img;
+								cache_it = tf->card_image_cache.find(tf->manual_overlay_url);
+							}
+						}
+					}
+
 					if (cache_it != tf->card_image_cache.end()) {
-						int overlay_w = 180;
-						int overlay_h = (int)(overlay_w * 88.0 / 63.0 + 0.5f);
-						int pad = 10;
-						int x = frame.cols - overlay_w - pad;
-						int y = frame.rows - overlay_h - pad;
+						int banner_left = (int)(fw * 0.02f);
+						int banner_top = pool_top + tf->player_count * pool_line_h + (int)(fh * 0.02f);
+						int banner_w = (int)(fw * 0.24f);
+						int banner_h = fh - banner_top - (int)(fh * 0.02f);
 
 						cv::Mat overlay_resized;
-						cv::resize(cache_it->second, overlay_resized, cv::Size(overlay_w, overlay_h));
-
-					cv::Rect roi(x, y, overlay_w, overlay_h);
-						cv::Rect roi_clamped = roi & cv::Rect(0, 0, frame.cols, frame.rows);
-						if (roi_clamped.width > 0 && roi_clamped.height > 0) {
-							int ox = roi_clamped.x - x;
-							int oy = roi_clamped.y - y;
-							cv::Mat overlay_cropped = overlay_resized(cv::Rect(ox, oy, roi_clamped.width, roi_clamped.height));
-							cv::addWeighted(frame(roi_clamped), 1.0 - alpha, overlay_cropped, alpha, 0.0, frame(roi_clamped));
+						cv::resize(cache_it->second, overlay_resized, cv::Size(banner_w, banner_h));
+						cv::Rect roi(banner_left, banner_top, banner_w, banner_h);
+						roi &= cv::Rect(0, 0, fw, fh);
+						if (roi.width > 0 && roi.height > 0) {
+							cv::Mat overlay_cropped = overlay_resized(
+								cv::Rect(0, 0, roi.width, roi.height));
+							cv::addWeighted(display(roi), 1.0 - alpha, overlay_cropped, alpha, 0.0, display(roi));
 						}
 					}
 				} else {
 					tf->current_overlay_card_url.clear();
-					if (!tf->manual_overlay_url.empty()) {
-						// Manual overlay timed out — clear it
-						tf->manual_overlay_url.clear();
+					tf->manual_overlay_url.clear();
+				}
+			}
+
+		// 6. Rulings de la carta principal, sobre la propia carta
+		//
+		// El panel no tiene ningun hueco libre: la rejilla de 10 ranuras ocupa
+		// y=86..518 y el ankh (donde va la carta) y=507..1015 sobre la
+		// referencia 1920x1080. Decision actual: los rulings se dibujan sobre
+		// la carta, en una caja que abarca el interior del panel, con un velo
+		// oscuro detras para que el texto se lea sobre la ilustracion.
+		//
+		// El texto no se recorta por abajo: la caja es un viewport sobre el
+		// texto completo y cuanto se ve de el lo mueve el slider
+		// "Rulings scroll" del filtro. Cambiar donde se muestran es cambiar
+		// esta caja.
+		{
+			if (tf->manual_overlay_url.empty()) {
+				std::lock_guard<std::mutex> lock(tf->game_state_lock);
+
+				// Misma carta que se pinta sobre el ankh: la ultima detectada.
+				const filter_data::TrackedCardState* principal = nullptr;
+				for (auto& [tid, tc] : tf->tracked_cards) {
+					if (tc.card_image.empty())
+						continue;
+					if (!principal || tid > principal->track_id)
+						principal = &tc;
+				}
+
+				const VTESCardEntry* entry = (principal && !principal->card_id.empty())
+					? tf->vtes_db.get_by_id(principal->card_id)
+					: nullptr;
+
+				if (entry && entry->has_rulings()) {
+					// Escalar la caja y la metrica de texto con la misma proporcion
+					// que el resto del overlay, para que el ajuste de lineas
+					// coincida con lo que realmente se dibuja.
+					const double osy = (double)fh / kOverlayRefH;
+					const double osx = (double)fw / kOverlayRefW;
+
+					// La caja nace donde empieza la carta sobre el ankh y mide lo
+					// que mide el ankh, para quedarse sobre la carta. El ancho es
+					// el del interior del panel, mas ancho que la carta, porque a
+					// 0.55 de escala de fuente 196 px dan unas 21 letras por
+					// linea y los rulings se vuelven ilegibles.
+					const int pad = 2;
+					// x y w se escalan con osx igual que y y h con osy: el ankh
+					// del bloque 4b se escala con los dos, y si aqui solo se usara
+					// osy la caja se desviaria en horizontal en cualquier escena que
+					// no sea 1920x1080.
+					vtes_overlay::RulingsBox box;
+					box.x = (int)(158 * osx + 0.5);
+					box.w = (int)(280 * osx + 0.5);
+					box.y = (int)((kAnkhY + pad) * osy + 0.5);
+					box.h = (int)((kAnkhH - 2 * pad) * osy + 0.5);
+
+					const int lh = (int)(vtes_overlay::kRulingsLineHeight * osy + 0.5);
+					const double fs = vtes_overlay::kRulingsFontScale * osy;
+
+					// El ancho real de cada linea solo lo sabe OpenCV: putText es
+					// proporcional y un avance fijo por caracter se pasa de ancho.
+					// A esta escala el glifo medio mide 7.07 px con el OpenCV 5.0.0
+					// que enlaza el plugin (9.15 con el 4.13 de otro entorno: un 30%
+					// mas ancho por el mismo tamano de fuente), asi que no hay
+					// constante que valga para todos. La unidad de rulings recibe
+					vtes_overlay::RulingsMeasure measure =
+						[fs](const std::string& s) -> int {
+							if (s.empty())
+								return 0;
+							int tw = 0;
+							cv::getTextSize(s, cv::FONT_HERSHEY_SIMPLEX,
+							                fs, 1, &tw);
+							return tw;
+						};
+
+					const vtes_overlay::RulingsLayout layout =
+						vtes_overlay::buildRulingsLayout(entry, box, measure);
+
+					if (!layout.lines.empty() && lh > 0 && box.w > 0) {
+						// El velo se limita a la franja que ocupan las lineas
+						// (mas una para el aviso), no a la caja entera: una
+						// carta con dos rulings ocupa 10 lineas y oscurecer los
+						// 504 px taparia la ilustracion sin motivo. Sin el, las
+						// zonas claras de la ilustracion se comen el texto gris.
+						{
+							const int alto_velo = std::min(
+								box.h, ((int)layout.lines.size() + 1) * lh);
+							cv::Rect velo(box.x - 2, box.y - 2,
+							              box.w + 4, alto_velo + 4);
+							velo &= cv::Rect(0, 0, fw, fh);
+							if (velo.width > 0 && velo.height > 0) {
+								cv::Mat roi = display(velo);
+								cv::addWeighted(roi, 0.28,
+								                cv::Scalar(8, 8, 12),
+								                0.0, 0.0, roi);
+							}
+						}
+
+						// El slider es un porcentaje del desplazamiento maximo
+						// de esta carta: con dos rulings el maximo es 0 y el
+						// slider no hace nada, con dieciocho recorre todo.
+						const int max_scroll =
+							vtes_overlay::maxScroll(layout, box, lh);
+						double frac = tf->rulings_scroll / 100.0;
+						if (frac < 0.0)
+							frac = 0.0;
+						if (frac > 1.0)
+							frac = 1.0;
+						const int scroll_px = (int)(max_scroll * frac + 0.5);
+
+						std::pair<size_t, size_t> range =
+							vtes_overlay::visibleLineRange(layout, box,
+							                               lh, scroll_px);
+
+						// Barra de desplazamiento a la derecha de la caja: sin
+						// ella no hay forma de saber cuanto texto queda detras,
+						// porque el slider de OBS no muestra nada.
+						if (max_scroll > 0) {
+							const int track_x = box.x + box.w + 2;
+							const int track_w = 3;
+							const int content = vtes_overlay::contentHeight(
+								layout, lh);
+							cv::rectangle(display,
+							              cv::Rect(track_x, box.y,
+							                       track_w, box.h),
+							              cv::Scalar(40, 40, 48),
+							              cv::FILLED);
+							int thumb_h = (int)((double)box.h * box.h /
+							                        std::max(1, content) + 0.5);
+							thumb_h = std::max(4, std::min(thumb_h, box.h));
+							const int thumb_y = (int)((double)(box.h - thumb_h)
+							                          * frac + 0.5);
+							cv::rectangle(display,
+							              cv::Rect(track_x,
+							                       box.y + thumb_y,
+							                       track_w, thumb_h),
+							              cv::Scalar(120, 140, 160),
+							              cv::FILLED);
+						}
+
+						const cv::Scalar kBodyColor(200, 205, 215);
+						const cv::Scalar kHeadColor(130, 225, 250);
+
+						for (size_t i = range.first; i < range.second; ++i) {
+							const vtes_overlay::RulingsLine& line =
+								layout.lines[i];
+							// La linea ya se midio al ajustarla, pero se vuelve
+							// a comprobar: si algo la deja larga, se descarta
+							// antes de que se salga de la caja.
+							int tw = 0;
+							cv::getTextSize(line.text,
+							                cv::FONT_HERSHEY_SIMPLEX,
+							                fs, 1, &tw);
+							if (tw <= 0 || tw > box.w)
+								continue;
+
+							const int y = box.y + lh + (int)i * lh - scroll_px;
+							cv::putText(display, line.text,
+							            cv::Point(box.x, y),
+							            cv::FONT_HERSHEY_SIMPLEX, fs,
+							            line.is_heading ? kHeadColor
+							                            : kBodyColor,
+							            1);
+						}
 					}
 				}
 			}
+		}
+
+
+
+			// Replace frame with display for subsequent drawing
+			frame = display;
 		}
 
 		// ─── GPU indicator ─────────────────────────────────────────────────

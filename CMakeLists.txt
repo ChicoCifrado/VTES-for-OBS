@@ -79,21 +79,51 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE src)
 # ─── ONNX Runtime (for YOLO model — pinned version for CUDA/cuDNN compatibility) ─
 # Uses a specific ORT release from GitHub instead of OpenCV's auto-downloaded one
 # to ensure reproducible builds and cuDNN version compatibility.
-set(ORT_VERSION "1.23.1")
-set(ORT_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/onnxruntime-gpu-${ORT_VERSION}")
-set(ORT_DOWNLOAD_URL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-win-x64-gpu-${ORT_VERSION}.zip")
-set(ORT_ZIP "${CMAKE_CURRENT_BINARY_DIR}/_deps/onnxruntime-gpu-${ORT_VERSION}.zip")
+set(ORT_VERSION "1.24.4")
+set(ORT_DIR "${CMAKE_CURRENT_BINARY_DIR}/_deps/onnxruntime-${ORT_VERSION}")
+# Core + .lib de enlace: paquete CPU. El paquete GPU (cuda12 / cuda13) trae
+# ademas los proveedores de CUDA y TensorRT, pero este proyecto usa DirectML.
+set(ORT_DOWNLOAD_URL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-win-x64-${ORT_VERSION}.zip")
+set(ORT_ZIP "${CMAKE_CURRENT_BINARY_DIR}/_deps/onnxruntime-win-x64-${ORT_VERSION}.zip")
+# El proveedor DirectML no se publica como DLL suelto en GitHub ni en NuGet:
+# desde ORT 1.24 va compilado DENTRO de onnxruntime.dll. La variante DirectML
+# se distribuye en el paquete NuGet Microsoft.ML.OnnxRuntime.DirectML, que
+# empaqueta ese onnxruntime.dll. Descargar DOS ficheros: el CPU para tener
+# onnxruntime.lib, y el NuGet para quedarnos con ese core.
+set(ORT_DML_NUPKG_URL "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/${ORT_VERSION}/microsoft.ml.onnxruntime.directml.${ORT_VERSION}.nupkg")
+set(ORT_DML_NUPKG "${CMAKE_CURRENT_BINARY_DIR}/_deps/onnxruntime-directml-${ORT_VERSION}.nupkg")
 
+# 1) Core + libs del paquete CPU
 if(NOT EXISTS "${ORT_DIR}/lib/onnxruntime.lib")
-    message(STATUS "Downloading ORT ${ORT_VERSION} (CUDA 12, cuDNN 9)...")
+    message(STATUS "Downloading ORT ${ORT_VERSION} core ...")
     file(DOWNLOAD "${ORT_DOWNLOAD_URL}" "${ORT_ZIP}" INACTIVITY_TIMEOUT 60 SHOW_PROGRESS)
     file(ARCHIVE_EXTRACT INPUT "${ORT_ZIP}" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/_deps/")
-    # The zip contains a top-level folder like onnxruntime-win-x64-gpu-1.20.1/
-    file(GLOB _ort_extracted "${CMAKE_CURRENT_BINARY_DIR}/_deps/onnxruntime-win-x64-gpu-*")
-    list(SORT _ort_extracted)
-    list(GET _ort_extracted -1 _ort_extracted_dir)
-    file(RENAME "${_ort_extracted_dir}" "${ORT_DIR}")
+    # Nombre fijo, no glob: el glob tambien coincide con el .zip descargado
+    # (onnxruntime-win-x64-<ver> y onnxruntime-win-x64-<ver>.zip comparten
+    # prefijo) y segun el orden lo renombraba mal.
+    set(_ort_extracted "${CMAKE_CURRENT_BINARY_DIR}/_deps/onnxruntime-win-x64-${ORT_VERSION}")
+    file(RENAME "${_ort_extracted}" "${ORT_DIR}")
 endif()
+
+# 2) Sobrescribir onnxruntime.dll con el que lleva el EP de DirectML dentro
+if(NOT EXISTS "${ORT_DML_NUPKG}")
+    message(STATUS "Downloading ORT ${ORT_VERSION} DirectML (NuGet) ...")
+    file(DOWNLOAD "${ORT_DML_NUPKG_URL}" "${ORT_DML_NUPKG}" INACTIVITY_TIMEOUT 60 SHOW_PROGRESS)
+endif()
+if(EXISTS "${ORT_DML_NUPKG}")
+    file(ARCHIVE_EXTRACT INPUT "${ORT_DML_NUPKG}"
+         DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/_deps/_dmlpkg"
+         PATTERNS "runtimes/win-x64/native/*")
+    file(COPY "${CMAKE_CURRENT_BINARY_DIR}/_deps/_dmlpkg/runtimes/win-x64/native/onnxruntime.dll"
+         DESTINATION "${ORT_DIR}/lib")
+    file(REMOVE_RECURSE "${CMAKE_CURRENT_BINARY_DIR}/_deps/_dmlpkg")
+    message(STATUS "ORT ${ORT_VERSION} core reemplazado por la variante DirectML (EP integrado)")
+endif()
+
+# 3) DLL de reenvio: el codigo carga onnxruntime_providers_dml.dll con
+# GetProcAddress("OrtSessionOptionsAppendExecutionProvider_DML"), pero ese
+# simbolo lo exporta onnxruntime.dll. Este DLL de 1 KB reenvia la llamada, sin
+# tocar el fuente. Ver tools/onnxruntime_providers_dml.def.
 
 if(EXISTS "${ORT_DIR}/lib/onnxruntime.lib")
     target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${ORT_DIR}/include")
@@ -102,24 +132,21 @@ if(EXISTS "${ORT_DIR}/lib/onnxruntime.lib")
     # Install ORT DLLs alongside the plugin
     install(FILES "${ORT_DIR}/lib/onnxruntime.dll"
                   "${ORT_DIR}/lib/onnxruntime_providers_shared.dll"
-            DESTINATION "obs-plugins/64bit")
-    if(EXISTS "${ORT_DIR}/lib/onnxruntime_providers_cuda.dll")
-        install(FILES "${ORT_DIR}/lib/onnxruntime_providers_cuda.dll"
-                DESTINATION "obs-plugins/64bit")
-    endif()
-    if(EXISTS "${ORT_DIR}/lib/onnxruntime_providers_dml.dll")
-        install(FILES "${ORT_DIR}/lib/onnxruntime_providers_dml.dll"
-                DESTINATION "obs-plugins/64bit")
-    endif()
+             DESTINATION "obs-plugins/64bit")
+    # El core DirectML ya lleva el EP dentro; este DLL de 1 KB solo reenvia el
+    # simbolo que el codigo busca por nombre.
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/tools/onnxruntime_providers_dml.dll"
+             DESTINATION "obs-plugins/64bit")
     # Install CUDA runtime DLLs needed by the CUDA provider
     # Convert Windows backslash paths to CMake forward-slash paths
     set(_cuda_dll_dirs "")
     if(DEFINED ENV{CUDA_PATH})
         set(_cuda_path "$ENV{CUDA_PATH}")
         file(TO_CMAKE_PATH "${_cuda_path}" _cuda_path)
-        list(APPEND _cuda_dll_dirs "${_cuda_path}/bin")
+        # CUDA 13 movio los runtime a bin/x64; CUDA 12 los tenia en bin.
+        list(APPEND _cuda_dll_dirs "${_cuda_path}/bin/x64" "${_cuda_path}/bin")
     endif()
-    foreach(_dll cudart64_12 cublas64_12 cublasLt64_12 cufft64_11)
+    foreach(_dll cudart64_13 cublas64_13 cublasLt64_13 cufft64_12)
         set(_found FALSE)
         foreach(_dir ${_cuda_dll_dirs})
             if(EXISTS "${_dir}/${_dll}.dll")
@@ -187,6 +214,21 @@ if(DEFINED ENV{TENSORRT_ROOT})
                 unset(CUDART_LIB)
             endif()
             unset(_cuda_inc)
+            message(STATUS "CUDA runtime from toolkit: ${_cuda_inc}")
+        else()
+            # Sin el toolkit no se puede fijar CUDA_PATH, pero
+            # tensorrt_detector.cpp se compila igualmente y llama a la API de
+            # CUDA runtime: el enlace falla con los simbolos cuda* sin
+            # resolver. La DLL de cudart que despliega OBS si existe, asi que
+            # se enlaza contra una libreria de importacion generada a partir de
+            # ella con dumpbin + lib. Ver scripts/gen_cudart_lib.py.
+            set(_cudart_fallback "${CMAKE_CURRENT_SOURCE_DIR}/cudalib/cudart64_12.lib")
+            if(EXISTS "${_cudart_fallback}")
+                target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE "${_cudart_fallback}")
+                message(STATUS "CUDA toolkit ausente: enlazando contra la libreria de importacion generada desde cudart64_12.dll")
+            else()
+                message(WARNING "CUDA toolkit ausente y no existe ${_cudart_fallback}: el enlace fallara con los simbolos cuda* sin resolver. Ejecuta scripts/gen_cudart_lib.py")
+            endif()
         endif()
         message(STATUS "TensorRT found: ${_trt_root}")
     else()
@@ -263,9 +305,8 @@ target_sources(
           src/classifier/vtes_card_classifier.cpp
           src/ocr/vtes_ocr.cpp
           src/ocr/vtes_api_lookup.cpp
+          src/overlay/rulings_view.cpp
           src/ocr/nis_upscaler.cpp)
-
-
 
 # Configure plugin target properties (install, resources, etc.)
 set_target_properties_plugin(${CMAKE_PROJECT_NAME})

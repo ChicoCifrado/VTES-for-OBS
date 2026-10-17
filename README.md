@@ -94,6 +94,24 @@ cmake --build --preset windows-x64 --config RelWithDebInfo --parallel
 cmake --install build_x64 --prefix release/RelWithDebInfo --config RelWithDebInfo
 ```
 
+### Compilar contra el OBS instalado (SDK local)
+
+Por defecto el build descarga obs-studio y compila libobs desde fuente dentro
+de `.deps`. Para evitarlo y compilar contra el OBS que ya tienes instalado:
+
+```powershell
+scripts\make_obs_sdk.bat
+cmake --preset windows-x64
+```
+
+El script fabrica `.deps\obs-sdk` con las cabeceras de la versión instalada
+(por defecto desde `.deps\include-32.2.2`), genera `obs.lib` a partir de los
+exports del `obs.dll` del sistema y escribe el `libobsConfig.cmake` que define
+`OBS::libobs`. `CMakePresets.json` fija `OBS_SDK_DIR` a ese directorio; si no
+existe (por ejemplo en CI), el build cae de vuelta al camino de siempre y usa
+las dependencias de `buildspec.json`. Para volver al libobs compilado desde
+fuente, borra `.deps\obs-sdk` (o pasa `-DOBS_SDK_DIR=` vacío).
+
 ### Opciones de CMake
 
 | Flag | Descripción |
