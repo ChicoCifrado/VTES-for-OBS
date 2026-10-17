@@ -295,6 +295,7 @@ endif()
 target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE src/plugin-main.c
+          src/i18n.cpp
           src/detect-filter-obb.cpp
           src/detect-filter-obb-info.c
           src/detect-filter-utils.cpp

@@ -2,6 +2,7 @@
 #define VTES_WEB_SERVER_H
 
 #include "vtes_database.hpp"
+#include "i18n.h"
 #include <string>
 #include <thread>
 #include <atomic>
@@ -423,7 +424,7 @@ private:
             toJson(arr, *entry);
             out = arr[0];
         } else {
-            out["error"] = id.empty() ? "missing id parameter" : "card not found";
+            out["error"] = id.empty() ? tf_text("ApiMissingId") : tf_text("ApiCardNotFound");
         }
 
         std::string body = out.dump(2);
@@ -442,7 +443,7 @@ private:
     static std::string rulingsHtml(const VTESCardEntry& entry) {
         std::ostringstream h;
         if (entry.rulings.empty()) {
-            h << "<div class=\"rulings-empty\">Esta carta no tiene rulings.</div>";
+            h << "<div class=\"rulings-empty\">" << tf_text("WebNoRulings") << "</div>";
             return h.str();
         }
 
@@ -484,23 +485,23 @@ private:
 
         std::string title = entry
             ? (entry->printed_name.empty() ? entry->name : entry->printed_name)
-            : "Carta no encontrada";
+            : tf_text("WebCardNotFound");
 
         std::ostringstream h;
-        h << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+        h << "<!DOCTYPE html><html lang=\"" << tf_i18n_code() << "\"><head><meta charset=\"UTF-8\">"
           << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
           << "<title>" << escapeHtml(title) << " — VTES</title><style>" << PAGE_CSS
           << "</style></head><body><div class=\"container\">"
           << "<div class=\"nav-bar\">"
-          << "<a href=\"/\">Buscar</a>"
+          << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
-          << "<a href=\"/detections\">Detecciones</a>"
+          << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
           << "<span class=\"status-bar\">Rulings</span></div>";
 
         if (!entry) {
-            h << "<h1>Carta no encontrada</h1>"
-              << "<div class=\"error\">No hay ninguna carta con id "
-              << escapeHtml(id.empty() ? "(vacío)" : id) << ".</div>";
+            h << "<h1>" << tf_text("WebCardNotFound") << "</h1>"
+              << "<div class=\"error\">" << tf_text("WebNoCardWithId") << " "
+              << escapeHtml(id.empty() ? tf_text("WebEmpty") : std::string(id)) << ".</div>";
         } else {
             h << "<h1>" << escapeHtml(title) << "</h1>";
             if (!entry->name_es.empty() || !entry->name_fr.empty()) {
@@ -639,17 +640,17 @@ private:
 
     void servePoolPage(SOCKET client) {
         std::ostringstream h;
-        h << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+        h << "<!DOCTYPE html><html lang=\"" << tf_i18n_code() << "\"><head><meta charset=\"UTF-8\">"
           << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
           << "<title>VTES Pool Control</title><style>"
           << PAGE_CSS
           << "</style></head><body><div class=\"container\">"
-          << "<h1>Control de Pool</h1>"
+          << "<h1>" << tf_text("WebPoolControl") << "</h1>"
           << "<div class=\"nav-bar\">"
-          << "<a href=\"/\">Buscar Cartas</a>"
-          << "<a href=\"/detections\">Detecciones</a>"
+          << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
+          << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
           << "<a href=\"/pool\" class=\"active\">Pool</a>"
-          << "<span class=\"status\" id=\"status\">Conectado</span>"
+          << "<span class=\"status\" id=\"status\">" << tf_text("WebConnected") << "</span>"
           << "</div>"
           << "<div id=\"players\"></div>"
           << "<script>"
@@ -658,7 +659,8 @@ private:
           << "const r=await fetch('/api/pool/status');"
           << "const data=await r.json();"
           << "const c=document.getElementById('players');"
-          << "c.innerHTML='<table class=\"pool-table\"><tr><th>Jugador</th><th>Pool</th><th></th></tr>';"
+          << "c.innerHTML='<table class=\"pool-table\"><tr><th>" << tf_text("WebPlayer")
+          << "</th><th>Pool</th><th></th></tr>';"
           << "for(let i=0;i<data.length;i++){"
           << "const d=data[i];"
           << "c.innerHTML+='<tr>'"
@@ -716,17 +718,17 @@ private:
 
     void serveDetectionsPage(SOCKET client) {
         std::ostringstream h;
-        h << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+        h << "<!DOCTYPE html><html lang=\"" << tf_i18n_code() << "\"><head><meta charset=\"UTF-8\">"
           << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-          << "<title>VTES Detecciones del Directo</title><style>"
+          << "<title>VTES " << tf_text("WebLiveDetections") << "</title><style>"
           << PAGE_CSS
           << "</style></head><body><div class=\"container\">"
-          << "<h1>Detecciones del Directo</h1>"
+          << "<h1>" << tf_text("WebLiveDetections") << "</h1>"
           << "<div class=\"nav-bar\">"
-          << "<a href=\"/\">Buscar Cartas</a>"
+          << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
-          << "<a href=\"/detections\" class=\"active\">Detecciones</a>"
-          << "<span class=\"status\" id=\"status\">Conectado</span>"
+          << "<a href=\"/detections\" class=\"active\">" << tf_text("WebDetections") << "</a>"
+          << "<span class=\"status\" id=\"status\">" << tf_text("WebConnected") << "</span>"
           << "</div>"
           << "<div id=\"grid\" class=\"detection-grid\"></div>"
           << "<script>"
@@ -735,7 +737,7 @@ private:
           << "const data=await r.json();"
           << "const grid=document.getElementById('grid');"
           << "grid.innerHTML='';"
-          << "if(data.length===0){grid.innerHTML='<div class=\"empty\">Aún no hay detecciones</div>';return}"
+          << "if(data.length===0){grid.innerHTML='<div class=\"empty\">" << tf_text("WebNoDetections") << "</div>';return}"
           << "for(const d of data){"
           << "const div=document.createElement('div');"
           << "div.className='detection-card';"
@@ -755,7 +757,7 @@ private:
           << "loadDetections();"
           << "setInterval(loadDetections,2000);"
           << "</script>"
-          << "<div class=\"footer\">VTES Card Scanner — Haz clic en una carta para mostrarla en el overlay de OBS</div>"
+          << "<div class=\"footer\">VTES Card Scanner — " << tf_text("WebClickOverlay") << "</div>"
           << "</div></body></html>";
         std::string body = h.str();
         std::string header =
@@ -769,16 +771,16 @@ private:
     }
 
     void send404(SOCKET client) {
-        const char *body = "<h1>404 Not Found</h1>";
+        std::string body = "<h1>" + std::string(tf_text("Web404")) + "</h1>";
         std::string resp = "HTTP/1.1 404 Not Found\r\nContent-Length: " +
-            std::to_string(strlen(body)) + "\r\nConnection: close\r\n\r\n" + body;
+            std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
         sendAll(client, resp);
     }
 
     void send405(SOCKET client) {
-        const char *body = "<h1>405 Method Not Allowed</h1>";
+        std::string body = "<h1>" + std::string(tf_text("Web405")) + "</h1>";
         std::string resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: " +
-            std::to_string(strlen(body)) + "\r\nConnection: close\r\n\r\n" + body;
+            std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
         sendAll(client, resp);
     }
 
@@ -799,35 +801,36 @@ private:
         std::ostringstream h;
         size_t dbSize = (db_ && !db_->is_empty()) ? db_->size() : 0;
         const char *dbStatus = (db_ && !db_->is_empty()) ? "ready" : "empty";
-        h << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+        const char *dbStatusText = (db_ && !db_->is_empty()) ? tf_text("WebDbReady") : tf_text("WebDbEmpty");
+        h << "<!DOCTYPE html><html lang=\"" << tf_i18n_code() << "\"><head><meta charset=\"UTF-8\">"
           << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-          << "<title>VTES Card Search</title><style>"
+          << "<title>" << tf_text("WebCardSearch") << "</title><style>"
           << PAGE_CSS
           << "</style></head><body><div class=\"container\">"
-          << "<h1>VTES Card Search</h1>"
+          << "<h1>" << tf_text("WebCardSearch") << "</h1>"
           << "<form class=\"search-box\" action=\"/search\" method=\"get\">"
-          << "<input type=\"text\" name=\"q\" placeholder=\"e.g. Aabbt or type:Vampire clan:Ventrue cap>5\" autofocus>"
-          << "<button type=\"submit\">Search</button></form>"
+          << "<input type=\"text\" name=\"q\" placeholder=\"" << tf_text("WebPlaceholder") << "\" autofocus>"
+          << "<button type=\"submit\">" << tf_text("WebSearch") << "</button></form>"
           << "<div class=\"nav-bar\">"
-          << "<a href=\"/\">Buscar</a>"
+          << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
-          << "<a href=\"/detections\">Detecciones</a>"
-          << "<span class=\"status-bar\">Database: <span class=\"status-" << dbStatus << "\">"
-          << dbStatus << "</span>"
-          << (dbSize > 0 ? " (" + std::to_string(dbSize) + " cards)" : "")
+          << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<span class=\"status-bar\">" << tf_text("WebDbLabel") << " <span class=\"status-" << dbStatus << "\">"
+          << dbStatusText << "</span>"
+          << (dbSize > 0 ? " (" + std::to_string(dbSize) + " " + tf_text("WebCardsWord") + ")" : "")
           << " | <a href=\"/api/status\">API</a>"
           << "</span></div>"
           << "<div class=\"legend\">"
-          << "<h3>Search tips</h3>"
-          << "<table><tr><td><code>Aabbt</code></td><td>by name (EN / ES / FR / variants)</td></tr>"
-          << "<tr><td><code>type:Vampire</code></td><td>card type: Vampire, Master, Combat, etc.</td></tr>"
-          << "<tr><td><code>clan:Ventrue</code></td><td>clan</td></tr>"
-          << "<tr><td><code>disc:aus</code></td><td>discipline abbreviation</td></tr>"
-          << "<tr><td><code>cap:5</code></td><td>exact capacity</td></tr>"
-          << "<tr><td><code>cap>5</code> <code>cap&lt;4</code></td><td>capacity range</td></tr>"
-          << "<tr><td><code>group:4</code></td><td>group number</td></tr>"
-          << "<tr><td><code>text:bleed</code></td><td>search card text</td></tr>"
-          << "<tr><td colspan=\"2\">Combine terms: <code>type:Vampire clan:Nosferatu disc:obf cap>4</code></td></tr>"
+          << "<h3>" << tf_text("WebTipsTitle") << "</h3>"
+          << "<table><tr><td><code>Aabbt</code></td><td>" << tf_text("WebTipName") << "</td></tr>"
+          << "<tr><td><code>type:Vampire</code></td><td>" << tf_text("WebTipType") << "</td></tr>"
+          << "<tr><td><code>clan:Ventrue</code></td><td>" << tf_text("WebTipClan") << "</td></tr>"
+          << "<tr><td><code>disc:aus</code></td><td>" << tf_text("WebTipDisc") << "</td></tr>"
+          << "<tr><td><code>cap:5</code></td><td>" << tf_text("WebTipCap") << "</td></tr>"
+          << "<tr><td><code>cap>5</code> <code>cap&lt;4</code></td><td>" << tf_text("WebTipCapRange") << "</td></tr>"
+          << "<tr><td><code>group:4</code></td><td>" << tf_text("WebTipGroup") << "</td></tr>"
+          << "<tr><td><code>text:bleed</code></td><td>" << tf_text("WebTipText") << "</td></tr>"
+          << "<tr><td colspan=\"2\">" << tf_text("WebTipsCombine") << " <code>type:Vampire clan:Nosferatu disc:obf cap>4</code></td></tr>"
           << "</table></div>"
           << "<div class=\"footer\">VTES Card Scanner</div></div></body></html>";
         return h.str();
@@ -837,28 +840,29 @@ private:
         std::ostringstream h;
         size_t dbSize = (db_ && !db_->is_empty()) ? db_->size() : 0;
         const char *dbStatus = (db_ && !db_->is_empty()) ? "ready" : "empty";
-        h << "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
+        const char *dbStatusText = (db_ && !db_->is_empty()) ? tf_text("WebDbReady") : tf_text("WebDbEmpty");
+        h << "<!DOCTYPE html><html lang=\"" << tf_i18n_code() << "\"><head><meta charset=\"UTF-8\">"
           << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-          << "<title>VTES Card Search</title><style>" << PAGE_CSS
+          << "<title>" << tf_text("WebCardSearch") << "</title><style>" << PAGE_CSS
           << "</style></head><body><div class=\"container\">"
-          << "<h1>VTES Card Search</h1>"
+          << "<h1>" << tf_text("WebCardSearch") << "</h1>"
           << "<form class=\"search-box\" action=\"/search\" method=\"get\">"
           << "<input type=\"text\" name=\"q\" value=\"" << escapeHtml(q) << "\" autofocus>"
-          << "<button type=\"submit\">Search</button></form>"
+          << "<button type=\"submit\">" << tf_text("WebSearch") << "</button></form>"
           << "<div class=\"nav-bar\">"
-          << "<a href=\"/\">Buscar</a>"
+          << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
-          << "<a href=\"/detections\">Detecciones</a>"
-          << "<span class=\"status-bar\">Database: <span class=\"status-" << dbStatus << "\">"
-          << dbStatus << "</span>"
-          << (dbSize > 0 ? " (" + std::to_string(dbSize) + " cards)" : "")
-          << " | <a href=\"/\">tips</a>"
+          << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<span class=\"status-bar\">" << tf_text("WebDbLabel") << " <span class=\"status-" << dbStatus << "\">"
+          << dbStatusText << "</span>"
+          << (dbSize > 0 ? " (" + std::to_string(dbSize) + " " + tf_text("WebCardsWord") + ")" : "")
+          << " | <a href=\"/\">" << tf_text("WebTipsLink") << "</a>"
           << "</span></div>"
           << "<div id=\"results\">";
 
         if (!db_ || db_->is_empty()) {
-            h << "<div class=\"error\">Database not loaded or empty"
-              << (db_ ? ". Check OBS log for details." : "")
+            h << "<div class=\"error\">" << tf_text("WebDbNotLoaded")
+              << (db_ ? tf_text("WebDbCheckLog") : "")
               << "</div></div></div></body></html>";
             return h.str();
         }
@@ -890,7 +894,7 @@ private:
                     }
                 }
                 if (entry.capacity > 0) h << " | Cap: " << entry.capacity;
-                if (entry.group > 0) h << " | Group: " << entry.group;
+                if (entry.group > 0) h << " | " << tf_text("WebGroupWord") << ": " << entry.group;
                 if (!entry.disciplines.empty()) {
                     h << " | ";
                     for (size_t i = 0; i < entry.disciplines.size(); i++) {
@@ -904,16 +908,16 @@ private:
                 h << "</div>";
                 count++;
                 if (count >= 50) {
-                    h << "<div class=\"empty\">Showing first 50 results. Narrow your search.</div>";
+                    h << "<div class=\"empty\">" << tf_text("WebFirst50") << "</div>";
                     break;
                 }
             }
         }
 
         if (count == 0)
-            h << "<div class=\"empty\">No cards found</div>";
+            h << "<div class=\"empty\">" << tf_text("WebNoCards") << "</div>";
 
-        h << "</div><div class=\"footer\">VTES Card Scanner — Haz clic en una carta para mostrarla en el overlay de OBS</div>"
+        h << "</div><div class=\"footer\">VTES Card Scanner — " << tf_text("WebClickOverlay") << "</div>"
           << "<script>"
           << "function showOverlay(url,img){"
           << "fetch('/api/overlay?url='+encodeURIComponent(url));"

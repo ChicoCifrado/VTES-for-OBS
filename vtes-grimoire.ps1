@@ -343,6 +343,40 @@ function Invoke-Deploy {
         Copy-Item $srcData $dstData -Recurse -Force
         Write-Success ("Data copiada: " + $srcData + " -> " + $dstData)
     } else { Write-Error "Data no encontrada en: $srcData" }
+    # ── Silenciar avisos de locale de modulos internos de OBS (decklink) ──
+    # decklink-captions / decklink-output-ui no traen carpeta locale y OBS
+    # avisa en cada arranque ("Failed to load 'xx-YY' text for module").
+    # Se crean los .ini minimos que OBS espera, si no existen.
+    $userIni = Join-Path $env:APPDATA "obs-studio\user.ini"
+    $obsLocaleCfg = ""
+    if (Test-Path $userIni) {
+        $m = Select-String -Path $userIni -Pattern '^\s*Language\s*=\s*(.+)$' -List
+        if ($m) { $obsLocaleCfg = $m.Matches[0].Groups[1].Value.Trim() }
+    }
+    $quietLocales = @("en-US", "es-ES", $obsLocaleCfg, [System.Globalization.CultureInfo]::CurrentUICulture.Name) |
+        Where-Object { $_ -and $_ -match '^[A-Za-z]{2}(-[A-Za-z]{2})?$' } | Select-Object -Unique
+    $obsPluginsData = Split-Path $dstData -Parent
+    $localeFixed = 0
+    foreach ($mod in @("decklink-captions", "decklink-output-ui")) {
+        $locDir = Join-Path (Join-Path $obsPluginsData $mod) "locale"
+        foreach ($loc in $quietLocales) {
+            $locIni = Join-Path $locDir "$loc.ini"
+            if (Test-Path $locIni) { continue }
+            if (-not (Test-Path $locDir)) { New-Item -ItemType Directory -Path $locDir -Force | Out-Null }
+            $quietLines = @(
+                "OBS builtin module ($mod): no own locale strings; hardcoded English UI.",
+                "File created by the vtes-card-scanner deploy to silence the warning",
+                "'Failed to load ''$loc'' text for module: ''$mod.dll''' in the obs log."
+            )
+            Set-Content -Path $locIni -Value $quietLines -Encoding Ascii
+            $localeFixed++
+        }
+    }
+    if ($localeFixed -gt 0) {
+        Write-Info ("Avisos de locale de OBS (decklink) silenciados: " + $localeFixed + " archivos creados")
+    } else {
+        Write-Info "Avisos de locale de OBS (decklink): ya silenciados"
+    }
     # ── Fallback: ensure vtes.engine is in OBS data models dir ─────
     $engineSrc = Join-Path $SCRIPT:PROJECT_ROOT "vtes.engine"
     $engineDstDir = Join-Path $dstData "models"

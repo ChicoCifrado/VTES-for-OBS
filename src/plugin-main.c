@@ -19,19 +19,25 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <obs-module.h>
 #include <plugin-support.h>
 #include <curl/curl.h>
+#include "i18n.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
-	return obs_module_text("DetectFilterPlugin");
+	return tf_text("DetectFilterPlugin");
 }
 
 extern struct obs_source_info detect_filter_obb_info;
 
 bool obs_module_load(void)
 {
+	/* Textos del plugin: espanol nativo + ingles. En la primera carga se
+	 * pregunta al usuario que idioma quiere (dos botones). */
+	tf_i18n_init();
+	tf_i18n_prompt_if_needed();
+
 	curl_global_init(CURL_GLOBAL_DEFAULT);
 
 	obs_register_source(&detect_filter_obb_info);
