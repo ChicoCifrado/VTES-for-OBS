@@ -287,6 +287,10 @@ bool VtesOcrReader::recognize(const cv::Mat& card_bgr,
 
     // Indice de debug para esta lectura (-1 = ya no se guardan mas)
     const int dbg_idx = (g_ocr_debug_saves < kMaxOcrDebugSaves) ? g_ocr_debug_saves++ : -1;
+    if (dbg_idx >= 0) {
+        obs_log(LOG_INFO, "[OCR] warp card: %dx%d", card_bgr.cols, card_bgr.rows);
+        saveOcrDebugImage("vtes_ocr_card_" + std::to_string(dbg_idx) + ".png", card_bgr);
+    }
 
     // Step 1: visually locate the card name region (instead of hardcoded crop)
     cv::Mat name_region = detectNameRegion(card_bgr, card_type_hint);
@@ -568,11 +572,32 @@ cv::Mat VtesOcrReader::preprocessForOcr(const cv::Mat& region, bool already_upsc
     // nombre en tinta oscura sobre banner claro, pero la quinta edicion
     // (V5/V5C, reediciones) lo imprime en claro sobre banner oscuro. Como
     // Tesseract trabaja siempre con tinta oscura sobre fondo claro
-    // (tessedit_do_invert=0), se invierte la banda cuando el fondo es
-    // oscuro. Sin esto, el umbral producia una imagen casi negra con halos
-    // blancos: las letras quedaban fundidas con el fondo.
-    const double band_mean = cv::mean(gray)[0];
-    const bool inverted_polarity = band_mean < 110.0;
+    // (tessedit_do_invert=0), se invierte la banda cuando el texto es claro.
+    // La decision por media (band_mean < 110) fallaba en bandas luminosas
+    // (banner oscuro con reflejos/textura del arte: media > 110 pero texto
+    // claro): se compara la asimetria de las colas del histograma — si la
+    // cola clara es mas larga que la oscura, la minoria (el texto) es clara.
+    bool inverted_polarity = false;
+    {
+        int hist[256] = {0};
+        for (int y = 0; y < gray.rows; ++y) {
+            const uchar *row = gray.ptr<uchar>(y);
+            for (int x = 0; x < gray.cols; ++x) hist[row[x]]++;
+        }
+        const double total = (double)gray.rows * (double)gray.cols;
+        int p2 = 0, p50 = 128, p98 = 255;
+        bool ok2 = false, ok50 = false;
+        double acc = 0.0;
+        for (int v = 0; v < 256; ++v) {
+            acc += hist[v];
+            if (!ok2 && acc >= total * 0.02) { p2 = v; ok2 = true; }
+            if (!ok50 && acc >= total * 0.50) { p50 = v; ok50 = true; }
+            if (acc >= total * 0.98) { p98 = v; break; }
+        }
+        inverted_polarity = (p98 - p50) > (p50 - p2);
+        obs_log(LOG_DEBUG, "[OCR] polaridad: p2=%d p50=%d p98=%d invertir=%d",
+                p2, p50, p98, (int)inverted_polarity);
+    }
     if (inverted_polarity) {
         cv::bitwise_not(gray, gray);
     }
