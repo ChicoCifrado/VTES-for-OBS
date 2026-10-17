@@ -51,6 +51,11 @@ public:
     std::function<std::vector<std::pair<std::string,int>>()> get_pool_fn;
     // Estado de partida (minions y giro de cartas por jugador) como JSON.
     std::function<nlohmann::json()> get_game_fn;
+    // Modo realizador: cola de detecciones pendientes + feedback de entrenamiento
+    std::function<nlohmann::json()> get_pending_fn;
+    std::function<nlohmann::json(uint64_t)> on_pending_select_fn;
+    std::function<nlohmann::json()> on_pending_clear_fn;
+    std::function<std::string(uint64_t)> get_pending_crop_fn;
 
     bool start(int port, const VTESCardDatabase *db) {
         if (running_) stop();
@@ -188,6 +193,16 @@ private:
             serveGameStatus(client);
         } else if (uri == "/game") {
             serveGamePage(client);
+        } else if (uri == "/api/pending") {
+            servePendingStatus(client);
+        } else if (uri == "/api/pending/select") {
+            servePendingSelect(client, query);
+        } else if (uri == "/api/pending/clear") {
+            servePendingClear(client);
+        } else if (uri == "/api/pending/crop") {
+            servePendingCrop(client, query);
+        } else if (uri == "/pending") {
+            servePendingPage(client);
         } else if (uri == "/search") {
             serveHtmlResult(client, q);
         } else if (uri == "/detections") {
@@ -503,6 +518,7 @@ private:
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
           << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\">" << tf_text("WebPending") << "</a>"
           << "<span class=\"status-bar\">Rulings</span></div>";
 
         if (!entry) {
@@ -657,6 +673,7 @@ private:
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
           << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\">" << tf_text("WebPending") << "</a>"
           << "<a href=\"/pool\" class=\"active\">Pool</a>"
           << "<span class=\"status\" id=\"status\">" << tf_text("WebConnected") << "</span>"
           << "</div>"
@@ -742,6 +759,157 @@ private:
         sendAll(client, body);
     }
 
+    // ─── Modo realizador: API + pagina de pendientes ─────────────────
+    void sendJsonResponse(SOCKET client, const nlohmann::json &j) {
+        std::string body = j.dump(2);
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    uint64_t parseIdParam(const std::string &query) {
+        uint64_t id = 0;
+        size_t pos = query.find("id=");
+        if (pos == std::string::npos)
+            return 0;
+        const char *s = query.c_str() + pos + 3;
+        while (*s >= '0' && *s <= '9') {
+            id = id * 10 + (uint64_t)(*s - '0');
+            ++s;
+        }
+        return id;
+    }
+
+    void servePendingStatus(SOCKET client) {
+        nlohmann::json j;
+        if (get_pending_fn) {
+            j = get_pending_fn();
+        } else {
+            j["director_mode"] = false;
+            j["pending"] = nlohmann::json::array();
+        }
+        sendJsonResponse(client, j);
+    }
+
+    void servePendingSelect(SOCKET client, const std::string &query) {
+        uint64_t id = parseIdParam(query);
+        nlohmann::json j;
+        if (on_pending_select_fn && id > 0) {
+            j = on_pending_select_fn(id);
+        } else {
+            j["ok"] = false;
+            j["error"] = "bad_id";
+        }
+        sendJsonResponse(client, j);
+    }
+
+    void servePendingClear(SOCKET client) {
+        nlohmann::json j;
+        if (on_pending_clear_fn)
+            j = on_pending_clear_fn();
+        else
+            j["ok"] = false;
+        sendJsonResponse(client, j);
+    }
+
+    void servePendingCrop(SOCKET client, const std::string &query) {
+        uint64_t id = parseIdParam(query);
+        std::string body;
+        if (get_pending_crop_fn && id > 0)
+            body = get_pending_crop_fn(id);
+        if (body.empty()) {
+            send404(client);
+            return;
+        }
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: image/jpeg\r\n"
+            "Cache-Control: no-store\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    void servePendingPage(SOCKET client) {
+        std::ostringstream h;
+        h << "<!DOCTYPE html><html lang=\"" << tf_i18n_code() << "\"><head><meta charset=\"UTF-8\">"
+          << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+          << "<title>VTES — " << tf_text("WebPending") << "</title><style>"
+          << PAGE_CSS
+          << "</style></head><body><div class=\"container\">"
+          << "<h1>" << tf_text("WebPending") << "</h1>"
+          << "<div class=\"nav-bar\">"
+          << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
+          << "<a href=\"/pool\">Pool</a>"
+          << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\" class=\"active\">" << tf_text("WebPending") << "</a>"
+          << "</div>"
+          << "<div class=\"game-legend\">" << tf_text("WebPendingHint") << "</div>"
+          << "<div id=\"msgEmpty\" class=\"empty\" style=\"display:none\">" << tf_text("WebPendingEmpty") << "</div>"
+          << "<div id=\"msgOff\" class=\"empty\" style=\"display:none\">" << tf_text("WebPendingModeOff") << "</div>"
+          << "<div id=\"grid\" class=\"detection-grid\"></div>"
+          << "<div class=\"pending-actions\">"
+          << "<button id=\"discardBtn\">" << tf_text("WebPendingDiscard") << "</button>"
+          << "<button id=\"overlayBtn\">" << tf_text("WebPendingClearOverlay") << "</button>"
+          << "</div>"
+          << "<div class=\"footer\" id=\"fb\"></div>"
+          << "</div>"
+          << "<script>"
+          << "async function selectCard(id){try{"
+          << "const r=await fetch('/api/pending/select?id='+id);const j=await r.json();"
+          << "if(j.ok){load();}}catch(e){}}"
+          << "function cardEl(p){"
+          << "const d=document.createElement('div');d.className='pending-card';"
+          << "d.onclick=function(){selectCard(p.id);};"
+          << "const row=document.createElement('div');row.className='pending-imgs';"
+          << "const img=document.createElement('img');img.loading='lazy';"
+          << "img.src=p.card_url?p.card_url:('/api/pending/crop?id='+p.id);row.appendChild(img);"
+          << "if(p.card_url){const ev=document.createElement('img');ev.loading='lazy';"
+          << "ev.src='/api/pending/crop?id='+p.id;row.appendChild(ev);}"
+          << "d.appendChild(row);"
+          << "const nm=document.createElement('div');nm.className='pending-name';"
+          << "nm.textContent=p.card_name||p.card_id;d.appendChild(nm);"
+          << "const mt=document.createElement('div');mt.className='pending-meta';"
+          << "mt.textContent='conf '+(p.confidence||0).toFixed(2)+' · x'+p.hits+' · "
+          << "Math.round((p.fresh_ms||0)/1000)+'s';d.appendChild(mt);"
+          << "return d;}"
+          << "async function load(){try{"
+          << "const r=await fetch('/api/pending');const d=await r.json();"
+          << "const grid=document.getElementById('grid');const mE=document.getElementById('msgEmpty');"
+          << "const mO=document.getElementById('msgOff');"
+          << "grid.innerHTML='';mE.style.display='none';mO.style.display='none';"
+          << "if(!d.director_mode){mO.style.display='block';}"
+          << "else if(!d.pending.length){mE.style.display='block';}"
+          << "else{for(const p of d.pending){grid.appendChild(cardEl(p));}}"
+          << "document.getElementById('fb').textContent='Feedback: '+(d.feedback_dir||'');"
+          << "}catch(e){}}"
+          << "document.getElementById('discardBtn').onclick=async function(){"
+          << "try{await fetch('/api/pending/clear');load();}catch(e){}};"
+          << "document.getElementById('overlayBtn').onclick=async function(){"
+          << "try{await fetch('/api/overlay/clear');}catch(e){}};"
+          << "load();setInterval(load,2000);"
+          << "</script>"
+          << "</div></body></html>";
+        std::string body = h.str();
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
     void serveGamePage(SOCKET client) {
         std::ostringstream h;
         h << "<!DOCTYPE html><html lang=\"" << tf_i18n_code() << "\"><head><meta charset=\"UTF-8\">"
@@ -755,6 +923,7 @@ private:
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
           << "<a href=\"/game\" class=\"active\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\">" << tf_text("WebPending") << "</a>"
           << "<span class=\"status\" id=\"status\">" << tf_text("WebConnected") << "</span>"
           << "</div>"
           << "<div class=\"game-legend\">&#128274; " << tf_text("WebLockedWord")
@@ -817,6 +986,7 @@ private:
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\" class=\"active\">" << tf_text("WebDetections") << "</a>"
           << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\">" << tf_text("WebPending") << "</a>"
           << "<span class=\"status\" id=\"status\">" << tf_text("WebConnected") << "</span>"
           << "</div>"
           << "<div id=\"grid\" class=\"detection-grid\"></div>"
@@ -905,6 +1075,7 @@ private:
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
           << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\">" << tf_text("WebPending") << "</a>"
           << "<span class=\"status-bar\">" << tf_text("WebDbLabel") << " <span class=\"status-" << dbStatus << "\">"
           << dbStatusText << "</span>"
           << (dbSize > 0 ? " (" + std::to_string(dbSize) + " " + tf_text("WebCardsWord") + ")" : "")
@@ -944,6 +1115,7 @@ private:
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
           << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\">" << tf_text("WebPending") << "</a>"
           << "<span class=\"status-bar\">" << tf_text("WebDbLabel") << " <span class=\"status-" << dbStatus << "\">"
           << dbStatusText << "</span>"
           << (dbSize > 0 ? " (" + std::to_string(dbSize) + " " + tf_text("WebCardsWord") + ")" : "")
@@ -1097,6 +1269,15 @@ private:
         ".detection-card .name{color:#c9a84c;font-size:.85rem;text-align:center}"
         ".detection-card .time{color:#666;font-size:.7rem;text-align:center;margin-top:4px}"
         ".detection-card.active{border-color:#4caf50;box-shadow:0 0 12px rgba(76,175,80,.3)}"
+        ".pending-card{border:1px solid #333;border-radius:8px;padding:12px;background:#16213e;cursor:pointer;transition:border-color .2s}"
+        ".pending-card:hover{border-color:#c9a84c;box-shadow:0 0 12px rgba(201,168,76,.25)}"
+        ".pending-imgs{display:flex;gap:6px;margin-bottom:8px}"
+        ".pending-imgs img{width:50%;border-radius:4px;background:#0d1b3e;object-fit:cover}"
+        ".pending-name{color:#c9a84c;font-size:.85rem;text-align:center}"
+        ".pending-meta{color:#666;font-size:.7rem;text-align:center;margin-top:4px}"
+        ".pending-actions{margin-top:16px;display:flex;gap:10px;justify-content:center}"
+        ".pending-actions button{padding:8px 16px;border:none;border-radius:6px;background:#0f3460;color:#c9a84c;font-size:.9rem;cursor:pointer;font-family:inherit}"
+        ".pending-actions button:hover{background:#1a4a80}"
         ".status-bar{margin-bottom:20px;font-size:.85rem;color:#888;padding:8px 12px;background:#0d1b3e;border-radius:4px}"
         ".status-bar a{color:#c9a84c;text-decoration:none}"
         ".status-bar a:hover{text-decoration:underline}"

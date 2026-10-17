@@ -47,6 +47,8 @@ static constexpr int kSlotY[5] = {89, 170, 249, 327, 401};
 #include <memory>
 #include <exception>
 #include <fstream>
+#include <filesystem>
+#include <ctime>
 #include <new>
 #include <mutex>
 #include <regex>
@@ -975,7 +977,7 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "ocr_enabled", true);
 	obs_data_set_default_bool(settings, "upscaler_enabled", false);
 	obs_data_set_default_bool(settings, "vampire_cuda_enabled", true);
-	obs_data_set_default_bool(settings, "click_to_overlay", false);
+	obs_data_set_default_bool(settings, "click_to_overlay", true);
 	obs_data_set_default_double(settings, "detection_interval_seconds", 0.0);
 	obs_data_set_default_double(settings, "clf_oval_weight", 0.5);
 	obs_data_set_default_double(settings, "clf_color_weight", 0.3);
@@ -1436,6 +1438,14 @@ static void submit_ocr_jobs(detect_filter_obb* tf,
 static void drain_ocr_results(detect_filter_obb* tf,
 							  std::vector<vtes_detection::OBBObject>& objects);
 
+// ─── Modo realizador: pendientes + feedback forward declarations ────
+static void addPendingDetection(detect_filter_obb *tf,
+								const vtes_detection::OBBObject &obj,
+								const cv::Mat &frame, int64_t now_ns);
+static void recordDirectorFeedback(detect_filter_obb *tf, const char *kind,
+								   const filter_data::PendingDetection *chosen,
+								   const std::vector<filter_data::PendingDetection> &pool);
+
 void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 {
 	obs_log(LOG_INFO, "VTES OBB filter created");
@@ -1505,15 +1515,20 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 		return out;
 	};
 	tf->web_server->on_overlay_fn = [tf](const std::string& url) {
-		tf->manual_overlay_url = url;
-		tf->manual_overlay_set_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-			std::chrono::steady_clock::now().time_since_epoch()).count();
-		obs_log(LOG_INFO, "[WebServer] Manual overlay set: %s", url.c_str());
+		{
+			std::lock_guard<std::mutex> lock(tf->game_state_lock);
+			tf->current_overlay_card_url = url;
+			tf->current_overlay_card_id.clear();
+		}
+		obs_log(LOG_INFO, "[WebServer] Overlay manual: %s", url.c_str());
 	};
 	tf->web_server->on_overlay_clear_fn = [tf]() {
-		tf->manual_overlay_url.clear();
-		tf->manual_overlay_set_time_ns = 0;
-		obs_log(LOG_INFO, "[WebServer] Manual overlay cleared");
+		{
+			std::lock_guard<std::mutex> lock(tf->game_state_lock);
+			tf->current_overlay_card_url.clear();
+			tf->current_overlay_card_id.clear();
+		}
+		obs_log(LOG_INFO, "[WebServer] Overlay manual limpiado");
 	};
 	tf->web_server->on_pool_fn = [tf](int player_idx, int delta) {
 		if (player_idx >= 0 && player_idx < tf->player_count) {
@@ -1584,6 +1599,101 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 		}
 		out["players"] = std::move(players_json);
 		return out;
+	};
+
+	// Carpeta de datos de feedback del realizador (entrenamiento futuro),
+	// bajo la config del plugin: .../plugin_config/vtes-card-scanner/feedback
+	{
+		char *cfg_dir = obs_module_config_path("");
+		if (cfg_dir) {
+			tf->feedback_dir = std::string(cfg_dir) + "feedback";
+			bfree(cfg_dir);
+			obs_log(LOG_INFO, "[Director] Datos de feedback en: %s",
+				tf->feedback_dir.c_str());
+		}
+	}
+
+	// Modo realizador: cola de detecciones pendientes (la web las muestra)
+	// y feedback de entrenamiento (elegidas/descartadas con recortes).
+	tf->web_server->get_pending_fn = [tf]() -> nlohmann::json {
+		nlohmann::json out;
+		out["director_mode"] = tf->click_to_overlay;
+		out["feedback_dir"] = tf->feedback_dir;
+		nlohmann::json arr = nlohmann::json::array();
+		const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+		std::lock_guard<std::mutex> lock(tf->pending_lock);
+		for (const auto &p : tf->pending_detections) {
+			nlohmann::json pj;
+			pj["id"] = p.id;
+			pj["card_id"] = p.card_id;
+			pj["card_name"] = p.card_name;
+			pj["card_url"] = p.card_url;
+			pj["confidence"] = p.confidence;
+			pj["hits"] = p.hits;
+			pj["age_ms"] = (now_ns - p.first_seen_ns) / 1000000LL;
+			pj["fresh_ms"] = (now_ns - p.last_seen_ns) / 1000000LL;
+			arr.push_back(std::move(pj));
+		}
+		out["pending"] = std::move(arr);
+		return out;
+	};
+	// Elegir una pendiente: se muestra en el overlay y la cola se limpia.
+	tf->web_server->on_pending_select_fn = [tf](uint64_t id) -> nlohmann::json {
+		nlohmann::json out;
+		filter_data::PendingDetection chosen;
+		std::vector<filter_data::PendingDetection> pool;
+		bool found = false;
+		{
+			std::lock_guard<std::mutex> lock(tf->pending_lock);
+			for (const auto &p : tf->pending_detections) {
+				if (p.id == id) {
+					chosen = p;
+					found = true;
+				}
+			}
+			if (!found) {
+				out["ok"] = false;
+				out["error"] = "not_found";
+				return out;
+			}
+			pool.assign(tf->pending_detections.begin(), tf->pending_detections.end());
+			tf->pending_detections.clear();
+		}
+		{
+			std::lock_guard<std::mutex> lock(tf->game_state_lock);
+			tf->current_overlay_card_url = chosen.card_url;
+			tf->current_overlay_card_id = chosen.card_id;
+		}
+		recordDirectorFeedback(tf, "selection", &chosen, pool);
+		obs_log(LOG_INFO, "[Director] Mostrado \"%s\" (elegida entre %zu; cola limpiada)",
+			chosen.card_name.c_str(), pool.size());
+		out["ok"] = true;
+		out["card_name"] = chosen.card_name;
+		return out;
+	};
+	// Descartar la cola sin mostrar nada (tambien genera feedback).
+	tf->web_server->on_pending_clear_fn = [tf]() -> nlohmann::json {
+		std::vector<filter_data::PendingDetection> pool;
+		{
+			std::lock_guard<std::mutex> lock(tf->pending_lock);
+			pool.assign(tf->pending_detections.begin(), tf->pending_detections.end());
+			tf->pending_detections.clear();
+		}
+		recordDirectorFeedback(tf, "dismissed", nullptr, pool);
+		obs_log(LOG_INFO, "[Director] %zu detecciones descartadas (feedback guardado)",
+			pool.size());
+		nlohmann::json out;
+		out["ok"] = true;
+		out["dismissed"] = pool.size();
+		return out;
+	};
+	tf->web_server->get_pending_crop_fn = [tf](uint64_t id) -> std::string {
+		std::lock_guard<std::mutex> lock(tf->pending_lock);
+		for (const auto &p : tf->pending_detections)
+			if (p.id == id)
+				return std::string((const char *)p.crop_jpg.data(), p.crop_jpg.size());
+		return std::string();
 	};
 	bool ws_ok = tf->web_server->start(tf->web_server_port, &tf->vtes_db);
 	if (ws_ok) {
@@ -1998,6 +2108,151 @@ static float relativeLockAngleDeg(float card_angle_rad, float base_angle_deg)
 	if (rel < 0.0f)
 		rel += 180.0f;
 	return rel - 90.0f;
+}
+
+// ─── Modo realizador: pendientes + feedback de entrenamiento ────────
+
+// Anade (o refresca) una candidata en la cola de pendientes. El recorte
+// del frame se guarda como dato para futuros entrenamientos.
+static void addPendingDetection(detect_filter_obb *tf, const vtes_detection::OBBObject &obj,
+				const cv::Mat &frame, int64_t now_ns)
+{
+	if (obj.card_id.empty())
+		return;
+	std::lock_guard<std::mutex> lock(tf->pending_lock);
+
+	// Limpia pendientes que llevan mucho sin volver a verse (120 s).
+	const int64_t stale_ms = 120000;
+	for (auto it = tf->pending_detections.begin(); it != tf->pending_detections.end();) {
+		if ((now_ns - it->last_seen_ns) / 1000000LL > stale_ms)
+			it = tf->pending_detections.erase(it);
+		else
+			++it;
+	}
+
+	for (auto &p : tf->pending_detections) {
+		if (p.card_id == obj.card_id) {
+			p.last_seen_ns = now_ns;
+			p.hits++;
+			if (obj.prob > p.confidence)
+				p.confidence = obj.prob;
+			return;
+		}
+	}
+
+	filter_data::PendingDetection pd;
+	pd.id = tf->pending_next_id++;
+	pd.card_id = obj.card_id;
+	pd.card_name = obj.card_name;
+	auto cit = tf->card_info_by_id.find(obj.card_id);
+	if (cit != tf->card_info_by_id.end())
+		pd.card_url = cit->second.url;
+	pd.confidence = obj.prob;
+	pd.first_seen_ns = pd.last_seen_ns = now_ns;
+	pd.hits = 1;
+
+	// Recorte de la carta en el frame (evidencia + entrenamiento).
+	{
+		const int x0 = std::max(0, (int)obj.rect.x);
+		const int y0 = std::max(0, (int)obj.rect.y);
+		const int x1 = std::min(frame.cols, (int)(obj.rect.x + obj.rect.width));
+		const int y1 = std::min(frame.rows, (int)(obj.rect.y + obj.rect.height));
+		if (x1 > x0 && y1 > y0) {
+			cv::Mat crop = frame(cv::Rect(x0, y0, x1 - x0, y1 - y0));
+			if (crop.channels() == 4) {
+				cv::Mat bgr;
+				cv::cvtColor(crop, bgr, cv::COLOR_BGRA2BGR);
+				crop = bgr;
+			}
+			std::vector<uchar> buf;
+			const std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 90};
+			if (cv::imencode(".jpg", crop, buf, params))
+				pd.crop_jpg = std::move(buf);
+		}
+	}
+
+	obs_log(LOG_INFO, "[Director] Pendiente: \"%s\" (conf %.2f, %zu en cola)",
+		pd.card_name.c_str(), pd.confidence, tf->pending_detections.size() + 1);
+
+	tf->pending_detections.push_back(std::move(pd));
+	const size_t max_pending = 24;
+	if (tf->pending_detections.size() > max_pending)
+		tf->pending_detections.pop_front();
+}
+
+// Guarda un evento de feedback (elegida / descartadas) con los recortes
+// de las candidatas: materia prima para entrenar futuras versiones.
+static void recordDirectorFeedback(detect_filter_obb *tf, const char *kind,
+				   const filter_data::PendingDetection *chosen,
+				   const std::vector<filter_data::PendingDetection> &pool)
+{
+	if (tf->feedback_dir.empty() || pool.empty())
+		return;
+	std::error_code ec;
+	std::filesystem::create_directories(tf->feedback_dir, ec);
+
+	char stamp[32] = {0};
+	const std::time_t t = std::time(nullptr);
+	const std::tm *tmv = std::localtime(&t);
+	if (tmv)
+		std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", tmv);
+	const std::string kind_s = kind ? kind : "event";
+	const std::string ev_id = std::string(stamp) + "-" + kind_s;
+	const std::string ev_dir = tf->feedback_dir + "/events/" + ev_id;
+	std::filesystem::create_directories(ev_dir, ec);
+
+	auto save_crop = [&](const filter_data::PendingDetection &p,
+			     const std::string &name) -> std::string {
+		if (p.crop_jpg.empty())
+			return std::string();
+		const std::string rel = ev_id + "/" + name + ".jpg";
+		std::ofstream f(tf->feedback_dir + "/events/" + rel, std::ios::binary);
+		if (!f)
+			return std::string();
+		f.write((const char *)p.crop_jpg.data(), (std::streamsize)p.crop_jpg.size());
+		return rel;
+	};
+
+	nlohmann::json ev;
+	ev["type"] = kind_s;
+	ev["ts"] = stamp;
+	ev["pool_size"] = pool.size();
+	nlohmann::json candidates = nlohmann::json::array();
+	int cand_idx = 0;
+	for (const auto &p : pool) {
+		if (chosen && p.id == chosen->id && kind_s == "selection")
+			continue; // la elegida va aparte
+		if (cand_idx >= 12)
+			break; // tope de candidatas guardadas por evento
+		nlohmann::json cj;
+		cj["card_id"] = p.card_id;
+		cj["card_name"] = p.card_name;
+		cj["confidence"] = p.confidence;
+		cj["hits"] = p.hits;
+		const std::string saved = save_crop(p, "cand_" + std::to_string(cand_idx++));
+		if (!saved.empty())
+			cj["crop"] = saved;
+		candidates.push_back(std::move(cj));
+	}
+	ev["candidates"] = std::move(candidates);
+	if (chosen) {
+		nlohmann::json cj;
+		cj["card_id"] = chosen->card_id;
+		cj["card_name"] = chosen->card_name;
+		cj["card_url"] = chosen->card_url;
+		cj["confidence"] = chosen->confidence;
+		cj["hits"] = chosen->hits;
+		const std::string saved = save_crop(*chosen, "chosen");
+		if (!saved.empty())
+			cj["crop"] = saved;
+		ev["chosen"] = std::move(cj);
+	}
+
+	std::ofstream log(tf->feedback_dir + "/events.jsonl", std::ios::app | std::ios::binary);
+	if (log)
+		log << ev.dump() << "\n";
+	obs_log(LOG_INFO, "[Director] Feedback guardado: %s (%zu candidatas)",
+		ev_dir.c_str(), pool.size());
 }
 
 void detect_filter_obb_video_tick(void *data, float seconds)
@@ -2446,6 +2701,11 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 					}
 				}
 			}
+
+			// Modo realizador: la deteccion no se muestra sola; entra en la
+			// cola de pendientes para que el operador la valide en la web.
+			if (tf->click_to_overlay && !obj.card_id.empty())
+				addPendingDetection(tf, obj, imageBGRA, now_ns);
 		}
 
 		// Remove stale tracks (unseen > 120 frames ≈ 4 s at 30 fps)
@@ -2737,24 +2997,52 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			// y por encima de todo, para retransmisiones vistas en un movil.
 			cv::Rect shown_card;       // rect de la carta mostrada (frame px)
 			double shown_metric = 1.0; // factor de metrica para el texto de rulings
+			std::string shown_card_db_id; // id de la carta mostrada (para rulings)
 			{
 				std::lock_guard<std::mutex> lock(tf->game_state_lock);
 				// Caja del ankh en pixeles del frame: la misma transformacion
 				// que coloca el resto del diseño (escala + centrado).
 				const cv::Rect abox = designRect(fit, kAnkhX, kAnkhY, kAnkhW, kAnkhH);
 
-				// Ultima carta detectada (la de track_id mas alto, la mas reciente).
+				// Carta a mostrar:
+				//  - Si el operador eligio una en la web (pulsada en
+				//    Pendientes), esa misma.
+				//  - Si no, en modo clasico la ultima detectada (track_id
+				//    mas alto); en modo realizador no se muestra nada.
 				filter_data::TrackedCardState *principal = nullptr;
-				for (auto& [tid, tc] : tf->tracked_cards) {
-					if (tc.card_image.empty())
-						continue;
-					if (!principal || tid > principal->track_id)
-						principal = &tc;
+				cv::Mat card_img;
+				if (!tf->current_overlay_card_url.empty()) {
+					for (auto& [tid, tc] : tf->tracked_cards) {
+						if (tc.card_url == tf->current_overlay_card_url) {
+							principal = &tc;
+							break;
+						}
+					}
+					if (principal && !principal->card_image.empty()) {
+						card_img = principal->card_image;
+					} else {
+						auto cache_it = tf->card_image_cache.find(tf->current_overlay_card_url);
+						if (cache_it != tf->card_image_cache.end())
+							card_img = cache_it->second;
+					}
+					shown_card_db_id = (principal && !principal->card_id.empty())
+						? principal->card_id : tf->current_overlay_card_id;
+				} else if (!tf->click_to_overlay) {
+					for (auto& [tid, tc] : tf->tracked_cards) {
+						if (tc.card_image.empty())
+							continue;
+						if (!principal || tid > principal->track_id)
+							principal = &tc;
+					}
+					if (principal) {
+						card_img = principal->card_image;
+						shown_card_db_id = principal->card_id;
+					}
 				}
 
-				if (principal) {
-					const double cw = principal->card_image.cols;
-					const double ch = principal->card_image.rows;
+				if (!card_img.empty()) {
+					const double cw = card_img.cols;
+					const double ch = card_img.rows;
 					if (cw > 0 && ch > 0) {
 						// Carta completa (contain) centrada dentro de una caja:
 						// nunca se recortan los lados.
@@ -2788,7 +3076,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 						const cv::Rect dst = shown_card & cv::Rect(0, 0, fw, fh);
 						if (dst.width > 0 && dst.height > 0) {
 							cv::Mat carta;
-							cv::resize(principal->card_image, carta,
+							cv::resize(card_img, carta,
 							           cv::Size(shown_card.width, shown_card.height),
 							           0, 0, cv::INTER_AREA);
 							const cv::Rect src(dst.x - shown_card.x,
@@ -2800,48 +3088,6 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 						if (normal.height > 0)
 							shown_metric = (double)shown_card.height / normal.height;
 					}
-				}
-			}
-
-			// 5. Manual overlay from web UI (on display)
-			if (!tf->manual_overlay_url.empty()) {
-				auto now = std::chrono::steady_clock::now();
-				auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-					now - tf->last_overlay_detection_time).count();
-				float elapsed_sec = elapsed_ms / 1000.0f;
-				float alpha = std::max(0.0f, 1.0f - (elapsed_sec / 30.0f));
-
-				if (alpha > 0.0f && !tf->current_overlay_card_url.empty()) {
-					auto cache_it = tf->card_image_cache.find(tf->current_overlay_card_url);
-					if (cache_it == tf->card_image_cache.end() && !tf->manual_overlay_url.empty()) {
-						if (downloadImageToMemory(tf->manual_overlay_url, img_data)) {
-							cv::Mat img = cv::imdecode(img_data, cv::IMREAD_COLOR);
-							if (!img.empty()) {
-								tf->card_image_cache[tf->manual_overlay_url] = img;
-								cache_it = tf->card_image_cache.find(tf->manual_overlay_url);
-							}
-						}
-					}
-
-					if (cache_it != tf->card_image_cache.end()) {
-						int banner_left = (int)(fw * 0.02f);
-						int banner_top = (int)(fh * (0.04f + tf->player_count * 0.045f));
-						int banner_w = (int)(fw * 0.24f);
-						int banner_h = fh - banner_top - (int)(fh * 0.02f);
-
-						cv::Mat overlay_resized;
-						cv::resize(cache_it->second, overlay_resized, cv::Size(banner_w, banner_h));
-						cv::Rect roi(banner_left, banner_top, banner_w, banner_h);
-						roi &= cv::Rect(0, 0, fw, fh);
-						if (roi.width > 0 && roi.height > 0) {
-							cv::Mat overlay_cropped = overlay_resized(
-								cv::Rect(0, 0, roi.width, roi.height));
-							cv::addWeighted(display(roi), 1.0 - alpha, overlay_cropped, alpha, 0.0, display(roi));
-						}
-					}
-				} else {
-					tf->current_overlay_card_url.clear();
-					tf->manual_overlay_url.clear();
 				}
 			}
 
@@ -2858,20 +3104,11 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		// "Rulings scroll" del filtro. Cambiar donde se muestran es cambiar
 		// esta caja.
 		{
-			if (tf->manual_overlay_url.empty()) {
-				std::lock_guard<std::mutex> lock(tf->game_state_lock);
-
-				// Misma carta que se pinta sobre el ankh: la ultima detectada.
-				const filter_data::TrackedCardState* principal = nullptr;
-				for (auto& [tid, tc] : tf->tracked_cards) {
-					if (tc.card_image.empty())
-						continue;
-					if (!principal || tid > principal->track_id)
-						principal = &tc;
-				}
-
-				const VTESCardEntry* entry = (principal && !principal->card_id.empty())
-					? tf->vtes_db.get_by_id(principal->card_id)
+			{
+				// La carta mostrada sobre el ankh (elegida en la web o, en
+				// modo clasico, la ultima detectada).
+				const VTESCardEntry* entry = !shown_card_db_id.empty()
+					? tf->vtes_db.get_by_id(shown_card_db_id)
 					: nullptr;
 
 				if (entry && entry->has_rulings() && shown_card.width > 0 &&

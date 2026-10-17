@@ -200,8 +200,10 @@ struct filter_data {
 
 	// --- Card image cache for overlay display ---
 	std::unordered_map<std::string, cv::Mat> card_image_cache;
-	std::chrono::steady_clock::time_point last_overlay_detection_time;
+	// Carta elegida por el operador (modo realizador): se pinta en el ankh
+	// hasta que se elija otra o se limpie desde la web.
 	std::string current_overlay_card_url;
+	std::string current_overlay_card_id;
 	float card_overlay_duration = 5.0f;
 
 	// --- Performance: minimum detection interval ---
@@ -217,10 +219,23 @@ struct filter_data {
 	// --- Web server notification flag (show popup once per filter instance) ---
 	bool web_server_notified = false;
 
-	// --- Manual overlay (triggered from web UI, overrides auto-detection) ---
-	std::string manual_overlay_url;
-	int64_t manual_overlay_set_time_ns = 0;
-	bool click_to_overlay = false;  // when true, only show cards manually clicked from web UI
+	// --- Modo realizador: las detecciones no se muestran solas; se acumulan
+	// como pendientes y el operador elige cual se muestra desde la web. ---
+	bool click_to_overlay = true;
+	struct PendingDetection {
+		uint64_t id = 0;
+		std::string card_id, card_name, card_url;
+		float confidence = 0.0f;     // deteccion (objetos) o identificacion (OCR)
+		int64_t first_seen_ns = 0;
+		int64_t last_seen_ns = 0;
+		int hits = 0;                // veces re-detectada mientras esperaba
+		std::vector<uchar> crop_jpg; // recorte del frame (datos de entrenamiento)
+	};
+	std::deque<PendingDetection> pending_detections;
+	uint64_t pending_next_id = 1;
+	std::mutex pending_lock;
+	// Carpeta de datos de entrenamiento (feedback del realizador).
+	std::string feedback_dir;
 
 	// --- Detection history for web server ---
 	struct DetectedCard {
