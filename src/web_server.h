@@ -49,6 +49,8 @@ public:
     std::function<void()> on_overlay_clear_fn;
     std::function<void(int player_idx, int delta)> on_pool_fn;
     std::function<std::vector<std::pair<std::string,int>>()> get_pool_fn;
+    // Estado de partida (minions y giro de cartas por jugador) como JSON.
+    std::function<nlohmann::json()> get_game_fn;
 
     bool start(int port, const VTESCardDatabase *db) {
         if (running_) stop();
@@ -182,6 +184,10 @@ private:
             servePoolSet(client, query);
         } else if (uri == "/api/pool/status") {
             servePoolStatus(client);
+        } else if (uri == "/api/game/status") {
+            serveGameStatus(client);
+        } else if (uri == "/game") {
+            serveGamePage(client);
         } else if (uri == "/search") {
             serveHtmlResult(client, q);
         } else if (uri == "/detections") {
@@ -496,6 +502,7 @@ private:
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
           << "<span class=\"status-bar\">Rulings</span></div>";
 
         if (!entry) {
@@ -649,6 +656,7 @@ private:
           << "<div class=\"nav-bar\">"
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
           << "<a href=\"/pool\" class=\"active\">Pool</a>"
           << "<span class=\"status\" id=\"status\">" << tf_text("WebConnected") << "</span>"
           << "</div>"
@@ -716,6 +724,86 @@ private:
         sendAll(client, body);
     }
 
+    void serveGameStatus(SOCKET client) {
+        nlohmann::json j;
+        if (get_game_fn)
+            j = get_game_fn();
+        else
+            j["players"] = nlohmann::json::array();
+        std::string body = j.dump(2);
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    void serveGamePage(SOCKET client) {
+        std::ostringstream h;
+        h << "<!DOCTYPE html><html lang=\"" << tf_i18n_code() << "\"><head><meta charset=\"UTF-8\">"
+          << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+          << "<title>VTES — " << tf_text("WebGame") << "</title><style>"
+          << PAGE_CSS
+          << "</style></head><body><div class=\"container\">"
+          << "<h1>" << tf_text("WebGame") << "</h1>"
+          << "<div class=\"nav-bar\">"
+          << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
+          << "<a href=\"/pool\">Pool</a>"
+          << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\" class=\"active\">" << tf_text("WebGame") << "</a>"
+          << "<span class=\"status\" id=\"status\">" << tf_text("WebConnected") << "</span>"
+          << "</div>"
+          << "<div class=\"game-legend\">&#128274; " << tf_text("WebLockedWord")
+          << " &middot; &#10004; " << tf_text("WebUnlockedWord") << "</div>"
+          << "<div id=\"players\"></div>"
+          << "<script>"
+          << "async function loadGame(){"
+          << "try{"
+          << "const r=await fetch('/api/game/status');"
+          << "const data=await r.json();"
+          << "const c=document.getElementById('players');"
+          << "let html='';"
+          << "for(const p of data.players){"
+          << "html+='<div class=\"game-player'+(p.active?'':' game-out')+'\">';"
+          << "html+='<div class=\"game-head\"><span class=\"game-pname\">'+p.name+'</span>';"
+          << "html+='<span class=\"badge pool\">Pool '+p.pool+'</span>';"
+          << "html+='<span class=\"badge locked\">&#128274; '+p.locked_count+'</span>';"
+          << "html+='<span class=\"badge ready\">&#10004; '+p.unlocked_count+'</span>';"
+          << "if(p.crypt_count>0)html+='<span class=\"badge\">'+p.crypt_count+' "
+          << tf_text("WebCryptWord") << "</span>';"
+          << "html+='</div>';"
+          << "for(const m of p.minions){"
+          << "html+='<div class=\"game-minion'+(m.locked?' locked':'')+'\">';"
+          << "html+='<span class=\"mi\">'+(m.locked?'&#128274;':'&#10004;')+'</span> '+m.name;"
+          << "if(m.capacity)html+=' <span class=\"cap\">'+m.capacity+'</span>';"
+          << "html+='</div>';"
+          << "}"
+          << "if(p.minions.length===0)html+='<div class=\"game-empty\">"
+          << tf_text("WebNoMinions") << "</div>';"
+          << "html+='</div>';"
+          << "}"
+          << "c.innerHTML=html;"
+          << "}catch(e){document.getElementById('status').textContent='Error'}}"
+          << "loadGame();"
+          << "setInterval(loadGame,2000);"
+          << "</script>"
+          << "<div class=\"footer\">VTES Card Scanner — " << tf_text("WebGame") << "</div>"
+          << "</div></body></html>";
+        std::string body = h.str();
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
     void serveDetectionsPage(SOCKET client) {
         std::ostringstream h;
         h << "<!DOCTYPE html><html lang=\"" << tf_i18n_code() << "\"><head><meta charset=\"UTF-8\">"
@@ -728,6 +816,7 @@ private:
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\" class=\"active\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
           << "<span class=\"status\" id=\"status\">" << tf_text("WebConnected") << "</span>"
           << "</div>"
           << "<div id=\"grid\" class=\"detection-grid\"></div>"
@@ -815,6 +904,7 @@ private:
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
           << "<span class=\"status-bar\">" << tf_text("WebDbLabel") << " <span class=\"status-" << dbStatus << "\">"
           << dbStatusText << "</span>"
           << (dbSize > 0 ? " (" + std::to_string(dbSize) + " " + tf_text("WebCardsWord") + ")" : "")
@@ -853,6 +943,7 @@ private:
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
           << "<span class=\"status-bar\">" << tf_text("WebDbLabel") << " <span class=\"status-" << dbStatus << "\">"
           << dbStatusText << "</span>"
           << (dbSize > 0 ? " (" + std::to_string(dbSize) + " " + tf_text("WebCardsWord") + ")" : "")
@@ -1046,6 +1137,19 @@ private:
         ".pool-btns button:first-child{background:#d32f2f;color:#fff}"
         ".pool-btns button:last-child{background:#388e3c;color:#fff}"
         ".pool-btns button:hover{opacity:.85}"
+        ".game-legend{font-size:.8rem;color:#888;margin-bottom:14px}"
+        ".game-player{margin-bottom:18px;padding:12px 16px;background:#0d1b3e;border-radius:8px}"
+        ".game-player.game-out{opacity:.45}"
+        ".game-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}"
+        ".game-pname{font-weight:600;color:#e0e0e0;font-size:1.05rem}"
+        ".badge{font-size:.8rem;padding:3px 10px;border-radius:12px;background:#16213e;border:1px solid #333;color:#bbb}"
+        ".badge.pool{color:#c9a84c;border-color:#574a1d}"
+        ".badge.locked{color:#ffd166;border-color:#7a5c00}"
+        ".badge.ready{color:#7ee787;border-color:#1f6f2e}"
+        ".game-minion{padding:5px 8px;margin:3px 0;border-radius:5px;background:#101f47;color:#ddd;border-left:3px solid #1f6f2e}"
+        ".game-minion.locked{border-left-color:#ffd166;background:#2a2413;color:#ffd166}"
+        ".game-minion .cap{color:#888;font-size:.85rem}"
+        ".game-empty{color:#888;font-size:.85rem;padding:4px 0}"
         ".empty{text-align:center;color:#666;padding:40px;font-size:1.1rem}"
         ".error{text-align:center;color:#ff5722;padding:40px;font-size:1.1rem}"
         ".footer{text-align:center;color:#444;font-size:.75rem;margin-top:40px}";

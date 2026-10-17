@@ -1533,6 +1533,58 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 			out.push_back({tf->players[i].name, tf->players[i].pool});
 		return out;
 	};
+	// Estado de partida: pool + minions con su estado de giro por jugador.
+	tf->web_server->get_game_fn = [tf]() -> nlohmann::json {
+		nlohmann::json out;
+		nlohmann::json players_json = nlohmann::json::array();
+		std::lock_guard<std::mutex> lock(tf->game_state_lock);
+		const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+		for (int i = 0; i < tf->player_count; i++) {
+			const filter_data::PlayerState &pl = tf->players[i];
+			nlohmann::json pj;
+			pj["index"] = i;
+			pj["name"] = pl.name;
+			pj["pool"] = pl.pool;
+			pj["active"] = pl.active;
+			pj["zone_angle"] = pl.minion_zone.angle;
+			int locked_n = 0, unlocked_n = 0, crypt_n = 0;
+			nlohmann::json minions = nlohmann::json::array();
+			for (const auto &kv : tf->tracked_cards) {
+				const filter_data::TrackedCardState &tc = kv.second;
+				if (tc.player_idx != i)
+					continue;
+				if (tc.in_crypt) {
+					crypt_n++;
+					continue;
+				}
+				nlohmann::json mj;
+				mj["name"] = tc.card_name;
+				mj["card_id"] = tc.card_id;
+				mj["locked"] = (tc.lock_state == filter_data::CardLockState::Locked);
+				mj["rel_angle"] = tc.last_rel_angle;
+				mj["seen_ms_ago"] = (tc.last_seen_ns > 0)
+					? (now_ns - tc.last_seen_ns) / 1000000LL : 0LL;
+				int capacity = 0;
+				auto cit = tf->card_info_by_id.find(tc.card_id);
+				if (cit != tf->card_info_by_id.end())
+					capacity = cit->second.capacity;
+				mj["capacity"] = capacity;
+				if (mj["locked"].get<bool>())
+					locked_n++;
+				else
+					unlocked_n++;
+				minions.push_back(std::move(mj));
+			}
+			pj["minions"] = std::move(minions);
+			pj["locked_count"] = locked_n;
+			pj["unlocked_count"] = unlocked_n;
+			pj["crypt_count"] = crypt_n;
+			players_json.push_back(std::move(pj));
+		}
+		out["players"] = std::move(players_json);
+		return out;
+	};
 	bool ws_ok = tf->web_server->start(tf->web_server_port, &tf->vtes_db);
 	if (ws_ok) {
 		obs_log(LOG_INFO, "[WebServer] Started on http://localhost:%d (filter=%s)",
@@ -1879,6 +1931,73 @@ static void drawTextInBox(cv::Mat& img, const std::string& text, const cv::Rect&
 	cv::Mat blended;
 	cv::addWeighted(roi, 1.0, rot(src_r), 0.85, 0.0, blended);
 	blended.copyTo(roi, rotmask(src_r));
+}
+
+// ─── Estado de partida ───────────────────────────────────────────────
+// Una carta está "girada" (tapped) cuando su ángulo difiere ~90° del de
+// la zona minion de su jugador. Las cartas de la cripta no se giran.
+
+struct PlayerZoneHit {
+	int  player_idx = -1; // -1 = fuera de toda zona
+	bool in_crypt   = false;
+};
+
+// Resuelve a qué zona (minion/cripta) de qué jugador corresponde el
+// centro de una carta. Los jugadores inactivos (ousted) no asignan.
+static PlayerZoneHit resolvePlayerZone(const struct detect_filter_obb *tf,
+				       const cv::Point2f &c, int fw, int fh)
+{
+	PlayerZoneHit hit;
+	for (int pi = 0; pi < tf->player_count; pi++) {
+		const filter_data::PlayerState &pl = tf->players[pi];
+		if (!pl.active)
+			continue; // jugador fuera de partida: su sitio queda libre
+		auto checkZone = [&](const filter_data::PlayerZone &z, bool crypt) -> bool {
+			const float zw = z.nw * fw, zh = z.nh * fh;
+			if (zw <= 0.0f || zh <= 0.0f)
+				return false;
+			const float zx = z.nx * fw, zy = z.ny * fh;
+			float dx = c.x - (zx + zw * 0.5f);
+			float dy = c.y - (zy + zh * 0.5f);
+			if (z.angle != 0.0f) {
+				// Zona rotada (positivo = horario): se pasa el punto
+				// al sistema de la zona aplicando el giro inverso.
+				const float ra = z.angle * kPI / 180.0f;
+				const float ca = std::cos(ra), sa = std::sin(ra);
+				const float rx = ca * dx + sa * dy;
+				const float ry = -sa * dx + ca * dy;
+				dx = rx;
+				dy = ry;
+			}
+			if (std::fabs(dx) <= zw * 0.5f && std::fabs(dy) <= zh * 0.5f) {
+				hit.player_idx = pi;
+				hit.in_crypt = crypt;
+				return true;
+			}
+			return false;
+		};
+		if (checkZone(pl.minion_zone, false))
+			return hit;
+		if (checkZone(pl.crypt_zone, true))
+			return hit;
+	}
+	return hit;
+}
+
+// Votos de histéresis del estado de giro (se cuentan por evaluación).
+static constexpr float kLockTiltedDeg = 55.0f; // ≥ = vota "girada"
+static constexpr float kLockFlatDeg   = 35.0f; // ≤ = vota "lista"
+static constexpr int   kLockVotesMax  = 8;     // votos seguidos para cambiar
+
+// Ángulo de una carta (radianes) relativo a la referencia de su zona,
+// normalizado a [-90, 90): ~0 = lista (alineada), ~±90 = girada.
+static float relativeLockAngleDeg(float card_angle_rad, float base_angle_deg)
+{
+	const float card_deg = card_angle_rad * 180.0f / kPI;
+	float rel = std::fmod(card_deg - base_angle_deg + 90.0f, 180.0f);
+	if (rel < 0.0f)
+		rel += 180.0f;
+	return rel - 90.0f;
 }
 
 void detect_filter_obb_video_tick(void *data, float seconds)
@@ -2247,37 +2366,9 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				}
 
 				// Assign to player by zone overlap
-				cv::Point2f c = tc.last_position;
-				tc.player_idx = -1;
-				for (int pi = 0; pi < tf->player_count; pi++) {
-					auto& pl = tf->players[pi];
-					if (!pl.active)
-						continue; // jugador fuera de partida: su sitio queda libre
-					auto checkZone = [&](const filter_data::PlayerZone& z, bool crypt) {
-						float zx = z.nx * fw, zy = z.ny * fh;
-						float zw = z.nw * fw, zh = z.nh * fh;
-						float dx = c.x - (zx + zw * 0.5f);
-						float dy = c.y - (zy + zh * 0.5f);
-						if (z.angle != 0.0f) {
-							// Zona rotada (positivo = horario): se pasa el punto
-							// al sistema de la zona aplicando el giro inverso.
-							const float ra = z.angle * kPI / 180.0f;
-							const float ca = std::cos(ra), sa = std::sin(ra);
-							const float rx = ca * dx + sa * dy;
-							const float ry = -sa * dx + ca * dy;
-							dx = rx;
-							dy = ry;
-						}
-						if (std::fabs(dx) <= zw * 0.5f && std::fabs(dy) <= zh * 0.5f) {
-							tc.player_idx = pi;
-							tc.in_crypt = crypt;
-							return true;
-						}
-						return false;
-					};
-					if (checkZone(pl.minion_zone, false)) break;
-					if (checkZone(pl.crypt_zone, true)) break;
-				}
+				PlayerZoneHit zone = resolvePlayerZone(tf, tc.last_position, fw, fh);
+				tc.player_idx = zone.player_idx;
+				tc.in_crypt = zone.in_crypt;
 
 				tf->tracked_cards[obj.id] = std::move(tc);
 			} else {
@@ -2298,16 +2389,60 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 						tc.card_url = cit->second.url;
 				}
 
-				// Lock state: after 1 s, check if rotated ~90°
-				if (!tc.rotation_checked) {
-					int64_t elapsed_ns = now_ns - tc.first_seen_ns;
-					if (elapsed_ns > 1000000000LL) {
-						float delta = obj.angle - tc.initial_angle;
-						while (delta > 180.0f) delta -= 360.0f;
-						while (delta < -180.0f) delta += 360.0f;
-						if (fabs(delta) >= 60.0f && fabs(delta) <= 120.0f)
-							tc.lock_state = filter_data::CardLockState::Locked;
-						tc.rotation_checked = true;
+				// Reasignación de zona cada frame: una carta puede cambiar
+				// de zona (p.ej. de cripta a minion al completar la
+				// influencia del vampiro).
+				{
+					PlayerZoneHit zone = resolvePlayerZone(tf, tc.last_position, fw, fh);
+					if (zone.player_idx != tc.player_idx || zone.in_crypt != tc.in_crypt) {
+						tc.player_idx = zone.player_idx;
+						tc.in_crypt = zone.in_crypt;
+						tc.lock_votes = 0; // la histéresis previa ya no aplica
+					}
+				}
+
+				// ── Estado de giro: evaluación continua (una carta puede
+				//    girarse/enderezarse en cualquier momento) y relativa a
+				//    la zona minion del jugador. En la cripta no se gira.
+				{
+					const bool in_minion_zone = tc.player_idx >= 0 && !tc.in_crypt;
+					const float base_deg = in_minion_zone
+						? tf->players[tc.player_idx].minion_zone.angle
+						: tc.initial_angle * 180.0f / kPI;
+					const float rel = relativeLockAngleDeg(obj.angle, base_deg);
+					tc.last_rel_angle = rel;
+
+					int dir = 0;
+					if (in_minion_zone) {
+						const float a = std::fabs(rel);
+						if (a >= kLockTiltedDeg)
+							dir = +1;
+						else if (a <= kLockFlatDeg)
+							dir = -1;
+					} else {
+						dir = -1; // sin zona minion no se puede afirmar giro
+					}
+					if (dir != 0)
+						tc.lock_votes = std::max(-kLockVotesMax,
+									 std::min(kLockVotesMax, tc.lock_votes + dir));
+
+					const char *cname = tc.card_name.empty() ? "?" : tc.card_name.c_str();
+					if (tc.lock_state == filter_data::CardLockState::Unlocked &&
+					    tc.lock_votes >= kLockVotesMax) {
+						tc.lock_state = filter_data::CardLockState::Locked;
+						tc.lock_changed_ns = now_ns;
+						if (tc.player_idx >= 0)
+							obs_log(LOG_INFO,
+								"[Game] Jugador %d: \"%s\" girada (rel %+.0f deg)",
+								tc.player_idx + 1, cname, rel);
+					} else if (tc.lock_state == filter_data::CardLockState::Locked &&
+						   tc.lock_votes <= -kLockVotesMax) {
+						tc.lock_state = filter_data::CardLockState::Unlocked;
+						tc.lock_changed_ns = now_ns;
+						if (tc.player_idx >= 0)
+							obs_log(LOG_INFO,
+								"[Game] Jugador %d: \"%s\" lista (rel %+.0f deg)",
+								tc.player_idx + 1, cname, rel);
 					}
 				}
 			}

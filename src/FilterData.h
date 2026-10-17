@@ -265,11 +265,14 @@ struct filter_data {
 		std::string card_id, card_name, card_url;
 		cv::Mat card_image;
 
-		// Lock state (default = Unlocked)
+		// Lock state: una carta está girada (tapped) cuando su ángulo
+		// difiere ~90° del de la zona minion de su jugador.
 		int64_t first_seen_ns   = 0;
-		float   initial_angle   = 0.0f;
+		float   initial_angle   = 0.0f;  // radianes; baseline si no hay zona
+		float   last_rel_angle  = 0.0f;  // grados normalizados a [-90, 90)
 		CardLockState lock_state = CardLockState::Unlocked;
-		bool   rotation_checked = false;  // true after 1 s observation
+		int     lock_votes      = 0;     // histéresis (+ girada / - lista)
+		int64_t lock_changed_ns = 0;     // último cambio de estado
 
 		// Player assignment (determined by zone overlap)
 		int  player_idx = -1;   // -1 = unassigned
