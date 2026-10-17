@@ -83,6 +83,9 @@ function(target_install_resources target)
   message(DEBUG "Installing resources for target ${target}...")
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data")
     file(GLOB_RECURSE data_files "${CMAKE_CURRENT_SOURCE_DIR}/data/*")
+    # Directorios de trabajo locales (descargas krcg / dataset de entrenamiento):
+    # no forman parte del runtime y no deben instalarse ni listarse como recursos.
+    list(FILTER data_files EXCLUDE REGEX "/data/(card-cache|card-cache-es|train_root)/")
     foreach(data_file IN LISTS data_files)
       cmake_path(RELATIVE_PATH data_file BASE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data/" OUTPUT_VARIABLE
                  relative_path)
@@ -94,7 +97,10 @@ function(target_install_resources target)
     install(
       DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data/"
       DESTINATION data/obs-plugins/${target}
-      USE_SOURCE_PERMISSIONS)
+      USE_SOURCE_PERMISSIONS
+      PATTERN "card-cache" EXCLUDE
+      PATTERN "card-cache-es" EXCLUDE
+      PATTERN "train_root" EXCLUDE)
 
     if(OBS_BUILD_DIR)
       add_custom_command(
