@@ -535,7 +535,7 @@ static bool downloadImageToMemory(const std::string& url, std::vector<uchar>& ou
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2000L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "VTES-Card-Scanner/0.1.4");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "VTES-Card-Scanner/0.1.6");
     CURLcode res = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
     return res == CURLE_OK && !out_data.empty();
