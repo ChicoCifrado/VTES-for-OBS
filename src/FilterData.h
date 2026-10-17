@@ -237,6 +237,17 @@ struct filter_data {
 	// Carpeta de datos de entrenamiento (feedback del realizador).
 	std::string feedback_dir;
 
+	// --- Registro de eventos de partida (historial para la web) ---
+	struct GameEvent {
+		int64_t ts_ns = 0;
+		std::string type; // lock | unlock | zone | pool | ousted | revived
+		int player_idx = -1;
+		std::string card_name;
+		int from = 0;     // pool anterior / zona: 1 cripta, 0 minion
+		int to = 0;
+	};
+	std::deque<GameEvent> game_events; // max 100; el mas reciente al final
+
 	// --- Detection history for web server ---
 	struct DetectedCard {
 		std::string card_name;

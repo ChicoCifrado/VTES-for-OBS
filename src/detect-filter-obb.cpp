@@ -1446,6 +1446,12 @@ static void recordDirectorFeedback(detect_filter_obb *tf, const char *kind,
 								   const filter_data::PendingDetection *chosen,
 								   const std::vector<filter_data::PendingDetection> &pool);
 
+// Registro de eventos de partida (historial web). El llamador debe tener
+// game_state_lock.
+static void pushGameEvent(detect_filter_obb *tf, const char *type,
+						  int player_idx, const std::string &card_name,
+						  int from, int to, int64_t now_ns);
+
 void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 {
 	obs_log(LOG_INFO, "VTES OBB filter created");
@@ -1531,16 +1537,34 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 		obs_log(LOG_INFO, "[WebServer] Overlay manual limpiado");
 	};
 	tf->web_server->on_pool_fn = [tf](int player_idx, int delta) {
-		if (player_idx >= 0 && player_idx < tf->player_count) {
-			tf->players[player_idx].pool += delta;
-			if (tf->players[player_idx].pool < 0)
-				tf->players[player_idx].pool = 0;
-			if (tf->players[player_idx].pool > 99)
-				tf->players[player_idx].pool = 99;
-			obs_log(LOG_INFO, "[WebServer] Pool: %s = %d (delta %+d)",
-				tf->players[player_idx].name.c_str(),
-				tf->players[player_idx].pool, delta);
+		if (player_idx < 0 || player_idx >= tf->player_count)
+			return;
+		const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
+		std::lock_guard<std::mutex> lock(tf->game_state_lock);
+		auto &pl = tf->players[player_idx];
+		const int old_pool = pl.pool;
+		pl.pool += delta;
+		if (pl.pool < 0)
+			pl.pool = 0;
+		if (pl.pool > 99)
+			pl.pool = 99;
+		if (pl.pool != old_pool)
+			pushGameEvent(tf, "pool", player_idx, std::string(), old_pool, pl.pool, now_ns);
+		// Auto-ousted: pool 0 = eliminado; volver a subir pool lo reactiva.
+		if (pl.pool == 0 && pl.active) {
+			pl.active = false;
+			pushGameEvent(tf, "ousted", player_idx, std::string(), 0, 0, now_ns);
+			obs_log(LOG_INFO, "[Game] Jugador %d (%s) ousted: pool 0",
+				player_idx + 1, pl.name.c_str());
+		} else if (pl.pool > 0 && !pl.active) {
+			pl.active = true;
+			pushGameEvent(tf, "revived", player_idx, std::string(), 0, pl.pool, now_ns);
+			obs_log(LOG_INFO, "[Game] Jugador %d (%s) reactivado (pool %d)",
+				player_idx + 1, pl.name.c_str(), pl.pool);
 		}
+		obs_log(LOG_INFO, "[WebServer] Pool: %s = %d (delta %+d)",
+			pl.name.c_str(), pl.pool, delta);
 	};
 	tf->web_server->get_pool_fn = [tf]() -> std::vector<std::pair<std::string,int>> {
 		std::vector<std::pair<std::string,int>> out;
@@ -1597,6 +1621,21 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 			pj["crypt_count"] = crypt_n;
 			players_json.push_back(std::move(pj));
 		}
+		nlohmann::json events = nlohmann::json::array();
+		const size_t ev_total = tf->game_events.size();
+		const size_t ev_start = ev_total > 30 ? ev_total - 30 : 0;
+		for (size_t i = ev_start; i < ev_total; i++) {
+			const filter_data::GameEvent &ev = tf->game_events[i];
+			nlohmann::json ej;
+			ej["type"] = ev.type;
+			ej["player"] = ev.player_idx;
+			ej["card"] = ev.card_name;
+			ej["from"] = ev.from;
+			ej["to"] = ev.to;
+			ej["age_ms"] = (now_ns - ev.ts_ns) / 1000000LL;
+			events.push_back(std::move(ej));
+		}
+		out["events"] = std::move(events);
 		out["players"] = std::move(players_json);
 		return out;
 	};
@@ -2255,6 +2294,37 @@ static void recordDirectorFeedback(detect_filter_obb *tf, const char *kind,
 		ev_dir.c_str(), pool.size());
 }
 
+// ─── Registro de eventos de partida (historial en la web) ───────────
+
+// Anade un evento al registro (max 100). Los cambios de zona de la misma
+// carta se deduplican 10 s para evitar rafagas si la carta oscila.
+static void pushGameEvent(detect_filter_obb *tf, const char *type,
+			  int player_idx, const std::string &card_name,
+			  int from, int to, int64_t now_ns)
+{
+	const std::string type_s = type ? type : "event";
+	if (type_s == "zone" && !card_name.empty()) {
+		for (auto it = tf->game_events.rbegin(); it != tf->game_events.rend(); ++it) {
+			if (now_ns - it->ts_ns > 10LL * 1000000000LL)
+				break;
+			if (it->type == "zone" && it->player_idx == player_idx &&
+			    it->card_name == card_name)
+				return;
+		}
+	}
+	filter_data::GameEvent ev;
+	ev.ts_ns = now_ns;
+	ev.type = type_s;
+	ev.player_idx = player_idx;
+	ev.card_name = card_name;
+	ev.from = from;
+	ev.to = to;
+	tf->game_events.push_back(std::move(ev));
+	const size_t max_events = 100;
+	if (tf->game_events.size() > max_events)
+		tf->game_events.pop_front();
+}
+
 void detect_filter_obb_video_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
@@ -2646,13 +2716,21 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 
 				// Reasignación de zona cada frame: una carta puede cambiar
 				// de zona (p.ej. de cripta a minion al completar la
-				// influencia del vampiro).
+				// influencia del vampiro). El paso cripta<->minion del
+				// mismo jugador queda registrado como influencia.
 				{
 					PlayerZoneHit zone = resolvePlayerZone(tf, tc.last_position, fw, fh);
 					if (zone.player_idx != tc.player_idx || zone.in_crypt != tc.in_crypt) {
+						const int prev_player = tc.player_idx;
+						const bool was_crypt = tc.in_crypt;
 						tc.player_idx = zone.player_idx;
 						tc.in_crypt = zone.in_crypt;
 						tc.lock_votes = 0; // la histéresis previa ya no aplica
+						if (zone.player_idx >= 0 && zone.player_idx == prev_player &&
+						    zone.in_crypt != was_crypt)
+							pushGameEvent(tf, "zone", zone.player_idx,
+								tc.card_name, was_crypt ? 1 : 0,
+								zone.in_crypt ? 1 : 0, now_ns);
 					}
 				}
 
@@ -2686,18 +2764,24 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 					    tc.lock_votes >= kLockVotesMax) {
 						tc.lock_state = filter_data::CardLockState::Locked;
 						tc.lock_changed_ns = now_ns;
-						if (tc.player_idx >= 0)
+						if (tc.player_idx >= 0) {
 							obs_log(LOG_INFO,
 								"[Game] Jugador %d: \"%s\" girada (rel %+.0f deg)",
 								tc.player_idx + 1, cname, rel);
+							pushGameEvent(tf, "lock", tc.player_idx,
+								tc.card_name, 0, 0, now_ns);
+						}
 					} else if (tc.lock_state == filter_data::CardLockState::Locked &&
 						   tc.lock_votes <= -kLockVotesMax) {
 						tc.lock_state = filter_data::CardLockState::Unlocked;
 						tc.lock_changed_ns = now_ns;
-						if (tc.player_idx >= 0)
+						if (tc.player_idx >= 0) {
 							obs_log(LOG_INFO,
 								"[Game] Jugador %d: \"%s\" lista (rel %+.0f deg)",
 								tc.player_idx + 1, cname, rel);
+							pushGameEvent(tf, "unlock", tc.player_idx,
+								tc.card_name, 0, 0, now_ns);
+						}
 					}
 				}
 			}
