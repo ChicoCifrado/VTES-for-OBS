@@ -1909,8 +1909,12 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 					thresh = pt_it->second->threshold();
 				}
 				// Fallback to global embedder
+				// NOTA: el filtro de tipo del clasificador de vision es poco fiable
+				// en frames reales (misclasifica ~100%: p.ej. Reaction -> Event),
+				// por lo que el matcher fusionado (embedding+NCC) identifica sin
+				// filtro de tipo.
 				if (!matched && tf->embedder.is_loaded()) {
-					matched = tf->embedder.identify(card_region, card_name, card_id, confidence, type_filter);
+					matched = tf->embedder.identify(card_region, card_name, card_id, confidence, "");
 					thresh = tf->embedder.threshold();
 				}
 			}
