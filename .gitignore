@@ -23,6 +23,11 @@ data/models/*.onnx
 *.pth
 *.pt
 
+# Datasets de cartas descargados de krcg (para entrenar/validar)
+data/card-cache/
+data/card-cache-es/
+data/train_root/
+
 # Large dataset files
 data/vtes.json
 data/card-hash-index.json
