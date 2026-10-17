@@ -201,7 +201,7 @@ private:
             servePendingClear(client);
         } else if (uri == "/api/pending/crop") {
             servePendingCrop(client, query);
-        } else if (uri == "/pending") {
+        } else if (uri == "/pending" || uri == "/pendientes") {
             servePendingPage(client);
         } else if (uri == "/search") {
             serveHtmlResult(client, q);
