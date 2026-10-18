@@ -26,7 +26,7 @@ DATE = "October 2026"
 
 # ── Assets en inglés (diagrama anotado) ───────────────────────────────────
 def make_assets_en() -> None:
-    if not (ASSETS / "ankh.png").exists():
+    if not (ASSETS / "ankh.jpg").exists():
         base.make_assets()  # también crea el ankh recortado
     ASSETS.mkdir(parents=True, exist_ok=True)
     design = Image.open(base.OVERLAY_PNG).convert("RGBA")
@@ -79,8 +79,9 @@ def make_assets_en() -> None:
     label_box(300, 636, 1010, 708, "ANKH — last shown card", f_lab)
     arrow(300, 672, 246, 704)
 
-    img.save(ASSETS / "overlay_diagram_en.png")
-    print("Assets EN generados:", ASSETS / "overlay_diagram_en.png")
+    img.save(ASSETS / "overlay_diagram_en.jpg", quality=88, optimize=True,
+             progressive=True)
+    print("Assets EN generados:", ASSETS / "overlay_diagram_en.jpg")
 
 
 # ── Documento (inglés) ────────────────────────────────────────────────────
@@ -121,7 +122,7 @@ def cover(pdf: ManualEN):
     pdf.set_line_width(0.4)
     pdf.line(85, 66, 125, 66)
 
-    pdf.image(str(ASSETS / "ankh.png"), x=(210 - 46) / 2, y=76, w=46)
+    pdf.image(str(ASSETS / "ankh.jpg"), x=(210 - 46) / 2, y=76, w=46)
 
     pdf.set_font("DejaVu", "", 12)
     pdf.set_text_color(*base.WHITISH)
@@ -301,7 +302,7 @@ def s5_overlay(pdf: ManualEN):
         "(1536×1024), so a 16:9 scene will have bands at the sides: that is part "
         "of the style."
     )
-    pdf.image_block(ASSETS / "overlay_diagram_en.png", 174,
+    pdf.image_block(ASSETS / "overlay_diagram_en.jpg", 174,
                     "Overlay anatomy: the real design with the camera in its window.")
     pdf.bullets([
         "Left panel: one row per player (up to 5) with their name and pool.",

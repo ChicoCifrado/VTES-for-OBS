@@ -21,6 +21,8 @@ hacen una sola vez en `build_manual.py`.
 `assets/` se regenera automáticamente a partir del diseño real del overlay
 (`data/obs-plugins/vtes-card-scanner/overlay-bg.png`): la portada usa el ankh
 recortado y los diagramas anotados (ES/EN) se dibujan sobre el propio diseño.
+Se guardan en JPEG de alta calidad (q88) para mantener los PDF por debajo de
+los límites de subida habituales (0,5 MB).
 
 ## Requisitos
 

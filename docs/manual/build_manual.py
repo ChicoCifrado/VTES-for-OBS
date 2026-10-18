@@ -62,7 +62,13 @@ def make_assets() -> None:
             f = max(0.0, min(1.0, f))
             px[xx, yy] = int(255 * (f * f * (3 - 2 * f)))
     ankh.putalpha(mask)
-    ankh.save(ASSETS / "ankh.png")
+    # JPEG (compuesto sobre el azul de la portada): mantiene los PDF por
+    # debajo de los límites de subida habituales (0,5 MB) sin pérdida
+    # visible de calidad.
+    ankh_flat = Image.new("RGB", ankh.size, NAVY)
+    ankh_flat.paste(ankh, mask=ankh.split()[3])
+    ankh_flat.save(ASSETS / "ankh.jpg", quality=88, optimize=True,
+                   progressive=True)
 
     # 2) Diagrama anotado del overlay.
     canvas = Image.new("RGBA", design.size, (14, 14, 22, 255))
@@ -113,7 +119,8 @@ def make_assets() -> None:
     label_box(300, 636, 1090, 708, "ANKH — última carta mostrada", f_lab)
     arrow(300, 672, 246, 704)
 
-    img.save(ASSETS / "overlay_diagram.png")
+    img.save(ASSETS / "overlay_diagram.jpg", quality=88, optimize=True,
+             progressive=True)
     print("Assets generados:", ASSETS)
 
 
@@ -299,7 +306,7 @@ def cover(pdf: Manual):
     pdf.set_line_width(0.4)
     pdf.line(85, 66, 125, 66)
 
-    pdf.image(str(ASSETS / "ankh.png"), x=(210 - 46) / 2, y=76, w=46)
+    pdf.image(str(ASSETS / "ankh.jpg"), x=(210 - 46) / 2, y=76, w=46)
 
     pdf.set_font("DejaVu", "", 12)
     pdf.set_text_color(*WHITISH)
@@ -479,7 +486,7 @@ def s5_overlay(pdf: Manual):
         "(1536×1024), así que en una escena 16:9 quedan bandas a los lados: es parte "
         "del estilo."
     )
-    pdf.image_block(ASSETS / "overlay_diagram.png", 174,
+    pdf.image_block(ASSETS / "overlay_diagram.jpg", 174,
                     "Anatomía del overlay: el diseño real con la cámara en su hueco.")
     pdf.bullets([
         "Panel izquierdo: una fila por jugador (hasta 5) con su nombre y su pool.",
