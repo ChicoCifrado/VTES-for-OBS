@@ -173,6 +173,21 @@ set(TENSORRT_FOUND FALSE)
 if(DEFINED ENV{TENSORRT_ROOT})
     set(_trt_root "$ENV{TENSORRT_ROOT}")
     file(TO_CMAKE_PATH "${_trt_root}" _trt_root)
+    # Algunos paquetes de TensorRT vienen envueltos en una carpeta
+    # contenedora (p.ej. TensorRT-11.1.0.106-12.x/TensorRT-11.1.0.106):
+    # si NvInfer.h no esta en la raiz, probar un nivel mas abajo.
+    if(NOT EXISTS "${_trt_root}/include/NvInfer.h")
+        file(GLOB _trt_nested "${_trt_root}/TensorRT-*")
+        foreach(_trt_cand IN LISTS _trt_nested)
+            if(EXISTS "${_trt_cand}/include/NvInfer.h")
+                set(_trt_root "${_trt_cand}")
+                message(STATUS "TensorRT root ajustado a: ${_trt_root}")
+                break()
+            endif()
+        endforeach()
+        unset(_trt_nested)
+        unset(_trt_cand)
+    endif()
     find_path(TENSORRT_INCLUDE_DIR NvInfer.h PATHS "${_trt_root}/include" NO_DEFAULT_PATH)
     find_library(TENSORRT_LIB nvinfer_lean_11 PATHS "${_trt_root}/lib" NO_DEFAULT_PATH)
     find_library(TENSORRT_PLUGIN_LIB nvinfer_plugin_11 PATHS "${_trt_root}/lib" NO_DEFAULT_PATH)
@@ -186,6 +201,10 @@ if(DEFINED ENV{TENSORRT_ROOT})
         endif()
         # Deploy only inference DLLs; skip the 400MB builder resource DLLs
         foreach(_trt_dll_suffix "nvinfer_lean_11.dll" "nvinfer_plugin_11.dll")
+            # El resultado de find_file queda en cache: limpiarlo en cada
+            # iteracion para que cada sufijo se busque de verdad (si no, el
+            # segundo find reutiliza el resultado del primero).
+            unset(_trt_dll CACHE)
             find_file(_trt_dll "${_trt_dll_suffix}" PATHS "${_trt_root}/bin" NO_DEFAULT_PATH)
             if(_trt_dll)
                 install(FILES "${_trt_dll}" DESTINATION "obs-plugins/64bit")
