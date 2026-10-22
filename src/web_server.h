@@ -2,12 +2,16 @@
 #define VTES_WEB_SERVER_H
 
 #include "vtes_database.hpp"
+#include "vtes_icons.h"
 #include "i18n.h"
+#include <obs-module.h>
 #include <string>
 #include <thread>
 #include <atomic>
 #include <memory>
 #include <sstream>
+#include <fstream>
+#include <iterator>
 #include <cctype>
 #include <cstring>
 #include <cstdio>
@@ -45,7 +49,7 @@ public:
 
     // Callbacks to communicate with the filter instance
     std::function<std::vector<DetectionEntry>()> get_detections_fn;
-    std::function<void(const std::string& url)> on_overlay_fn;
+    std::function<void(const std::string& url, const std::string& card_id)> on_overlay_fn;
     std::function<void()> on_overlay_clear_fn;
     std::function<void(int player_idx, int delta)> on_pool_fn;
     std::function<std::vector<std::pair<std::string,int>>()> get_pool_fn;
@@ -211,6 +215,8 @@ private:
             servePoolPage(client);
         } else if (uri == "/favicon.ico") {
             send204(client);
+        } else if (uri.rfind("/fonts/", 0) == 0) {
+            serveFont(client, uri.substr(7));
         } else if (uri == "/") {
             serveForm(client);
         } else {
@@ -247,6 +253,42 @@ private:
             "\r\n";
         sendAll(client, header);
         sendAll(client, body);
+    }
+
+    // Sirve las fuentes de iconos que usa la web. El navegador las cachea:
+    // son ficheros inmutables dentro de una version del plugin.
+    void serveFont(SOCKET client, const std::string &name) {
+        if (name != "ankha2.otf" && name != "vtes-clans.otf") {
+            send404(client);
+            return;
+        }
+        const std::string rel = "fonts/" + name;
+        char *path = obs_module_file(rel.c_str());
+        if (!path) {
+            send404(client);
+            return;
+        }
+        std::ifstream f(path, std::ios::binary);
+        bfree(path);
+        if (!f) {
+            send404(client);
+            return;
+        }
+        std::string data((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+        if (data.empty()) {
+            send404(client);
+            return;
+        }
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: font/otf\r\n"
+            "Cache-Control: public, max-age=86400\r\n"
+            "Content-Length: " + std::to_string(data.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, data);
     }
 
     void serveHtmlResult(SOCKET client, const std::string &q) {
@@ -500,6 +542,63 @@ private:
     }
 
     // /card?id=N — readable page with the card and its rulings.
+    // ── Iconos oficiales (fuentes ankha2 / vtes-clans) ───────────────────
+    static std::string iconSpan(const VtesIcon &ic) {
+        std::string h = "<span class=\"";
+        h += (ic.font == 1 ? "vtes-clan" : "vtes-icon");
+        h += "\" title=\"";
+        h += escapeHtml(ic.label);
+        h += "\">";
+        h += escapeHtml(ic.glyph);
+        h += "</span>";
+        return h;
+    }
+
+    // Fila compacta para las tarjetas de Pendientes / Detecciones.
+    static std::string iconsRow(const VTESCardEntry &e) {
+        std::vector<VtesIcon> icons = vtes_icons::forCard(e);
+        if (icons.empty())
+            return std::string();
+        std::string h = "<span class=\"vtes-icons\">";
+        for (const auto &ic : icons)
+            h += iconSpan(ic);
+        h += "</span>";
+        return h;
+    }
+
+    static std::string typeIconSpan(const std::string &t) {
+        const std::string g = vtes_icons::typeGlyph(t);
+        if (g.empty())
+            return std::string();
+        VtesIcon ic;
+        ic.font = 0;
+        ic.glyph = g;
+        ic.label = t;
+        return iconSpan(ic);
+    }
+
+    static std::string clanIconSpan(const std::string &c) {
+        const std::string g = vtes_icons::clanGlyph(c);
+        if (g.empty())
+            return std::string();
+        VtesIcon ic;
+        ic.font = 1;
+        ic.glyph = g;
+        ic.label = c;
+        return iconSpan(ic);
+    }
+
+    static std::string discIconSpan(const std::string &d) {
+        const std::string g = vtes_icons::discGlyph(d);
+        if (g.empty())
+            return std::string();
+        VtesIcon ic;
+        ic.font = 0;
+        ic.glyph = g;
+        ic.label = d;
+        return iconSpan(ic);
+    }
+
     void serveCardPage(SOCKET client, const std::string& query) {
         const std::string id = paramId(query);
         const VTESCardEntry* entry = (db_ && !id.empty()) ? db_->get_by_id(id) : nullptr;
@@ -536,17 +635,28 @@ private:
             }
             h << "<div>";
             for (const auto& t : entry->types)
-                h << "<span class=\"type\">" << escapeHtml(t) << "</span>";
+                h << "<span class=\"type\">" << typeIconSpan(t)
+                  << escapeHtml(t) << "</span>";
             for (const auto& c : entry->clans)
-                h << "<span class=\"type\">" << escapeHtml(c) << "</span>";
+                h << "<span class=\"type\">" << clanIconSpan(c)
+                  << escapeHtml(c) << "</span>";
             if (entry->capacity > 0)
                 h << "<span class=\"type\">Cap " << entry->capacity << "</span>";
             if (entry->group > 0)
                 h << "<span class=\"type\">G" << entry->group << "</span>";
             h << "</div>";
+            if (!entry->disciplines.empty()) {
+                h << "<div>";
+                for (const auto& d : entry->disciplines)
+                    h << "<span class=\"type\">" << discIconSpan(d)
+                      << escapeHtml(d) << "</span>";
+                h << "</div>";
+            }
             if (!entry->url.empty())
                 h << "<div class=\"result\"><img src=\"" << escapeHtml(entry->url)
-                  << "\" alt=\"" << escapeHtml(title) << "\"></div>";
+                  << "\" alt=\"" << escapeHtml(title)
+                  << "\" class=\"clickable\" onclick=\"showOverlay('" << entry->url
+                  << "',this," << entry->id << ")\"></div>";
             if (!entry->card_text.empty())
                 h << "<div class=\"result\"><div class=\"detail\">"
                   << escapeHtml(entry->card_text) << "</div></div>";
@@ -555,6 +665,10 @@ private:
         }
 
         h << "<div class=\"footer\">VTES Card Scanner</div>"
+          << "<script>function showOverlay(url,img,id){"
+          << "fetch('/api/overlay?url='+encodeURIComponent(url)+'&id='+encodeURIComponent(id||''));"
+          << "document.querySelectorAll('img.clickable').forEach(function(i){i.classList.remove('active')});"
+          << "if(img)img.classList.add('active');}</script>"
           << "</div></body></html>";
 
         std::string body = h.str();
@@ -578,6 +692,10 @@ private:
                 card["card_id"] = e.card_id;
                 card["card_url"] = e.card_url;
                 card["timestamp_ns"] = e.timestamp_ns;
+                const VTESCardEntry *entry = (!e.card_id.empty() && db_)
+                    ? db_->get_by_id(e.card_id) : nullptr;
+                if (entry)
+                    card["icons_html"] = iconsRow(*entry);
                 j.push_back(std::move(card));
             }
         }
@@ -594,16 +712,23 @@ private:
     }
 
     void serveOverlaySet(SOCKET client, const std::string& query) {
-        // Extract url= parameter from query string
-        std::string url;
-        size_t pos = query.find("url=");
-        if (pos != std::string::npos) {
-            url = urlDecode(query.substr(pos + 4));
-            size_t amp = url.find('&');
-            if (amp != std::string::npos) url.resize(amp);
-        }
+        // url= imagen que se pinta; id= carta de la base (opcional) para que
+        // el overlay pueda dibujar tambien sus iconos de tipo/clan/disciplinas.
+        auto param = [&](const char *key) -> std::string {
+            const std::string k = std::string(key) + "=";
+            size_t p = query.find(k);
+            if (p == std::string::npos)
+                return std::string();
+            const size_t start = p + k.size();
+            const size_t end = query.find('&', start);
+            return urlDecode(query.substr(start, end == std::string::npos
+                                                   ? std::string::npos
+                                                   : end - start));
+        };
+        const std::string url = param("url");
+        const std::string id = param("id");
         if (on_overlay_fn && !url.empty()) {
-            on_overlay_fn(url);
+            on_overlay_fn(url, id);
         }
         std::string body = "{\"ok\":true}";
         std::string header =
@@ -794,6 +919,23 @@ private:
             j["director_mode"] = false;
             j["pending"] = nlohmann::json::array();
         }
+        // Iconos de la carta para cada pendiente (los pinta el JS de /pending).
+        if (db_ && j.contains("pending") && j["pending"].is_array()) {
+            for (auto &p : j["pending"]) {
+                std::string id;
+                if (p.contains("card_id")) {
+                    if (p["card_id"].is_string())
+                        id = p["card_id"].get<std::string>();
+                    else if (p["card_id"].is_number_integer())
+                        id = std::to_string(p["card_id"].get<long long>());
+                    else if (p["card_id"].is_number_unsigned())
+                        id = std::to_string(p["card_id"].get<unsigned long long>());
+                }
+                const VTESCardEntry *e = id.empty() ? nullptr : db_->get_by_id(id);
+                if (e)
+                    p["icons_html"] = iconsRow(*e);
+            }
+        }
         sendJsonResponse(client, j);
     }
 
@@ -877,7 +1019,9 @@ private:
           << "ev.src='/api/pending/crop?id='+p.id;row.appendChild(ev);}"
           << "d.appendChild(row);"
           << "const nm=document.createElement('div');nm.className='pending-name';"
-          << "nm.textContent=p.card_name||p.card_id;d.appendChild(nm);"
+          << "nm.innerHTML=p.icons_html||'';"
+          << "const nmt=document.createElement('div');nmt.textContent=p.card_name||p.card_id;nm.appendChild(nmt);"
+          << "d.appendChild(nm);"
           << "const mt=document.createElement('div');mt.className='pending-meta';"
           << "mt.textContent='conf '+(p.confidence||0).toFixed(2)+' · x'+p.hits+' · "
           << "Math.round((p.fresh_ms||0)/1000)+'s';d.appendChild(mt);"
@@ -1029,10 +1173,10 @@ private:
           << "const time=new Date(Number(d.timestamp_ns)/1e6);"
           << "const timeStr=time.toLocaleTimeString();"
           << "div.innerHTML=(d.card_url?'<img src=\"'+d.card_url+'\" alt=\"'+d.card_name+'\" loading=\"lazy\">':'')"
-          << "+'<div class=\"name\">'+d.card_name+'</div>'"
+          << "+'<div class=\"name\">'+(d.icons_html||'')+d.card_name+'</div>'"
           << "+'<div class=\"time\">'+timeStr+'</div>';"
           << "div.onclick=function(){"
-          << "fetch('/api/overlay?url='+encodeURIComponent(d.card_url));"
+          << "fetch('/api/overlay?url='+encodeURIComponent(d.card_url)+'&id='+encodeURIComponent(d.card_id||''));"
           << "document.querySelectorAll('.detection-card').forEach(c=>c.classList.remove('active'));"
           << "this.classList.add('active');"
           << "};"
@@ -1173,13 +1317,15 @@ private:
                 }
                 h << "<div>";
                 for (const auto &t : entry.types)
-                    h << "<span class=\"type\">" << escapeHtml(t) << "</span>";
+                    h << "<span class=\"type\">" << typeIconSpan(t)
+                      << escapeHtml(t) << "</span>";
                 h << "</div><div class=\"detail\">";
                 if (!entry.clans.empty()) {
                     h << "Clan: ";
                     for (size_t i = 0; i < entry.clans.size(); i++) {
                         if (i > 0) h << "/";
-                        h << escapeHtml(entry.clans[i]);
+                        h << clanIconSpan(entry.clans[i])
+                          << escapeHtml(entry.clans[i]);
                     }
                 }
                 if (entry.capacity > 0) h << " | Cap: " << entry.capacity;
@@ -1188,12 +1334,15 @@ private:
                     h << " | ";
                     for (size_t i = 0; i < entry.disciplines.size(); i++) {
                         if (i > 0) h << "/";
-                        h << escapeHtml(entry.disciplines[i]);
+                        h << discIconSpan(entry.disciplines[i])
+                          << escapeHtml(entry.disciplines[i]);
                     }
                 }
                 h << "</div>";
                 if (!entry.url.empty())
-                    h << "<img src=\"" << entry.url << "\" alt=\"" << escapeHtml(entry.name) << "\" loading=\"lazy\" onclick=\"showOverlay('" << entry.url << "',this)\" class=\"clickable\">";
+                    h << "<img src=\"" << entry.url << "\" alt=\"" << escapeHtml(entry.name)
+                      << "\" loading=\"lazy\" onclick=\"showOverlay('" << entry.url
+                      << "',this," << entry.id << ")\" class=\"clickable\">";
                 h << "</div>";
                 count++;
                 if (count >= 50) {
@@ -1208,8 +1357,8 @@ private:
 
         h << "</div><div class=\"footer\">VTES Card Scanner — " << tf_text("WebClickOverlay") << "</div>"
           << "<script>"
-          << "function showOverlay(url,img){"
-          << "fetch('/api/overlay?url='+encodeURIComponent(url));"
+          << "function showOverlay(url,img,id){"
+          << "fetch('/api/overlay?url='+encodeURIComponent(url)+'&id='+encodeURIComponent(id||''));"
           << "document.querySelectorAll('.result img.clickable').forEach(function(i){i.classList.remove('active')});"
           << "img.classList.add('active');"
           << "}"
@@ -1319,6 +1468,14 @@ private:
         ".result h2{font-size:1rem;color:#c9a84c;margin-bottom:4px}"
         ".result .i18n{font-size:.8rem;color:#888;margin-bottom:4px}"
         ".result .type{display:inline-block;background:#0f3460;color:#aaa;font-size:.75rem;padding:2px 8px;border-radius:3px;margin-right:4px}"
+        ".type{display:inline-block;background:#0f3460;color:#aaa;font-size:.75rem;padding:2px 8px;border-radius:3px;margin:2px 4px 2px 0}"
+        "@font-face{font-family:'VTES Icons';src:url('/fonts/ankha2.otf') format('opentype');font-display:block}"
+        "@font-face{font-family:'VTES Clans';src:url('/fonts/vtes-clans.otf') format('opentype');font-display:block}"
+        ".vtes-icon{font-family:'VTES Icons';font-style:normal;font-weight:normal;font-size:1.3em;line-height:1;color:#c9a84c;vertical-align:-0.15em;display:inline-block;margin-right:2px}"
+        ".vtes-clan{font-family:'VTES Clans';font-style:normal;font-weight:normal;font-size:1.3em;line-height:1;color:#c9a84c;vertical-align:-0.15em;display:inline-block;margin-right:2px}"
+        ".vtes-icons{display:inline-flex;gap:3px;align-items:center;margin-right:5px;vertical-align:middle}"
+        ".vtes-icons .vtes-icon,.vtes-icons .vtes-clan{font-size:1.15em;margin-right:0}"
+        ".pending-name .vtes-icons,.detection-card .name .vtes-icons{display:flex;justify-content:center;margin:0 0 3px 0}"
         ".result .detail{font-size:.85rem;color:#999;margin-top:4px}"
         ".result img{max-width:200px;margin-top:8px;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.4)}"
         ".result img.clickable{cursor:pointer;border:2px solid transparent;transition:border-color .2s}"

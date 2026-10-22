@@ -6,6 +6,7 @@
 #include <fstream>
 #include <cmath>
 #include <algorithm>
+#include <thread>
 #include <unordered_map>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -121,11 +122,17 @@ public:
                   std::string& out_name,
                   std::string& out_id,
                   float& out_confidence,
-                  const std::string& type_filter = "")
+                  const std::string& type_filter = "",
+                  std::string* out_second_name = nullptr,
+                  std::string* out_second_id = nullptr,
+                  float* out_second_confidence = nullptr)
     {
         out_name.clear();
         out_id.clear();
         out_confidence = 0.0f;
+        if (out_second_name) out_second_name->clear();
+        if (out_second_id) out_second_id->clear();
+        if (out_second_confidence) *out_second_confidence = -1.0f;
 
         if (net_.empty() || num_cards_ == 0) return false;
 
@@ -144,30 +151,160 @@ public:
 
         bool has_filter = !type_filter.empty();
         const float* index_data = embeddings_.data();
+        const int dim = embedding_dim_;
+        const float* query = query_emb.data();
 
-        for (int i = 0; i < num_cards_; i++) {
-            if (has_filter) {
+        // Producto escalar con cuatro acumuladores independientes. El
+        // producto escalar es la parte que domina el coste (4.446 x 7.168
+        // floats): con un unico acumulador el compilador no puede vectorizar
+        // bien la reduccion y el hilo de video se queda esperando.
+        auto dot_row = [&](int idx) -> float {
+            const float* row = index_data + (size_t)idx * dim;
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            int j = 0;
+            for (; j + 3 < dim; j += 4) {
+                s0 += row[j] * query[j];
+                s1 += row[j + 1] * query[j + 1];
+                s2 += row[j + 2] * query[j + 2];
+                s3 += row[j + 3] * query[j + 3];
+            }
+            float s = (s0 + s1) + (s2 + s3);
+            for (; j < dim; ++j) s += row[j] * query[j];
+            return s;
+        };
+
+        // Top-K de filas para calcular el margen top-1/top-2. El indice
+        // contiene variantes duplicadas de la misma carta, asi que despues
+        // se busca la mejor fila de una carta DISTINTA.
+        constexpr int kTopK = 12;
+        float top_sim[kTopK];
+        int top_idx[kTopK];
+        for (int k = 0; k < kTopK; k++) {
+            top_sim[k] = -1.0e30f;
+            top_idx[k] = -1;
+        }
+        auto consider_candidate = [&](float dot, int idx) {
+            if (has_filter) return;
+            if (dot <= top_sim[kTopK - 1]) return;
+            int pos = kTopK - 1;
+            while (pos > 0 && dot > top_sim[pos - 1]) {
+                top_sim[pos] = top_sim[pos - 1];
+                top_idx[pos] = top_idx[pos - 1];
+                --pos;
+            }
+            top_sim[pos] = dot;
+            top_idx[pos] = idx;
+        };
+
+        if (!has_filter) {
+            // El indice es de solo lectura. Repartimos las filas entre unos
+            // pocos hilos para que la lectura de los ~127 MB del indice no
+            // recaiga exclusivamente en el hilo de video de OBS. Se limita a
+            // 8 hilos: mas no ayuda porque el cuello es la memoria y ademas
+            // dejamos CPU para OBS, OCR y el resto del filtro.
+            struct LocalTop {
+                float best_sim = -1.0f;
+                int best_idx = -1;
+                float top_sim[kTopK];
+                int top_idx[kTopK];
+            };
+            const unsigned hc = std::thread::hardware_concurrency();
+            const int nthreads = (num_cards_ < 512)
+                ? 1
+                : (int)std::min<unsigned>(8u, std::max(1u, hc));
+            std::vector<LocalTop> local(nthreads);
+            auto init_local = [&](LocalTop &L) {
+                L.best_sim = -1.0f;
+                L.best_idx = -1;
+                for (int k = 0; k < kTopK; k++) {
+                    L.top_sim[k] = -1.0e30f;
+                    L.top_idx[k] = -1;
+                }
+            };
+            for (auto &L : local) init_local(L);
+
+            auto work = [&](int t, int begin, int end) {
+                LocalTop &L = local[t];
+                for (int i = begin; i < end; i++) {
+                    const float dot = dot_row(i);
+                    if (dot > L.top_sim[kTopK - 1]) {
+                        int pos = kTopK - 1;
+                        while (pos > 0 && dot > L.top_sim[pos - 1]) {
+                            L.top_sim[pos] = L.top_sim[pos - 1];
+                            L.top_idx[pos] = L.top_idx[pos - 1];
+                            --pos;
+                        }
+                        L.top_sim[pos] = dot;
+                        L.top_idx[pos] = i;
+                    }
+                    if (dot > L.best_sim) {
+                        L.best_sim = dot;
+                        L.best_idx = i;
+                    }
+                }
+            };
+
+            if (nthreads == 1) {
+                work(0, 0, num_cards_);
+            } else {
+                std::vector<std::thread> workers;
+                workers.reserve((size_t)nthreads);
+                const int chunk = (num_cards_ + nthreads - 1) / nthreads;
+                for (int t = 0; t < nthreads; t++) {
+                    const int begin = t * chunk;
+                    const int end = std::min(num_cards_, begin + chunk);
+                    if (begin >= end) break;
+                    workers.emplace_back(work, t, begin, end);
+                }
+                for (auto &w : workers) w.join();
+            }
+
+            // Merge de los resultados parciales. Los 12 mejores de cada hilo
+            // bastan para reconstruir el top-12 global.
+            for (const auto &L : local) {
+                if (L.best_sim > best_sim) {
+                    best_sim = L.best_sim;
+                    best_idx = L.best_idx;
+                }
+                for (int k = 0; k < kTopK; k++) {
+                    if (L.top_idx[k] >= 0)
+                        consider_candidate(L.top_sim[k], L.top_idx[k]);
+                }
+            }
+        } else {
+            for (int i = 0; i < num_cards_; i++) {
                 const auto& types = (i < (int)card_types_.size()) ? card_types_[i] : empty_types_;
                 bool type_match = false;
                 for (const auto& t : types) {
                     if (t == type_filter) { type_match = true; break; }
                 }
                 if (!type_match) {
-                    float dot = 0.0f;
-                    for (int j = 0; j < embedding_dim_; j++)
-                        dot += query_emb[j] * index_data[i * embedding_dim_ + j];
+                    const float dot = dot_row(i);
                     if (dot > fallback_sim) { fallback_sim = dot; fallback_idx = i; }
                     continue;
                 }
-            }
 
-            float dot = 0.0f;
-            for (int j = 0; j < embedding_dim_; j++) {
-                dot += query_emb[j] * index_data[i * embedding_dim_ + j];
+                const float dot = dot_row(i);
+                consider_candidate(dot, i);
+                if (dot > best_sim) {
+                    best_sim = dot;
+                    best_idx = i;
+                }
             }
-            if (dot > best_sim) {
-                best_sim = dot;
-                best_idx = i;
+        }
+
+        // Mejor carta distinta de la ganadora (ignorando filas duplicadas de
+        // la misma carta). Solo se calcula en el matching global, que es el
+        // que usa el filtro fusionado embedding+NCC.
+        if (!has_filter && best_idx >= 0) {
+            const std::string& best_id = card_ids_[best_idx];
+            for (int k = 0; k < kTopK; k++) {
+                if (top_idx[k] < 0 || top_idx[k] == best_idx) continue;
+                if (card_ids_[top_idx[k]] == best_id) continue;
+                if (out_second_name) *out_second_name = card_names_[top_idx[k]];
+                if (out_second_id) *out_second_id = card_ids_[top_idx[k]];
+                if (out_second_confidence) *out_second_confidence = top_sim[k];
+                break;
             }
         }
 
@@ -186,9 +323,7 @@ public:
 
         if (has_filter && (best_idx < 0 || best_sim < threshold_ * 0.5f)) {
             for (int i = 0; i < num_cards_; i++) {
-                float dot = 0.0f;
-                for (int j = 0; j < embedding_dim_; j++)
-                    dot += query_emb[j] * index_data[i * embedding_dim_ + j];
+                const float dot = dot_row(i);
                 if (dot > best_sim) {
                     best_sim = dot;
                     best_idx = i;
@@ -226,12 +361,27 @@ private:
     InferenceDevice inference_device_;
     int num_cards_;
 
+    // El detector OBB deja unos pixeles de fieltro en los bordes, sobre todo
+    // en cartas pequenas. Ese margen se amplifica al normalizar a 224x224 y
+    // desplaza el embedding hacia otra carta. Recortamos un 5% por lado solo
+    // para la consulta; el recorte completo sigue usandose para OCR, overlay y
+    // la cola del realizador.
+    cv::Mat trim_query_border(const cv::Mat& bgr) const
+    {
+        if (bgr.empty() || bgr.cols < 16 || bgr.rows < 16) return bgr;
+        const int dx = std::max(1, (int)std::lround(bgr.cols * 0.05));
+        const int dy = std::max(1, (int)std::lround(bgr.rows * 0.05));
+        if (bgr.cols - 2 * dx < 8 || bgr.rows - 2 * dy < 8) return bgr;
+        return bgr(cv::Rect(dx, dy, bgr.cols - 2 * dx, bgr.rows - 2 * dy)).clone();
+    }
+
     std::vector<float> compute_embedding(const cv::Mat& bgr)
     {
         if (bgr.empty()) return {};
 
+        const cv::Mat query = trim_query_border(bgr);
         cv::Mat resized;
-        cv::resize(bgr, resized, cv::Size(224, 224), 0, 0, cv::INTER_LINEAR);
+        cv::resize(query, resized, cv::Size(224, 224), 0, 0, cv::INTER_LINEAR);
 
         // NCHW blob, RGB channel order, pixel values in [0,1]
         cv::Mat blob = cv::dnn::blobFromImage(resized, 1.0 / 255.0, cv::Size(224, 224),
@@ -270,7 +420,7 @@ private:
             // con cada fila del indice = media de las 4 similitudes de embedding
             // + similitud NCC. Ver scripts/build_embedding_index.py (--fused).
             if (embedding_dim_ == 4 * (int)output_size + 3 * 32 * 32) {
-                std::vector<float> ncc = compute_ncc_block(bgr);
+                std::vector<float> ncc = compute_ncc_block(query);
                 if (!ncc.empty()) {
                     std::vector<float> fused;
                     fused.reserve(4 * output_size + ncc.size());

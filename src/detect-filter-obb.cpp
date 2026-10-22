@@ -1,4 +1,5 @@
 #include "detect-filter-obb.h"
+#include "vtes_icons.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -12,6 +13,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/geometry.hpp>
 #include <opencv2/dnn.hpp>
+#include <cstring>
 
 static constexpr float kPI = 3.14159265358979323846f;
 // ─── Overlay: geometria de referencia ───────────────────────────────────────
@@ -57,6 +59,18 @@ static constexpr int kSlotY[5] = {89, 170, 249, 327, 401};
 #include <unordered_map>
 #include <bitset>
 #include <cmath>
+#include <climits>
+#include <iterator>
+
+// stb_truetype (dominio publico): rasteriza los TTF de los nombres.
+#ifdef _MSC_VER
+#pragma warning(push, 0)
+#endif
+#define STB_TRUETYPE_IMPLEMENTATION
+#include <stb_truetype.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 #include "detection/vampire_classifier.hpp"
 
@@ -91,10 +105,18 @@ static const char *DETECT_MODE_ONNX = "onnx";
 
 struct detect_filter_obb : public filter_data {};
 
+// El OCR necesita bastantes pixeles por letra para ser fiable. En una mesa de
+// juego la carta completa suele ocupar 50-150 px de alto y el nombre queda en
+// 2-5 px: Tesseract no puede leerlo. En ese rango manda el embedding; el OCR
+// se reserva para primeros planos, donde si aporta una confirmacion.
+static constexpr float kMinOcrSourceHeight = 200.0f;
+static constexpr float kMinCardSide = 12.0f;
+
 // ─── Card region extraction ─────────────────────────────────────────────────
 
-// Perspective-correct a region defined by 4 corners into a top-down view,
-// then enhance the crop for better embedding matching.
+// Perspective-correct a region defined by 4 corners into a top-down view.
+// Se mantiene el color original porque el indice de embeddings y el bloque
+// NCC se construyen sin CLAHE; el OCR realza su propia copia por separado.
 static cv::Mat extractCardRegion(const cv::Mat& frame,
                                    const cv::Point2f corners[4])
 {
@@ -105,7 +127,7 @@ static cv::Mat extractCardRegion(const cv::Mat& frame,
 	float right = std::max({corners[0].x, corners[1].x, corners[2].x, corners[3].x});
 	int raw_w = (int)(right - left + 1);
 	int raw_h = (int)(bottom - top + 1);
-	if (raw_w < 16 || raw_h < 16) return cv::Mat();
+	if (raw_w < kMinCardSide || raw_h < kMinCardSide) return cv::Mat();
 
 	// Sort corners into TL, TR, BR, BL using sum/diff method
 	cv::Point2f src_pts[4];
@@ -125,16 +147,25 @@ static cv::Mat extractCardRegion(const cv::Mat& frame,
 		src_pts[2] = pts[br]; src_pts[3] = pts[bl];
 	}
 
-	// Output size: preserve VTES card aspect (63:88) with minimum quality
+	// Output size: true card edges, not the axis-aligned bounding box of the
+	// rotated corners. Using raw_w/raw_h on a tilted card added background
+	// around it and diluted both the embedding and the NCC block.
 	constexpr double vtes_aspect = 88.0 / 63.0; // h/w
-	int out_w, out_h;
-	if ((double)raw_h / raw_w > vtes_aspect) {
-		out_h = std::max(raw_h, 128);
-		out_w = (int)(out_h / vtes_aspect + 0.5f);
-	} else {
-		out_w = std::max(raw_w, 96);
-		out_h = (int)(out_w * vtes_aspect + 0.5f);
-	}
+	auto edge_len = [](const cv::Point2f& a, const cv::Point2f& b) {
+		return std::hypot(a.x - b.x, a.y - b.y);
+	};
+	const float edge_a = 0.5f * (edge_len(src_pts[0], src_pts[1]) +
+		                          edge_len(src_pts[3], src_pts[2]));
+	const float edge_b = 0.5f * (edge_len(src_pts[0], src_pts[3]) +
+		                          edge_len(src_pts[1], src_pts[2]));
+	const float card_long = std::max(edge_a, edge_b);
+	// No dejamos que una deteccion lejana entregue un recorte de 30-60 px al
+	// embedder. El modelo trabaja a 224x224; ampliamos aqui, antes del warp,
+	// para que la interpolacion no destruya bordes y texto. El limite 224 no
+	// inventa detalle, pero conserva mejor la estructura que llegar a 128 y
+	// volver a ampliar despues.
+	int out_h = std::max((int)std::lround(card_long), 224);
+	int out_w = std::max((int)std::lround(out_h / vtes_aspect), 160);
 
 	cv::Point2f dst_pts[4] = {
 		{0, 0}, {(float)out_w - 1, 0}, {(float)out_w - 1, (float)out_h - 1}, {0, (float)out_h - 1}
@@ -142,24 +173,52 @@ static cv::Mat extractCardRegion(const cv::Mat& frame,
 
 	cv::Mat M = cv::getPerspectiveTransform(src_pts, dst_pts);
 	cv::Mat warped;
-	cv::warpPerspective(frame, warped, M, cv::Size(out_w, out_h));
+	const int interp = (out_h > (int)std::lround(card_long))
+		? cv::INTER_CUBIC : cv::INTER_LINEAR;
+	cv::warpPerspective(frame, warped, M, cv::Size(out_w, out_h), interp,
+	                    cv::BORDER_REPLICATE);
 
-	// Enhance for embedding — subtle CLAHE on L channel for better contrast
-	cv::Mat enhanced;
-	if (warped.channels() == 3) {
-		cv::Mat lab;
-		cv::cvtColor(warped, lab, cv::COLOR_BGR2Lab);
-		std::vector<cv::Mat> lab_channels;
-		cv::split(lab, lab_channels);
-		cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(1.5, cv::Size(4, 4));
-		clahe->apply(lab_channels[0], lab_channels[0]);
-		cv::merge(lab_channels, lab);
-		cv::cvtColor(lab, enhanced, cv::COLOR_Lab2BGR);
-	} else {
-		enhanced = warped.clone();
+	// El indice de embeddings se construye sin CLAHE (ver
+	// scripts/build_embedding_index.py). Aplicar CLAHE solo a la consulta
+	// rompia esa correspondencia y bajaba la similitud de las cartas
+	// correctas. El OCR aplica su propio CLAHE en preprocessForOcr().
+	return warped;
+}
+
+// dHash 9x8 del recorte. Sirve para casar el resultado asincrono del OCR
+// con el recorte exacto que lo origino; un track puede reutilizarse al
+// cambiar de carta y antes el nombre viejo se aplicaba a la carta nueva.
+static uint64_t cardCropHash(const cv::Mat& bgr)
+{
+	if (bgr.empty()) return 0;
+	cv::Mat gray, small;
+	cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+	cv::resize(gray, small, cv::Size(9, 8), 0, 0, cv::INTER_AREA);
+	uint64_t h = 0;
+	for (int y = 0; y < 8; ++y) {
+		for (int x = 0; x < 8; ++x) {
+			h <<= 1;
+			if (small.at<uchar>(y, x) > small.at<uchar>(y, x + 1)) h |= 1;
+		}
 	}
+	return h;
+}
 
-	return enhanced;
+// Varianza del laplaciano normalizada a 224x224. Sirve para diagnosticar
+// capturas desenfocadas: una carta enfocada ronda 3000-8000; una captura
+// borrosa de la C310 puede quedar por debajo de 100. No se usa para
+// rechazar todavia; se registra junto al resultado del embedding.
+static float cardRegionSharpness(const cv::Mat& bgr)
+{
+	if (bgr.empty()) return 0.0f;
+	cv::Mat gray, small;
+	cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+	cv::resize(gray, small, cv::Size(224, 224), 0, 0, cv::INTER_AREA);
+	cv::Mat lap;
+	cv::Laplacian(small, lap, CV_64F);
+	cv::Scalar mean, stddev;
+	cv::meanStdDev(lap, mean, stddev);
+	return (float)(stddev[0] * stddev[0]);
 }
 
 // ─── Vision-based type classifier inference ─────────────────────────────
@@ -709,23 +768,36 @@ static void updateTemporalTracks(
 			track.avg_angle = (1 - alpha) * track.avg_angle + alpha * det.angle;
 			track.stable_count++;
 			track.unseen_count = 0;
+			track.last_crop_hash = det.crop_hash;
+			track.last_label = det.label;
 			track.history.push_back(true);
 			if ((int)track.history.size() > filter_data::TEMPORAL_WINDOW)
 				track.history.pop_front();
 
-			// Update identity if detection has card_id
+			// Update identity if detection has card_id. La comparacion de
+			// "mejor" debe usar la confianza de identidad, no track.confidence
+			// (que mide estabilidad de la caja, no del nombre).
 			if (!det.card_id.empty() && det.card_id == track.tracked_card_id) {
 				track.identity_hits++;
+				track.identity_score = std::max(track.identity_score, det.prob);
 			} else if (!det.card_id.empty()) {
-				bool current_weak = track.identity_total < 5 ||
-				    (track.identity_total > 0 &&
-				     (float)track.identity_hits / track.identity_total < 0.4f);
-				bool new_much_better = det.prob > track.confidence + 0.2f;
+				const float identity_ratio = track.identity_total > 0
+					? (float)track.identity_hits / (float)track.identity_total : 0.0f;
+				bool current_weak = track.identity_total < 3 || identity_ratio < 0.5f;
+				bool new_much_better = det.prob > track.identity_score + 0.12f;
 				if (current_weak || new_much_better) {
 					track.tracked_card_id = det.card_id;
 					track.tracked_card_name = det.card_name;
 					track.identity_hits = 1;
+					track.identity_total = 0;
+					track.identity_score = det.prob;
+				} else if (track.identity_hits > 0) {
+					track.identity_hits--;
 				}
+			} else if (track.identity_hits > 0) {
+				// Un frame sin identificacion (borroso o ambiguo) no debe
+				// mantener viva indefinidamente una identidad antigua.
+				track.identity_hits--;
 			}
 			track.identity_total++;
 			if (track.identity_total > filter_data::TrackedObject::IDENTITY_WINDOW) {
@@ -751,10 +823,13 @@ static void updateTemporalTracks(
 			track.id = tf->next_track_id++;
 			track.confidence = 1.0f / (float)filter_data::TEMPORAL_WINDOW;
 			track.history = {true};
+			track.last_crop_hash = det.crop_hash;
+			track.last_label = det.label;
 			track.tracked_card_id = det.card_id;
 			track.tracked_card_name = det.card_name;
 			track.identity_hits = det.card_id.empty() ? 0 : 1;
 			track.identity_total = 1;
+			track.identity_score = det.card_id.empty() ? 0.0f : det.prob;
 			tf->temporal_tracks[track.id] = track;
 			best_id = track.id;
 		}
@@ -781,17 +856,22 @@ static void updateTemporalTracks(
 			obj.rect.width = track.avg_w;
 			obj.rect.height = track.avg_h;
 			obj.angle = track.avg_angle;
-			obj.label = 0;
+			obj.label = track.last_label;
 			obj.prob = track.confidence;
 			obj.id = track.id;
 			obj.unseenFrames = track.unseen_count;
+			obj.crop_hash = track.last_crop_hash;
 
-			// Use smoothed identity if majority of frames agree
+			// Use smoothed identity if majority of frames agree. Exigimos
+			// al menos 3 aciertos: una unica deteccion aislada (tipica de
+			// una captura borrosa) no debe entrar en la cola del realizador.
 			if (!track.tracked_card_id.empty() &&
 			    track.identity_total >= 3 &&
+			    track.identity_hits >= 3 &&
 			    (float)track.identity_hits / track.identity_total > 0.5f) {
 				obj.card_id = track.tracked_card_id;
 				obj.card_name = track.tracked_card_name;
+				obj.prob = track.identity_score;
 			}
 
 			output_objects.push_back(obj);
@@ -800,6 +880,159 @@ static void updateTemporalTracks(
 }
 
 // ─── OBS filter callbacks ──────────────────────────────────────────────────
+
+namespace {
+
+const char *tf_property_key(const char *name)
+{
+	if (!name)
+		return nullptr;
+
+	static const struct {
+		const char *name;
+		const char *key;
+	} labels[] = {
+		{"preview", "Preview"},
+		{"always_active", "AlwaysActive"},
+		{"language", "Language"},
+		{"threshold", "ConfThreshold"},
+		{"detection_mode", "DetectionMode"},
+		{"inference_device", "InferenceDevice"},
+		{"classifier_enabled", "TypeClassifier"},
+		{"ocr_enabled", "OcrEnabled"},
+		{"upscaler_enabled", "NisUpscale"},
+		{"vampire_cuda_enabled", "OvalRectClassifier"},
+		{"detection_interval_seconds", "DetectionInterval"},
+		{"rulings_scroll", "RulingsScroll"},
+		{"click_to_overlay", "ClickToOverlay"},
+		{"card_search_btn", "OpenCardSearch"},
+		{"player_count", "PlayerCount"},
+		{"show_zones", "ShowZones"},
+		{"big_card", "BigCard"},
+		{"overlay_font", "OverlayFont"},
+		{"cam_hint", "CamHint"},
+		{"cam_full_frame", "CamFullFrame"},
+		{"cam_zoom", "CamZoom"},
+		{"cam_offset_x", "CamOffsetX"},
+		{"cam_offset_y", "CamOffsetY"},
+	};
+
+	for (const auto &label : labels) {
+		if (std::strcmp(name, label.name) == 0)
+			return label.key;
+	}
+	return nullptr;
+}
+
+/* Separa "player_3_minion_angle" en indice 3 y campo "minion_angle". */
+bool tf_player_field(const char *name, int &player, std::string &field)
+{
+	if (!name)
+		return false;
+
+	const std::string value = name;
+	const std::string prefix = "player_";
+	if (value.compare(0, prefix.size(), prefix) != 0)
+		return false;
+
+	size_t sep = value.find('_', prefix.size());
+	if (sep == std::string::npos || sep == prefix.size())
+		return false;
+
+	int index = 0;
+	for (size_t i = prefix.size(); i < sep; ++i) {
+		if (value[i] < '0' || value[i] > '9')
+			return false;
+		index = index * 10 + (value[i] - '0');
+	}
+
+	player = index;
+	field = value.substr(sep + 1);
+	return true;
+}
+
+void tf_refresh_list(obs_property_t *property, const char *const *keys,
+		     const char *const *values, size_t count)
+{
+	obs_property_list_clear(property);
+	for (size_t i = 0; i < count; ++i)
+		obs_property_list_add_string(property, tf_text(keys[i]), values[i]);
+}
+
+void tf_refresh_property_labels(obs_properties_t *properties)
+{
+	if (!properties)
+		return;
+
+	obs_property_t *property = obs_properties_first(properties);
+	while (property) {
+		const char *name = obs_property_name(property);
+		int player = -1;
+		std::string field;
+
+		if (tf_player_field(name, player, field)) {
+			if (field == "group") {
+				const std::string label = std::string(tf_text("Player")) +
+							  " " + std::to_string(player + 1);
+				obs_property_set_description(property, label.c_str());
+			} else if (field == "name") {
+				obs_property_set_description(property, tf_text("PlayerName"));
+			} else if (field == "pool") {
+				obs_property_set_description(property, tf_text("InitialPool"));
+			} else if (field == "active") {
+				obs_property_set_description(property, tf_text("PlayerActive"));
+			} else if (field == "minion_angle") {
+				obs_property_set_description(property, tf_text("MinionAngle"));
+			} else if (field == "crypt_angle") {
+				obs_property_set_description(property, tf_text("CryptAngle"));
+			}
+		} else {
+			const char *key = tf_property_key(name);
+			if (key)
+				obs_property_set_description(property, tf_text(key));
+		}
+
+		const obs_property_type type = obs_property_get_type(property);
+		if (type == OBS_PROPERTY_GROUP) {
+			tf_refresh_property_labels(obs_property_group_content(property));
+		} else if (type == OBS_PROPERTY_LIST) {
+			if (name && std::strcmp(name, "detection_mode") == 0) {
+				static const char *keys[] = {"Shape (Contour)", "AI Model (ONNX)"};
+				static const char *values[] = {DETECT_MODE_CONTOUR, DETECT_MODE_ONNX};
+				tf_refresh_list(property, keys, values, 2);
+			} else if (name && std::strcmp(name, "inference_device") == 0) {
+				static const char *keys[] = {
+					"CPU",
+#if _WIN32
+					"GPU (DirectML)", "GPU (CUDA)",
+#endif
+				};
+				static const char *values[] = {
+					INFERENCE_CPU,
+#if _WIN32
+					INFERENCE_DML, INFERENCE_CUDA,
+#endif
+				};
+				tf_refresh_list(property, keys, values,
+#if _WIN32
+						3
+#else
+						1
+#endif
+				);
+			} else if (name && std::strcmp(name, "overlay_font") == 0) {
+				static const char *keys[] = {"FontCinzel", "FontGrenze",
+							     "FontClassic"};
+				static const char *values[] = {"cinzel", "grenze", "hershey"};
+				tf_refresh_list(property, keys, values, 3);
+			}
+		}
+
+		obs_property_next(&property);
+	}
+}
+
+} // namespace
 
 const char *detect_filter_obb_getname(void *unused)
 {
@@ -815,15 +1048,16 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	obs_properties_add_bool(props, "always_active", tf_text("AlwaysActive"));
 
 	// Idioma del plugin (nativo: espanol). Se guarda para las siguientes
-	// cargas y las etiquetas del panel se refrescan al reabrir el dialogo.
+	// cargas; el callback refresca las etiquetas del panel en el acto.
 	obs_property_t *p_lang = obs_properties_add_list(props, "language", tf_text("Language"),
 							 OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(p_lang, "Español", "es");
 	obs_property_list_add_string(p_lang, "English", "en");
 	obs_property_set_modified_callback2(
 		p_lang,
-		[](void *, obs_properties_t *, obs_property_t *, obs_data_t *settings) {
+		[](void *, obs_properties_t *props, obs_property_t *, obs_data_t *settings) {
 			tf_i18n_set(obs_data_get_string(settings, "language"));
+			tf_refresh_property_labels(props);
 			return true;
 		},
 		nullptr);
@@ -848,7 +1082,7 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 #endif
 
 	obs_properties_add_bool(props, "classifier_enabled", tf_text("TypeClassifier"));
-	
+
 	// OCR
 	obs_properties_add_bool(props, "ocr_enabled", tf_text("OcrEnabled"));
 	obs_properties_add_bool(props, "upscaler_enabled", tf_text("NisUpscale"));
@@ -910,6 +1144,23 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	obs_properties_add_bool(props, "show_zones", tf_text("ShowZones"));
 	obs_properties_add_bool(props, "big_card", tf_text("BigCard"));
 
+	obs_property_t *p_font = obs_properties_add_list(
+		props, "overlay_font", tf_text("OverlayFont"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(p_font, tf_text("FontCinzel"), "cinzel");
+	obs_property_list_add_string(p_font, tf_text("FontGrenze"), "grenze");
+	obs_property_list_add_string(p_font, tf_text("FontClassic"), "hershey");
+
+	// Encuadre de la camara bajo el overlay (sin barras negras)
+	obs_properties_add_text(props, "cam_hint", tf_text("CamHint"), OBS_TEXT_INFO);
+	obs_properties_add_bool(props, "cam_full_frame", tf_text("CamFullFrame"));
+	obs_properties_add_float_slider(props, "cam_zoom", tf_text("CamZoom"),
+	                                100.0, 300.0, 1.0);
+	obs_properties_add_int_slider(props, "cam_offset_x", tf_text("CamOffsetX"),
+	                              -400, 400, 1);
+	obs_properties_add_int_slider(props, "cam_offset_y", tf_text("CamOffsetY"),
+	                              -400, 400, 1);
+
 	for (int i = 0; i < filter_data::MAX_PLAYERS; i++) {
 		std::string prefix = "player_" + std::to_string(i);
 		std::string label = std::string(tf_text("Player")) + " " + std::to_string(i + 1);
@@ -961,8 +1212,12 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "contour_max_area", 0.30);
 	obs_data_set_default_double(settings, "contour_aspect_tol", 0.15);
 
-	// ONNX area filter defaults
-	obs_data_set_default_int(settings, "onnx_min_area", 4000);
+	// ONNX area filter defaults. En una mesa real una carta puede ocupar solo
+	// 20x30 px (600 px^2); el limite anterior de 4000 px^2 la descartaba antes
+	// de llegar al embedding. El embedding sigue identificando a 40 px de alto
+	// con margen amplio; dejamos el suelo en 300 y que confianza, tipo y
+	// embedding filtren los falsos positivos.
+	obs_data_set_default_int(settings, "onnx_min_area", 300);
 	obs_data_set_default_double(settings, "onnx_max_area", 0.30);
 
 	// Temporal smoothing defaults
@@ -990,6 +1245,11 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "player_count", 5);
 	obs_data_set_default_bool(settings, "show_zones", true);
 	obs_data_set_default_bool(settings, "big_card", false);
+	obs_data_set_default_string(settings, "overlay_font", "cinzel");
+	obs_data_set_default_bool(settings, "cam_full_frame", false);
+	obs_data_set_default_double(settings, "cam_zoom", 100.0);
+	obs_data_set_default_int(settings, "cam_offset_x", 0);
+	obs_data_set_default_int(settings, "cam_offset_y", 0);
 	for (int i = 0; i < filter_data::MAX_PLAYERS; i++) {
 		std::string p = "player_" + std::to_string(i);
 		obs_data_set_default_string(settings, (p + "_name").c_str(), ("Jugador " + std::to_string(i + 1)).c_str());
@@ -1101,6 +1361,21 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		tf->player_count = new_count;
 		tf->show_zones = obs_data_get_bool(settings, "show_zones");
 		tf->big_card = obs_data_get_bool(settings, "big_card");
+
+		const char *font = obs_data_get_string(settings, "overlay_font");
+		const std::string font_name = font ? font : "";
+		tf->overlay_font_mode = font_name == "hershey" ? 2
+		                      : font_name == "grenze"  ? 1
+		                                               : 0;
+
+		tf->cam_full_frame = obs_data_get_bool(settings, "cam_full_frame");
+		tf->cam_zoom = obs_data_get_double(settings, "cam_zoom") / 100.0;
+		if (tf->cam_zoom < 1.0) tf->cam_zoom = 1.0;
+		if (tf->cam_zoom > 3.0) tf->cam_zoom = 3.0;
+		tf->cam_off_x = (int)obs_data_get_int(settings, "cam_offset_x");
+		tf->cam_off_y = (int)obs_data_get_int(settings, "cam_offset_y");
+		tf->cam_off_x = std::max(-400, std::min(400, tf->cam_off_x));
+		tf->cam_off_y = std::max(-400, std::min(400, tf->cam_off_y));
 
 		for (int i = 0; i < filter_data::MAX_PLAYERS; i++) {
 			std::string p = "player_" + std::to_string(i);
@@ -1434,7 +1709,9 @@ static void stop_ocr_worker(detect_filter_obb* tf);
 static void submit_ocr_jobs(detect_filter_obb* tf,
 							const std::vector<cv::Mat>& card_regions,
 							const std::vector<int>& track_ids,
-							const std::vector<std::string>& type_filters);
+							const std::vector<std::string>& type_filters,
+							const std::vector<uint64_t>& crop_hashes,
+							const std::vector<char>& ocr_allowed);
 static void drain_ocr_results(detect_filter_obb* tf,
 							  std::vector<vtes_detection::OBBObject>& objects);
 
@@ -1520,19 +1797,23 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 			out.push_back({d.card_name, d.card_id, d.card_url, d.timestamp_ns});
 		return out;
 	};
-	tf->web_server->on_overlay_fn = [tf](const std::string& url) {
+	tf->web_server->on_overlay_fn = [tf](const std::string& url,
+	                                      const std::string& card_id) {
 		{
 			std::lock_guard<std::mutex> lock(tf->game_state_lock);
 			tf->current_overlay_card_url = url;
-			tf->current_overlay_card_id.clear();
+			tf->current_overlay_card_id = card_id;
+			tf->current_overlay_fallback.release();
 		}
-		obs_log(LOG_INFO, "[WebServer] Overlay manual: %s", url.c_str());
+		obs_log(LOG_INFO, "[WebServer] Overlay manual: %s (id=%s)",
+		        url.c_str(), card_id.c_str());
 	};
 	tf->web_server->on_overlay_clear_fn = [tf]() {
 		{
 			std::lock_guard<std::mutex> lock(tf->game_state_lock);
 			tf->current_overlay_card_url.clear();
 			tf->current_overlay_card_id.clear();
+			tf->current_overlay_fallback.release();
 		}
 		obs_log(LOG_INFO, "[WebServer] Overlay manual limpiado");
 	};
@@ -1703,6 +1984,12 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 			std::lock_guard<std::mutex> lock(tf->game_state_lock);
 			tf->current_overlay_card_url = chosen.card_url;
 			tf->current_overlay_card_id = chosen.card_id;
+			tf->current_overlay_fallback.release();
+			if (!chosen.crop_jpg.empty()) {
+				cv::Mat fb = cv::imdecode(chosen.crop_jpg, cv::IMREAD_COLOR);
+				if (!fb.empty())
+					tf->current_overlay_fallback = fb;
+			}
 		}
 		recordDirectorFeedback(tf, "selection", &chosen, pool);
 		obs_log(LOG_INFO, "[Director] Mostrado \"%s\" (elegida entre %zu; cola limpiada)",
@@ -1876,7 +2163,7 @@ static void ocr_worker_func(detect_filter_obb* tf)
 		{
 			std::lock_guard<std::mutex> lock(tf->ocr_result_lock);
 			tf->ocr_completed.push_back({job.id, true, accepted,
-				ocr_name, ocr_id, ocr_conf});
+				ocr_name, ocr_id, ocr_conf, job.crop_hash});
 		}
 	}
 	obs_log(LOG_INFO, "[OCR Worker] Stopped");
@@ -1901,17 +2188,31 @@ static void stop_ocr_worker(detect_filter_obb* tf)
 static void submit_ocr_jobs(detect_filter_obb* tf,
 							const std::vector<cv::Mat>& card_regions,
 							const std::vector<int>& track_ids,
-							const std::vector<std::string>& type_filters)
+							const std::vector<std::string>& type_filters,
+							const std::vector<uint64_t>& crop_hashes,
+							const std::vector<char>& ocr_allowed)
 {
 	if (!tf->ocr_worker_active || !tf->ocr_reader) return;
+	// El OCR es auxiliar y mas lento que el video. Si se encola un job por
+	// frame, los resultados llegan con segundos de retraso y de cartas que ya
+	// no estan en pantalla. Mantener la cola corta reduce latencia y basura.
+	{
+		std::lock_guard<std::mutex> lock(tf->ocr_queue_lock);
+		if (tf->ocr_queue.size() >= 2) return;
+	}
 	for (size_t i = 0; i < card_regions.size() && i < type_filters.size(); i++) {
 		if (card_regions[i].empty()) continue;
+		// Solo se encola lo que el OCR puede leer de verdad: primeros planos
+		// que aun no tienen una identificacion segura por embedding. Con una
+		// carta pequena el nombre ocupa 2-5 px y Tesseract solo puede inventar.
+		if (i >= ocr_allowed.size() || !ocr_allowed[i]) continue;
 		// El ticket del job ES el track id del objeto, para que
 		// drain_ocr_results pueda devolver cada nombre a su carta.
 		int64_t jid = track_ids[i];
 		{
 			std::lock_guard<std::mutex> lock(tf->ocr_queue_lock);
-			tf->ocr_queue.push({jid, card_regions[i].clone(), type_filters[i]});
+			tf->ocr_queue.push({jid, card_regions[i].clone(), type_filters[i],
+				i < crop_hashes.size() ? crop_hashes[i] : 0});
 		}
 		tf->ocr_queue_cv.notify_one();
 	}
@@ -1946,6 +2247,32 @@ static void drain_ocr_results(detect_filter_obb* tf,
 				continue;
 			}
 			auto& obj = objects[obj_idx];
+			// El mismo track puede reutilizarse cuando el operador cambia de
+			// carta. Sin comparar el recorte, un OCR lento de la carta anterior
+			// sobrescribia la identificacion de la nueva (p. ej. Eyes of Argus
+			// sobre Dust Up).
+			if (result.crop_hash != obj.crop_hash) {
+				obs_log(LOG_INFO, "[OCR] Async result descartado: recorte distinto (track %d)",
+						result.id);
+				continue;
+			}
+			// El embedding manda cuando ya hay una identificacion segura; el
+			// OCR solo confirma o rellena huecos. Asi una lectura vieja no puede
+			// cambiar una carta ya reconocida.
+			if (!obj.card_id.empty() && obj.card_id != result.card_id &&
+			    (obj.alt_card_id.empty() || obj.alt_card_id != result.card_id)) {
+				obs_log(LOG_INFO, "[OCR] Async result '%s' descartado: embedding dice '%s' (track %d)",
+						result.card_name.c_str(), obj.card_name.c_str(), result.id);
+				continue;
+			}
+			// Empate top-1/top-2: las dos candidatas ya estan en la cola del
+			// realizador. Dejar que el OCR elija una tercera carta convertiria
+			// una ambiguedad conocida en un falso positivo silencioso.
+			if (obj.card_id.empty() && !obj.alt_card_id.empty()) {
+				obs_log(LOG_INFO, "[OCR] Async result '%s' descartado: embedding ambiguo (track %d)",
+						result.card_name.c_str(), result.id);
+				continue;
+			}
 			obj.card_name = result.card_name;
 			obj.card_id = result.card_id;
 			obj.prob = result.confidence;
@@ -2009,27 +2336,400 @@ static cv::Rect designRect(const OverlayFit& fit, int x, int y, int w, int h)
 	                (int)(w * fit.esc + 0.5), (int)(h * fit.esc + 0.5));
 }
 
-// Rectangulo donde se dibuja la camara: la imagen entera ajustada (sin
-// recorte) dentro del hueco del diseño, centrada. Las zonas de jugador
-// (coords de camara 0..1) se mapean con este mismo rectangulo.
-static cv::Rect cameraFitRect(const OverlayFit& fit, int fw, int fh)
+// Ventana de camara = caja del area transparente del overlay (canal alfa).
+// Asi el encuadre sigue al diseño si este cambia, sin tocar constantes.
+static cv::Rect overlayCameraWindow(const cv::Mat& bg)
 {
-	const cv::Rect win = designRect(fit, kWinX, kWinY, kWinW, kWinH);
-	if (win.width < 8 || win.height < 8)
-		return cv::Rect(0, 0, fw, fh);
+	if (bg.empty() || bg.channels() != 4)
+		return {};
 
-	const double esc = std::min((double)win.width / fw, (double)win.height / fh);
-	const int cw = (int)(fw * esc + 0.5), ch = (int)(fh * esc + 0.5);
-	return cv::Rect(win.x + (win.width - cw) / 2, win.y + (win.height - ch) / 2, cw, ch);
+	cv::Mat alpha, mask;
+	cv::extractChannel(bg, alpha, 3);
+	cv::threshold(alpha, mask, 15, 255, cv::THRESH_BINARY_INV);
+
+	std::vector<cv::Point> pts;
+	cv::findNonZero(mask, pts);
+	if (pts.empty())
+		return {};
+
+	cv::Rect r = cv::boundingRect(pts);
+	if (r.width < 8 || r.height < 8 || r.area() >= bg.total() * 95 / 100)
+		return {};
+	return r;
 }
 
+// Encuadre de la camara bajo el overlay: escala tipo "cover" sobre el hueco
+// del diseño (la imagen cubre el hueco entero, sin barras negras), con zoom
+// y desplazamiento ajustables por el usuario. El desplazamiento se recorta
+// para que la camara siga cubriendo el hueco: nunca quedan bordes negros.
+struct CameraView {
+	double   scale = 1.0;        // pixeles de camara -> pixeles de frame
+	double   ox = 0.0, oy = 0.0; // esquina sup-izq de la imagen (px de frame)
+	cv::Rect win;                // hueco de camara (px de frame)
+};
+
+static CameraView cameraView(const OverlayFit& fit, int fw, int fh,
+                             const cv::Rect& win_design, double zoom,
+                             int off_x, int off_y, bool full_frame)
+{
+	CameraView view;
+	// A sangre: la camara cubre todo el frame (las bandas laterales del
+	// diseno 3:2 tambien muestran camara). Si no, solo cubre el hueco.
+	view.win = full_frame
+		? cv::Rect(0, 0, fw, fh)
+		: designRect(fit, win_design.x, win_design.y,
+		             win_design.width, win_design.height);
+	if (view.win.width < 8 || view.win.height < 8 || fw < 8 || fh < 8)
+		return view;
+
+	if (zoom < 1.0)
+		zoom = 1.0;
+	const double esc = std::max((double)view.win.width / fw,
+	                            (double)view.win.height / fh) * zoom;
+	const double iw = fw * esc, ih = fh * esc;
+	if (iw < 8.0 || ih < 8.0)
+		return view;
+
+	// Desplazamiento en pixeles de diseño -> frame, recortado para que la
+	// imagen siga cubriendo el hueco completo.
+	const double max_x = std::max(0.0, (iw - view.win.width) * 0.5);
+	const double max_y = std::max(0.0, (ih - view.win.height) * 0.5);
+	const double dx = std::max(-max_x, std::min(max_x, off_x * fit.esc));
+	const double dy = std::max(-max_y, std::min(max_y, off_y * fit.esc));
+
+	view.scale = esc;
+	view.ox = view.win.x + (view.win.width - iw) * 0.5 + dx;
+	view.oy = view.win.y + (view.win.height - ih) * 0.5 + dy;
+	return view;
+}
+
+// ─── Fuentes TTF para los nombres del overlay ─────────────────────────
+// stb_truetype rasteriza los TTF de data/obs-plugins/…/fonts/. El texto se
+// cachea ya rasterizado (mascara alfa) por texto+tamaño; el color se aplica
+// al pegarlo, asi el mismo nombre vale para jugador activo u ousted.
+static std::vector<int> utf8Codepoints(const std::string& s)
+{
+	std::vector<int> out;
+	for (size_t i = 0; i < s.size();) {
+		const unsigned char c = (unsigned char)s[i];
+		int cp = '?';
+		int n = 1;
+		if (c < 0x80) {
+			cp = c;
+		} else if ((c & 0xE0) == 0xC0) {
+			cp = c & 0x1F;
+			n = 2;
+		} else if ((c & 0xF0) == 0xE0) {
+			cp = c & 0x0F;
+			n = 3;
+		} else if ((c & 0xF8) == 0xF0) {
+			cp = c & 0x07;
+			n = 4;
+		} else {
+			out.push_back('?');
+			i++;
+			continue;
+		}
+		if (i + (size_t)n > s.size()) {
+			out.push_back('?');
+			break;
+		}
+		bool bad = false;
+		for (int k = 1; k < n; k++) {
+			const unsigned char cc = (unsigned char)s[i + (size_t)k];
+			if ((cc & 0xC0) != 0x80) {
+				bad = true;
+				break;
+			}
+			cp = (cp << 6) | (cc & 0x3F);
+		}
+		out.push_back(bad || cp <= 0 ? '?' : cp);
+		i += (size_t)n;
+	}
+	return out;
+}
+
+struct TtfFont {
+	const char *file;
+	bool tried = false;
+	bool ok = false;
+	std::vector<unsigned char> ttf;
+	stbtt_fontinfo info{};
+	std::unordered_map<std::string, cv::Mat> cache;
+
+	explicit TtfFont(const char *f) : file(f) {}
+
+	bool ensure()
+	{
+		if (tried)
+			return ok;
+		tried = true;
+
+		char *path = obs_module_file(file);
+		if (!path) {
+			obs_log(LOG_WARNING, "[Overlay] %s not found; using Hershey",
+			        file);
+			return false;
+		}
+		std::ifstream f(path, std::ios::binary);
+		bfree(path);
+		if (!f)
+			return false;
+		ttf.assign(std::istreambuf_iterator<char>(f),
+		           std::istreambuf_iterator<char>());
+		if (ttf.empty())
+			return false;
+
+		const int off = stbtt_GetFontOffsetForIndex(ttf.data(), 0);
+		if (off < 0 || !stbtt_InitFont(&info, ttf.data(), off)) {
+			obs_log(LOG_WARNING, "[Overlay] could not parse %s", file);
+			return false;
+		}
+		ok = true;
+		obs_log(LOG_INFO, "[Overlay] font %s loaded (%zu bytes)", file,
+		        ttf.size());
+		return true;
+	}
+
+	int glyphFor(int cp) const
+	{
+		if (cp == ' ')
+			return ' ';
+		return stbtt_FindGlyphIndex(&info, cp) != 0 ? cp : '?';
+	}
+
+	cv::Mat render(const std::string& text, const cv::Rect& box,
+	               double target_h)
+	{
+		const std::vector<int> cps = utf8Codepoints(text);
+		if (cps.empty())
+			return {};
+
+		// Altura visual = altura de 'H', para que el tamaño cuadre con el
+		// que daba la fuente Hershey (misma caja y mismo target_h).
+		int hx0 = 0, hy0 = 0, hx1 = 0, hy1 = 0;
+		stbtt_GetCodepointBitmapBox(&info, 'H', 1.0f, 1.0f,
+		                            &hx0, &hy0, &hx1, &hy1);
+		const float cap_h = (float)(hy1 - hy0);
+		if (cap_h <= 0.0f)
+			return {};
+
+		float scale = (float)target_h / cap_h;
+		const int avail = box.width - std::max(4, box.width / 8);
+
+		auto advanceAt = [&](int cp, int next) {
+			int adv = 0, lsb = 0;
+			stbtt_GetCodepointHMetrics(&info, glyphFor(cp), &adv, &lsb);
+			double a = adv * (double)scale;
+			if (next >= 0)
+				a += stbtt_GetCodepointKernAdvance(&info, glyphFor(cp),
+				                                  glyphFor(next)) *
+				     (double)scale;
+			return a;
+		};
+
+		double total = 0.0;
+		for (size_t i = 0; i < cps.size(); i++)
+			total += advanceAt(cps[i],
+			                   i + 1 < cps.size() ? cps[i + 1] : -1);
+		if (total > avail && total > 0.0)
+			scale *= (float)(avail / total);
+
+		// Caja real del texto (union de los glifos) para centrarlo sin
+		// depender de ascent/descent concretos del TTF.
+		struct Glyph {
+			int    cp;
+			double pen;
+		};
+		std::vector<Glyph> glyphs;
+		double pen = 0.0;
+		int minx = INT_MAX, miny = INT_MAX;
+		int maxx = INT_MIN, maxy = INT_MIN;
+		for (size_t i = 0; i < cps.size(); i++) {
+			const int cp = glyphFor(cps[i]);
+			glyphs.push_back({cp, pen});
+			int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+			stbtt_GetCodepointBitmapBox(&info, cp, scale, scale,
+			                            &x0, &y0, &x1, &y1);
+			if (x1 > x0 && y1 > y0) {
+				minx = std::min(minx, (int)std::floor(pen) + x0);
+				maxx = std::max(maxx, (int)std::ceil(pen) + x1);
+				miny = std::min(miny, y0);
+				maxy = std::max(maxy, y1);
+			}
+			pen += advanceAt(cps[i], i + 1 < cps.size() ? cps[i + 1] : -1);
+		}
+		if (minx == INT_MAX || maxx <= minx || maxy <= miny)
+			return {};
+
+		const int pad = 1;
+		cv::Mat mask(maxy - miny + pad * 2, maxx - minx + pad * 2,
+		             CV_8UC1, cv::Scalar(0));
+
+		for (const Glyph& g : glyphs) {
+			int gw = 0, gh = 0, gx = 0, gy = 0;
+			unsigned char *bmp = stbtt_GetCodepointBitmap(
+				&info, scale, scale, g.cp, &gw, &gh, &gx, &gy);
+			if (!bmp)
+				continue;
+			const int dx = (int)std::floor(g.pen) + gx - minx + pad;
+			const int dy = gy - miny + pad;
+			for (int y = 0; y < gh; y++) {
+				const int ty = dy + y;
+				if (ty < 0 || ty >= mask.rows)
+					continue;
+				uchar *row = mask.ptr<uchar>(ty);
+				const unsigned char *src = bmp + (size_t)y * gw;
+				for (int x = 0; x < gw; x++) {
+					const int tx = dx + x;
+					if (tx < 0 || tx >= mask.cols)
+						continue;
+					if (src[x] > row[tx])
+						row[tx] = src[x];
+				}
+			}
+			stbtt_FreeBitmap(bmp, nullptr);
+		}
+		return mask;
+	}
+
+	bool draw(cv::Mat& img, const std::string& text, const cv::Rect& box,
+	          const cv::Scalar& color, double target_h)
+	{
+		if (!ensure() || text.empty() || box.width < 6 || box.height < 6 ||
+		    target_h < 4.0)
+			return false;
+
+		const std::string key =
+			text + "|" + std::to_string(box.width) + "x" +
+			std::to_string(box.height) + "|" +
+			std::to_string((int)std::lround(target_h * 10.0));
+		auto it = cache.find(key);
+		if (it == cache.end()) {
+			cv::Mat mask = render(text, box, target_h);
+			if (mask.empty())
+				return false;
+			if (cache.size() >= 256)
+				cache.clear();
+			it = cache.emplace(key, std::move(mask)).first;
+		}
+
+		const cv::Mat& mask = it->second;
+		if (mask.cols > box.width || mask.rows > box.height)
+			return false;
+		const int x = box.x + (box.width - mask.cols) / 2;
+		const int y = box.y + (box.height - mask.rows) / 2;
+		const cv::Rect dst = cv::Rect(x, y, mask.cols, mask.rows) &
+		                     cv::Rect(0, 0, img.cols, img.rows);
+		if (dst.width <= 0 || dst.height <= 0)
+			return false;
+
+		const int ox = dst.x - x, oy = dst.y - y;
+		const int cb = (int)color[0], cg = (int)color[1], cr = (int)color[2];
+		for (int yy = 0; yy < dst.height; yy++) {
+			const uchar *m = mask.ptr<uchar>(yy + oy) + ox;
+			cv::Vec3b *p = img.ptr<cv::Vec3b>(dst.y + yy) + dst.x;
+			for (int xx = 0; xx < dst.width; xx++) {
+				const int a = m[xx];
+				if (!a)
+					continue;
+				p[xx][0] = (uchar)((p[xx][0] * (255 - a) + cb * a) / 255);
+				p[xx][1] = (uchar)((p[xx][1] * (255 - a) + cg * a) / 255);
+				p[xx][2] = (uchar)((p[xx][2] * (255 - a) + cr * a) / 255);
+			}
+		}
+		return true;
+	}
+
+	// Dibuja un unico glifo (icono) escalandolo para que llene la caja, en
+	// vez de usar la altura de 'H' como referencia: los iconos de ankha2 y
+	// vtes-clans ocupan casi todo el em y con draw() quedarian recortados o
+	// de tamaños muy dispares.
+	bool drawIcon(cv::Mat& img, const std::string& glyph, const cv::Rect& box,
+	              const cv::Scalar& color)
+	{
+		if (!ensure() || glyph.empty() || box.width < 4 || box.height < 4)
+			return false;
+		auto cps = utf8Codepoints(glyph);
+		if (cps.empty())
+			return false;
+		const int cp = glyphFor(cps[0]);
+		const std::string key = "icon:" + std::to_string(cp) + "x" +
+		                        std::to_string(box.width) + "x" +
+		                        std::to_string(box.height);
+		auto it = cache.find(key);
+		if (it == cache.end()) {
+			int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+			stbtt_GetCodepointBitmapBox(&info, cp, 1.0f, 1.0f, &x0, &y0,
+			                            &x1, &y1);
+			const int gw = x1 - x0, gh = y1 - y0;
+			if (gw <= 0 || gh <= 0)
+				return false;
+			const double scale = std::min((double)(box.width - 2) / gw,
+			                              (double)(box.height - 2) / gh);
+			int w = 0, h = 0, ox = 0, oy = 0;
+			unsigned char* bmp = stbtt_GetCodepointBitmap(
+				&info, (float)scale, (float)scale, cp, &w, &h, &ox, &oy);
+			if (!bmp || w <= 0 || h <= 0) {
+				if (bmp)
+					stbtt_FreeBitmap(bmp, nullptr);
+				return false;
+			}
+			cv::Mat mask(h, w, CV_8UC1);
+			for (int y = 0; y < h; y++)
+				memcpy(mask.ptr<uchar>(y), bmp + (size_t)y * w, (size_t)w);
+			stbtt_FreeBitmap(bmp, nullptr);
+			if (cache.size() >= 256)
+				cache.clear();
+			it = cache.emplace(key, std::move(mask)).first;
+		}
+
+		const cv::Mat& mask = it->second;
+		const int x = box.x + (box.width - mask.cols) / 2;
+		const int y = box.y + (box.height - mask.rows) / 2;
+		const cv::Rect dst = cv::Rect(x, y, mask.cols, mask.rows) &
+		                     cv::Rect(0, 0, img.cols, img.rows);
+		if (dst.width <= 0 || dst.height <= 0)
+			return false;
+		const int ox = dst.x - x, oy = dst.y - y;
+		const int cb = (int)color[0], cg = (int)color[1], cr = (int)color[2];
+		for (int yy = 0; yy < dst.height; yy++) {
+			const uchar* m = mask.ptr<uchar>(yy + oy) + ox;
+			cv::Vec3b* p = img.ptr<cv::Vec3b>(dst.y + yy) + dst.x;
+			for (int xx = 0; xx < dst.width; xx++) {
+				const int a = m[xx];
+				if (!a)
+					continue;
+				p[xx][0] = (uchar)((p[xx][0] * (255 - a) + cb * a) / 255);
+				p[xx][1] = (uchar)((p[xx][1] * (255 - a) + cg * a) / 255);
+				p[xx][2] = (uchar)((p[xx][2] * (255 - a) + cr * a) / 255);
+			}
+		}
+		return true;
+	}
+};
+static TtfFont g_font_cinzel("fonts/Cinzel.ttf");
+static TtfFont g_font_grenze("fonts/GrenzeGotisch.ttf");
+// stb_truetype no soporta contornos CFF: estos .ttf son la conversion de
+// los .otf oficiales de KRCP, con los mismos glifos y cmap.
+static TtfFont g_font_icons("fonts/ankha2.ttf");
+static TtfFont g_font_clans("fonts/vtes-clans.ttf");
+
 // Texto centrado dentro de una caja, encogiendo la fuente si no cabe a lo
-// ancho (los nombres de jugador son texto libre). `scale` es la escala base.
+// ancho (los nombres de jugador son texto libre). `target_h` es la altura
+// visual en pixeles; font_mode 0/1 usa TTF y si falla (o 2), Hershey.
 static void drawTextInBox(cv::Mat& img, const std::string& text, const cv::Rect& box,
-                          const cv::Scalar& color, double scale)
+                          const cv::Scalar& color, double target_h, int font_mode)
 {
 	if (text.empty() || box.width < 6 || box.height < 6)
 		return;
+	if (font_mode != 2) {
+		TtfFont *font = font_mode == 1 ? &g_font_grenze : &g_font_cinzel;
+		if (font->draw(img, text, box, color, target_h))
+			return;
+	}
+
+	double scale = target_h / 22.0;
 	int baseline = 0;
 	cv::Size ts = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, scale, 1, &baseline);
 	const int avail = box.width - std::max(4, box.width / 8);
@@ -2040,6 +2740,47 @@ static void drawTextInBox(cv::Mat& img, const std::string& text, const cv::Rect&
 	            cv::Point(box.x + (box.width - ts.width) / 2,
 	                      box.y + (box.height + ts.height) / 2),
 	            cv::FONT_HERSHEY_SIMPLEX, scale, color, 1, cv::LINE_AA);
+}
+
+// Fila de iconos de la carta (tipos, clan/credo y disciplinas). Se dibuja
+// debajo de la carta mostrada, sobre una banda oscura semitransparente para
+// que se lea tanto sobre el panel como sobre la camara (carta grande).
+static void drawCardIconRow(cv::Mat& img, const std::vector<VtesIcon>& icons,
+                            const cv::Rect& area, int size)
+{
+	if (icons.empty() || img.empty() || area.width < 8 || size < 8)
+		return;
+
+	const int n = (int)icons.size();
+	int gap = std::max(2, size / 5);
+	int total = n * size + (n - 1) * gap;
+	while (total > area.width && size > 8) {
+		--size;
+		gap = std::max(2, size / 5);
+		total = n * size + (n - 1) * gap;
+	}
+	if (size < 8)
+		return;
+
+	const int x0 = area.x + (area.width - total) / 2;
+	const int y0 = area.y;
+	const int pad = std::max(3, size / 4);
+	cv::Rect bg(x0 - pad, y0 - pad, total + 2 * pad, size + 2 * pad);
+	bg &= cv::Rect(0, 0, img.cols, img.rows);
+	if (bg.width > 2 && bg.height > 2) {
+		cv::Mat roi = img(bg);
+		cv::Mat dark;
+		roi.convertTo(dark, -1, 0.42, 0.0);
+		dark.copyTo(roi);
+		cv::rectangle(img, bg, cv::Scalar(45, 70, 105), 1);
+	}
+
+	const cv::Scalar col(76, 168, 201); // dorado #c9a84c (BGR)
+	for (int i = 0; i < n; ++i) {
+		const cv::Rect cell(x0 + i * (size + gap), y0, size, size);
+		TtfFont& f = icons[i].font == 1 ? g_font_clans : g_font_icons;
+		f.drawIcon(img, icons[i].glyph, cell, col);
+	}
 }
 
 // Pega una imagen (carta) rotada y centrada en `center`, escalada a w x h.
@@ -2149,6 +2890,105 @@ static float relativeLockAngleDeg(float card_angle_rad, float base_angle_deg)
 	return rel - 90.0f;
 }
 
+// ─── Cache de identidad por carta visible ───────────────────────────
+//
+// El embedding cuesta ~34 ms por carta en CPU (indice de 4.446 x 7.168
+// floats) y se ejecutaba en cada frame aunque la carta ya estuviera
+// identificada. Eso bloquea el hilo de video de OBS y baja los FPS sin
+// saturar la GPU. Guardamos la ultima identidad aceptada en la ficha de
+// seguimiento y la reutilizamos mientras el recorte siga siendo el mismo
+// (dHash parecido) y la carta siga en la misma zona. Si el operador cambia
+// la carta, el hash cambia y se vuelve a identificar.
+
+struct IdentityCacheEntry {
+	std::string card_id;
+	std::string card_name;
+	float confidence = 0.0f;
+	int label = 0;
+	uint64_t crop_hash = 0;
+	cv::Point2f center;
+	float width = 0.0f;
+	float height = 0.0f;
+	int64_t last_seen_ns = 0;
+};
+
+static int hamming64(uint64_t a, uint64_t b)
+{
+	uint64_t v = a ^ b;
+	int n = 0;
+	while (v) {
+		v &= v - 1;
+		++n;
+	}
+	return n;
+}
+
+static std::vector<IdentityCacheEntry> snapshotIdentityCache(detect_filter_obb *tf)
+{
+	std::vector<IdentityCacheEntry> out;
+	std::lock_guard<std::mutex> lock(tf->game_state_lock);
+	out.reserve(tf->tracked_cards.size());
+	for (const auto &[tid, tc] : tf->tracked_cards) {
+		(void)tid;
+		if (tc.card_id.empty() || tc.last_crop_hash == 0)
+			continue;
+		IdentityCacheEntry e;
+		e.card_id = tc.card_id;
+		e.card_name = tc.card_name;
+		e.confidence = tc.identity_confidence;
+		e.label = tc.last_label;
+		e.crop_hash = tc.last_crop_hash;
+		e.center = tc.last_position;
+		e.width = tc.last_width;
+		e.height = tc.last_height;
+		e.last_seen_ns = tc.last_seen_ns;
+		out.push_back(std::move(e));
+	}
+	return out;
+}
+
+static bool lookupIdentityCache(const std::vector<IdentityCacheEntry> &cache,
+				const vtes_detection::OBBObject &obj,
+				int64_t now_ns, IdentityCacheEntry &out)
+{
+	if (obj.crop_hash == 0)
+		return false;
+
+	const float cx = obj.rect.x + obj.rect.width * 0.5f;
+	const float cy = obj.rect.y + obj.rect.height * 0.5f;
+	const float obj_area = std::max(1.0f, obj.rect.width * obj.rect.height);
+	const float max_dist = std::max(24.0f, std::max(obj.rect.width, obj.rect.height) * 0.75f);
+	float best_dist = max_dist;
+
+	for (const auto &e : cache) {
+		if (now_ns - e.last_seen_ns > 1000000000LL)
+			continue;
+
+		const float dx = cx - e.center.x;
+		const float dy = cy - e.center.y;
+		const float dist = std::sqrt(dx * dx + dy * dy);
+		if (dist >= best_dist)
+			continue;
+
+		if (e.width > 1.0f && e.height > 1.0f) {
+			const float cached_area = e.width * e.height;
+			const float ratio = obj_area / cached_area;
+			if (ratio < 0.35f || ratio > 2.50f)
+				continue;
+		}
+
+		// dHash de 64 bits. Un cambio de carta produce muchos mas bits
+		// distintos que el movimiento normal de la camara; 16 bits permite
+		// pequenas variaciones de luz/encuadre sin aceptar otra carta.
+		if (hamming64(obj.crop_hash, e.crop_hash) > 16)
+			continue;
+
+		best_dist = dist;
+		out = e;
+	}
+	return best_dist < max_dist;
+}
+
 // ─── Modo realizador: pendientes + feedback de entrenamiento ────────
 
 // Anade (o refresca) una candidata en la cola de pendientes. El recorte
@@ -2158,6 +2998,16 @@ static void addPendingDetection(detect_filter_obb *tf, const vtes_detection::OBB
 {
 	if (obj.card_id.empty())
 		return;
+	// La carta que ya esta pintada en el overlay no vuelve a la cola: tras
+	// elegir una pendiente la cola debe quedar limpia aunque la carta siga
+	// delante de la camara. El id se escribe desde el hilo web, asi que se
+	// lee bajo el mismo mutex que el render.
+	{
+		std::lock_guard<std::mutex> lock(tf->game_state_lock);
+		if (!tf->current_overlay_card_id.empty() &&
+		    obj.card_id == tf->current_overlay_card_id)
+			return;
+	}
 	std::lock_guard<std::mutex> lock(tf->pending_lock);
 
 	// Limpia pendientes que llevan mucho sin volver a verse (120 s).
@@ -2410,7 +3260,12 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		std::vector<vtes_detection::OBBObject> filtered;
 		double max_area = tf->onnxMaxAreaFrac * inferenceFrame.cols * inferenceFrame.rows;
 		for (const auto& obj : raw_objects) {
-			double area = obj.rect.width * obj.rect.height;
+			// obj.rect es el AABB recortado al frame. En cartas giradas o
+			// pegadas al borde el area real es obb_w x obb_h; usar el AABB
+			// recortado descartaba cartas pequenas que si se veian enteras.
+			const double area = (obj.obb_w > 1.0f && obj.obb_h > 1.0f)
+				? (double)obj.obb_w * (double)obj.obb_h
+				: (double)obj.rect.width * (double)obj.rect.height;
 			if (area >= tf->onnxMinArea && area <= max_area) {
 				filtered.push_back(obj);
 			}
@@ -2424,11 +3279,39 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		const auto& obj = raw_objects[i];
 		cv::Point2f center(obj.rect.x + obj.rect.width / 2,
 				   obj.rect.y + obj.rect.height / 2);
-		cv::Size2f size(obj.rect.width, obj.rect.height);
+		// obb_w/obb_h conservan el tamano real de la carta cuando obj.rect
+		// se recorta al tocar un borde del frame.
+		const float card_w = obj.obb_w > 1.0f ? obj.obb_w : obj.rect.width;
+		const float card_h = obj.obb_h > 1.0f ? obj.obb_h : obj.rect.height;
+		cv::Size2f size(card_w, card_h);
 		cv::RotatedRect rr(center, size, obj.angle * 180.0f / kPI);
 		cv::Point2f corners[4];
 		rr.points(corners);
 		card_regions[i] = extractCardRegion(inferenceFrame, corners);
+		raw_objects[i].crop_hash = cardCropHash(card_regions[i]);
+	}
+
+	// ─── Reutilizar la identidad de una carta ya seguida ───────────────
+	// Antes de gastar ~34 ms por carta en el embedding, comprobamos si la
+	// misma carta ya estaba identificada en la ficha de seguimiento. La
+	// comprobacion es barata (dHash + distancia entre centros) y evita
+	// bloquear el hilo de video en cada frame.
+	std::vector<char> identity_cached(raw_objects.size(), 0);
+	if (!raw_objects.empty()) {
+		const auto identity_cache = snapshotIdentityCache(tf);
+		for (size_t i = 0; i < raw_objects.size(); i++) {
+			IdentityCacheEntry hit;
+			if (!lookupIdentityCache(identity_cache, raw_objects[i], now_ns, hit))
+				continue;
+			auto &obj = raw_objects[i];
+			obj.card_id = hit.card_id;
+			obj.card_name = hit.card_name;
+			obj.prob = hit.confidence;
+			obj.label = hit.label;
+			obj.alt_card_id.clear();
+			obj.alt_card_name.clear();
+			identity_cached[i] = 1;
+		}
 	}
 
 	// ─── VTES Card Classification (run BEFORE embedding to use type as filter) ─
@@ -2444,6 +3327,8 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 
 		auto crops = tf->cropExtractor->extract(inferenceFrame, detections);
 		for (size_t i = 0; i < crops.size() && i < raw_objects.size(); ++i) {
+			if (i < identity_cached.size() && identity_cached[i])
+				continue; // identidad ya resuelta: no repetir clasificador
 			if (crops[i].crop.empty() || crops[i].crop.rows < 8 || crops[i].crop.cols < 8) {
 				obs_log(LOG_DEBUG, "Card %zu: crop too small (%dx%d), skipping classification",
 					i, crops[i].crop.cols, crops[i].crop.rows);
@@ -2495,14 +3380,24 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	// OCR runs regardless of embedding availability — don't guard with embed_available
 	bool embed_available = tf->embedder.is_loaded() || !tf->per_type_matchers.empty();
 	if (!raw_objects.empty()) {
+		const int64_t identify_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now().time_since_epoch()).count();
 		for (size_t i = 0; i < raw_objects.size(); i++) {
 			auto& obj = raw_objects[i];
+
+			// Ya identificada en un frame anterior y el recorte sigue siendo
+			// el mismo: no repetir el embedding. La ficha de seguimiento se
+			// actualiza mas abajo con la posicion/hash de este frame.
+			if (i < identity_cached.size() && identity_cached[i])
+				continue;
 
 			cv::Mat card_region = card_regions[i];
 			if (card_region.empty()) continue;
 
 			std::string card_name, card_id;
+			std::string second_name, second_id;
 			float confidence = 0.0f;
+			float second_confidence = -1.0f;
 			const std::string& type_filter = per_object_type_filter[i];
 			bool matched = false;
 			float thresh = 0.35f;
@@ -2522,8 +3417,9 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				// en frames reales (misclasifica ~100%: p.ej. Reaction -> Event),
 				// por lo que el matcher fusionado (embedding+NCC) identifica sin
 				// filtro de tipo.
-				if (!matched && tf->embedder.is_loaded()) {
-					matched = tf->embedder.identify(card_region, card_name, card_id, confidence, "");
+				if ((!matched || confidence < thresh) && tf->embedder.is_loaded()) {
+					matched = tf->embedder.identify(card_region, card_name, card_id, confidence, "",
+					                                &second_name, &second_id, &second_confidence);
 					thresh = tf->embedder.threshold();
 				}
 			}
@@ -2532,30 +3428,61 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			// Jobs are submitted below; results are drained on the next frame.
 			// (The worker handles recognize() + vampire validation.)
 
-			if (matched) {
-				if (confidence >= thresh) {
-					obj.card_name = card_name;
-				} else {
-					obj.card_name = "?" + card_name;
-				}
+			const bool confident = matched && confidence >= thresh;
+			const bool has_second = confident && !second_id.empty() &&
+				second_confidence >= 0.0f;
+			obj.alt_card_id.clear();
+			obj.alt_card_name.clear();
+			if (has_second) {
+				obj.alt_card_id = second_id;
+				obj.alt_card_name = second_name;
+			}
+			const float margin = has_second ? confidence - second_confidence : confidence;
+			const bool ambiguous = confident && has_second &&
+				margin < tf->embed_min_margin;
+			const float sharpness = cardRegionSharpness(card_region);
+			const float angle_deg = obj.angle * 180.0f / kPI;
+
+			if (confident && !ambiguous) {
+				obj.card_name = card_name;
 				obj.card_id = card_id;
 				obj.prob = confidence;
 				obs_log(LOG_INFO,
-					"[Embed] Card #%d: '%s' (id=%s, sim=%.4f, thresh=%.2f, crop=%dx%d, filter=%s%s)",
+					"[Embed] Card #%d: '%s' (id=%s, sim=%.4f, second=%.4f, margin=%.4f, thresh=%.2f, crop=%dx%d, angle=%.1f, obb=%.1fx%.1f, sharp=%.0f, filter=%s)",
 					obj.id, card_name.c_str(), card_id.c_str(), confidence,
+					has_second ? second_confidence : -1.0f, margin,
 					thresh, card_region.cols, card_region.rows,
-					type_filter.c_str(),
-					confidence >= thresh ? "" : " ?");
+					angle_deg, obj.obb_w, obj.obb_h, sharpness,
+					type_filter.c_str());
 			} else {
-				obj.card_name = "???";
-				obj.card_id = "";
-				if (confidence > 0.2f) {
-					obj.prob = confidence;
-					obs_log(LOG_INFO,
-						"[Embed] Card #%d: no match (best_sim=%.4f, thresh=%.2f, crop=%dx%d, filter=%s)",
-						obj.id, confidence, thresh,
-						card_region.cols, card_region.rows,
-						type_filter.c_str());
+				// No aceptamos automaticamente una identificacion ambigua.
+				// En modo realizador se ofrecen las dos mejores cartas en la
+				// cola para que el operador desambigue con un clic. En modo
+				// clasico no se pinta nada antes que pintar una carta erronea.
+				obj.card_name = confident ? ("?" + card_name) : "???";
+				obj.card_id.clear();
+				if (confidence > 0.2f) obj.prob = confidence;
+
+				obs_log(LOG_INFO,
+					"[Embed] Card #%d: %s (best='%s' sim=%.4f, second='%s' sim=%.4f, margin=%.4f, thresh=%.2f, crop=%dx%d, angle=%.1f, obb=%.1fx%.1f, sharp=%.0f, filter=%s)",
+					obj.id, ambiguous ? "AMBIGUA" : (matched ? "BAJA CONFIANZA" : "sin match"),
+					card_name.c_str(), confidence, second_name.c_str(), second_confidence,
+					margin, thresh, card_region.cols, card_region.rows,
+					angle_deg, obj.obb_w, obj.obb_h, sharpness,
+					type_filter.c_str());
+
+				if (ambiguous && tf->click_to_overlay) {
+					vtes_detection::OBBObject best_candidate = obj;
+					best_candidate.card_name = card_name;
+					best_candidate.card_id = card_id;
+					best_candidate.prob = confidence;
+					addPendingDetection(tf, best_candidate, inferenceFrame, identify_now_ns);
+
+					vtes_detection::OBBObject alt_candidate = obj;
+					alt_candidate.card_name = second_name;
+					alt_candidate.card_id = second_id;
+					alt_candidate.prob = second_confidence;
+					addPendingDetection(tf, alt_candidate, inferenceFrame, identify_now_ns);
 				}
 			}
 		}
@@ -2570,9 +3497,27 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			// Pasar los track ids para que cada resultado de OCR vuelva
 			// a su propia carta y no a la primera que siga en "???".
 			std::vector<int> track_ids;
+			std::vector<uint64_t> crop_hashes;
+			std::vector<char> ocr_allowed;
 			track_ids.reserve(raw_objects.size());
-			for (const auto& o : raw_objects) track_ids.push_back(o.id);
-			submit_ocr_jobs(tf, card_regions, track_ids, empty_filters);
+			crop_hashes.reserve(raw_objects.size());
+			ocr_allowed.reserve(raw_objects.size());
+			for (const auto& o : raw_objects) {
+				track_ids.push_back(o.id);
+				crop_hashes.push_back(o.crop_hash);
+				const float source_h = o.obb_h > 1.0f ? o.obb_h
+				                                      : (float)o.rect.height;
+				// Una identificacion segura ya no necesita OCR. Si el
+				// embedding dejo dos candidatas (ambigua), el operador elige
+				// en la web; el OCR no debe meter una tercera carta.
+				const bool ambiguous_pair = o.card_id.empty() &&
+					!o.alt_card_id.empty();
+				ocr_allowed.push_back(
+					o.card_id.empty() && !ambiguous_pair &&
+					source_h >= kMinOcrSourceHeight ? 1 : 0);
+			}
+			submit_ocr_jobs(tf, card_regions, track_ids, empty_filters,
+			                crop_hashes, ocr_allowed);
 		}
 	} // end if (!raw_objects.empty())
 		// ─── Set cooldown on successful identification (not in Always Active mode) ─────
@@ -2652,7 +3597,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		}
 
 		for (const auto& obj : final_objects) {
-			std::lock_guard<std::mutex> lock(tf->game_state_lock);
+			std::unique_lock<std::mutex> lock(tf->game_state_lock);
 			auto it = tf->tracked_cards.find(obj.id);
 
 			if (it == tf->tracked_cards.end()) {
@@ -2669,6 +3614,11 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 					obj.rect.x + obj.rect.width / 2,
 					obj.rect.y + obj.rect.height / 2);
 				tc.unseen_frames = 0;
+				tc.last_crop_hash = obj.crop_hash;
+				tc.identity_confidence = obj.prob;
+				tc.last_label = obj.label;
+				tc.last_width = obj.rect.width;
+				tc.last_height = obj.rect.height;
 
 				// Look up card URL + pre-cache image
 				if (!obj.card_id.empty()) {
@@ -2705,13 +3655,23 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 					obj.rect.y + obj.rect.height / 2);
 				tc.unseen_frames = 0;
 
-				// Update card info if newly identified
-				if (tc.card_id.empty() && !obj.card_id.empty()) {
-					tc.card_id = obj.card_id;
-					tc.card_name = obj.card_name;
-					auto cit = tf->card_info_by_id.find(obj.card_id);
-					if (cit != tf->card_info_by_id.end())
-						tc.card_url = cit->second.url;
+				// Actualizar la identidad si es nueva o si el operador ha
+				// cambiado la carta en la misma posicion. Guardamos tambien
+				// el hash/confianza para poder reutilizarla en el proximo
+				// frame sin repetir el embedding.
+				if (!obj.card_id.empty()) {
+					if (tc.card_id.empty() || tc.card_id != obj.card_id) {
+						tc.card_id = obj.card_id;
+						tc.card_name = obj.card_name;
+						auto cit = tf->card_info_by_id.find(obj.card_id);
+						if (cit != tf->card_info_by_id.end())
+							tc.card_url = cit->second.url;
+					}
+					tc.last_crop_hash = obj.crop_hash;
+					tc.identity_confidence = obj.prob;
+					tc.last_label = obj.label;
+					tc.last_width = obj.rect.width;
+					tc.last_height = obj.rect.height;
 				}
 
 				// Reasignación de zona cada frame: una carta puede cambiar
@@ -2788,8 +3748,10 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 
 			// Modo realizador: la deteccion no se muestra sola; entra en la
 			// cola de pendientes para que el operador la valide en la web.
-			if (tf->click_to_overlay && !obj.card_id.empty())
+			if (tf->click_to_overlay && !obj.card_id.empty()) {
+				lock.unlock();
 				addPendingDetection(tf, obj, imageBGRA, now_ns);
+			}
 		}
 
 		// Remove stale tracks (unseen > 120 frames ≈ 4 s at 30 fps)
@@ -2914,6 +3876,15 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 					// se volveria negro opaco y taparia la camara.
 					tf->overlay_bg = cv::imread(bgPath, cv::IMREAD_UNCHANGED);
 					bfree(bgPath);
+					tf->overlay_cam_window = overlayCameraWindow(tf->overlay_bg);
+					if (tf->overlay_cam_window.width >= 8) {
+						obs_log(LOG_INFO,
+						        "[Overlay] camera window %dx%d at (%d,%d)",
+						        tf->overlay_cam_window.width,
+						        tf->overlay_cam_window.height,
+						        tf->overlay_cam_window.x,
+						        tf->overlay_cam_window.y);
+					}
 				}
 			}
 
@@ -2921,17 +3892,47 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			const OverlayFit fit = overlayFit(fw, fh);
 
 			cv::Mat display = cv::Mat::zeros(fh, fw, CV_8UC3);
-			// 2. Camara DENTRO del hueco del overlay y POR DEBAJO de el: se
-			// ajusta entera (sin recorte) dentro de la ventana del diseño y el
-			// overlay (marco, panel, ankh) se dibuja despues, encima. Las
-			// zonas de jugador (coords 0..1 de camara) se mapean a `cam`.
-			const cv::Rect cam = tf->overlay_bg.empty()
-				? cv::Rect(0, 0, fw, fh)
-				: cameraFitRect(fit, fw, fh);
-			if (cam.width > 4 && cam.height > 4 && !frame.empty()) {
-				cv::Mat src_resized;
-				cv::resize(frame, src_resized, cv::Size(cam.width, cam.height));
-				src_resized.copyTo(display(cam));
+			// 2. Camara DENTRO del hueco del overlay y POR DEBAJO de el. La
+			// imagen cubre el hueco entero (escala "cover"): sin barras
+			// negras. Zoom y posicion son ajustables; el desplazamiento se
+			// recorta para que la camara siga cubriendo el hueco. Las zonas
+			// de jugador (coords 0..1 de camara) se mapean con `cam`.
+			const cv::Rect win_design =
+				tf->overlay_cam_window.width >= 8
+					? tf->overlay_cam_window
+					: cv::Rect(kWinX, kWinY, kWinW, kWinH);
+			CameraView cam;
+			cam.win = cv::Rect(0, 0, fw, fh);
+			if (!tf->overlay_bg.empty()) {
+				cam = cameraView(fit, fw, fh, win_design, tf->cam_zoom,
+				                 tf->cam_off_x, tf->cam_off_y,
+				                 tf->cam_full_frame);
+			}
+			const cv::Rect cam_win = cam.win & cv::Rect(0, 0, fw, fh);
+			if (cam_win.width > 4 && cam_win.height > 4 && !frame.empty() &&
+			    cam.scale > 0.0) {
+				// Solo se reescala la parte visible del hueco (no la imagen
+				// entera): con zoom alto el recorte ahorra mucho trabajo.
+				const int x0 = std::max(0, (int)std::floor(
+					(cam_win.x - cam.ox) / cam.scale));
+				const int y0 = std::max(0, (int)std::floor(
+					(cam_win.y - cam.oy) / cam.scale));
+				const int x1 = std::min(fw, (int)std::ceil(
+					(cam_win.x + cam_win.width - cam.ox) / cam.scale));
+				const int y1 = std::min(fh, (int)std::ceil(
+					(cam_win.y + cam_win.height - cam.oy) / cam.scale));
+				const cv::Rect src(x0, y0, x1 - x0, y1 - y0);
+				if (src.width > 1 && src.height > 1) {
+					if (src.size() == cam_win.size()) {
+						frame(src).copyTo(display(cam_win));
+					} else {
+						cv::Mat scaled;
+						const int interp = cam.scale < 1.0 ? cv::INTER_AREA
+						                                   : cv::INTER_LINEAR;
+						cv::resize(frame(src), scaled, cam_win.size(), 0, 0, interp);
+						scaled.copyTo(display(cam_win));
+					}
+				}
 			}
 
 			// 2b. Zonas de jugadores (toggle): dibuja los rectangulos de minions
@@ -2953,10 +3954,10 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 					                                 : cv::Scalar(140, 140, 140);
 					auto drawZone = [&](const filter_data::PlayerZone& z, const char* tag) {
 						const cv::Point2f zc(
-							(float)(cam.x + (z.nx + z.nw * 0.5) * cam.width),
-							(float)(cam.y + (z.ny + z.nh * 0.5) * cam.height));
-						const cv::Size2f zs((float)(z.nw * cam.width),
-						                    (float)(z.nh * cam.height));
+							(float)(cam.ox + (z.nx + z.nw * 0.5) * fw * cam.scale),
+							(float)(cam.oy + (z.ny + z.nh * 0.5) * fh * cam.scale));
+						const cv::Size2f zs((float)(z.nw * fw * cam.scale),
+						                    (float)(z.nh * fh * cam.scale));
 						if (zs.width < 4.0f || zs.height < 4.0f)
 							return;
 						cv::RotatedRect rr(zc, zs, z.angle);
@@ -3066,9 +4067,9 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				const cv::Scalar slot_col = pl.active ? cv::Scalar(235, 228, 214)
 				                                      : cv::Scalar(115, 112, 108);
 				drawTextInBox(display, pl.name, name_box, slot_col,
-				              name_box.height * 0.42 / 22.0);
+				              name_box.height * 0.42, tf->overlay_font_mode);
 				drawTextInBox(display, std::to_string(pl.pool), pool_box, slot_col,
-				              pool_box.height * 0.55 / 22.0);
+				              pool_box.height * 0.55, tf->overlay_font_mode);
 			}
 
 			// 4. Las cartas rastreadas ya no se pintan en su zona de jugador:
@@ -3109,6 +4110,8 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 						if (cache_it != tf->card_image_cache.end())
 							card_img = cache_it->second;
 					}
+					if (card_img.empty() && !tf->current_overlay_fallback.empty())
+						card_img = tf->current_overlay_fallback;
 					shown_card_db_id = (principal && !principal->card_id.empty())
 						? principal->card_id : tf->current_overlay_card_id;
 				} else if (!tf->click_to_overlay) {
@@ -3175,6 +4178,41 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				}
 			}
 
+		// 4c. Iconos oficiales de la carta (tipos, clan/credo y disciplinas)
+		// justo debajo de la carta mostrada: en el ankh o bajo la carta
+		// grande. La fila se encoge sola si la carta tiene muchos simbolos.
+		const VTESCardEntry* shown_entry =
+			!shown_card_db_id.empty() ? tf->vtes_db.get_by_id(shown_card_db_id)
+			                          : nullptr;
+		if (shown_entry && shown_card.width > 0) {
+			const std::vector<VtesIcon> icons =
+				vtes_icons::forCard(*shown_entry);
+			if (!icons.empty()) {
+				const cv::Rect abox =
+					designRect(fit, kAnkhX, kAnkhY, kAnkhW, kAnkhH);
+				cv::Rect area;
+				int size = 0;
+				if (tf->big_card) {
+					size = (int)(42 * fit.esc + 0.5);
+					const int gap = (int)(12 * fit.esc + 0.5);
+					int y = shown_card.y + shown_card.height + gap;
+					if (y + size > fh - 4)
+						y = shown_card.y - size - gap;
+					area = cv::Rect(shown_card.x, y,
+					                shown_card.width, size);
+				} else {
+					size = (int)(26 * fit.esc + 0.5);
+					const int gap = (int)(6 * fit.esc + 0.5);
+					int y = shown_card.y + shown_card.height + gap;
+					const int max_y = abox.y + abox.height - size;
+					if (y > max_y)
+						y = max_y;
+					area = cv::Rect(abox.x, y, abox.width, size);
+				}
+				drawCardIconRow(display, icons, area, size);
+			}
+		}
+
 		// 6. Rulings de la carta principal, sobre la propia carta
 		//
 		// El panel no tiene ningun hueco libre: las casillas de jugador ocupan
@@ -3191,9 +4229,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			{
 				// La carta mostrada sobre el ankh (elegida en la web o, en
 				// modo clasico, la ultima detectada).
-				const VTESCardEntry* entry = !shown_card_db_id.empty()
-					? tf->vtes_db.get_by_id(shown_card_db_id)
-					: nullptr;
+				const VTESCardEntry* entry = shown_entry;
 
 				if (entry && entry->has_rulings() && shown_card.width > 0 &&
 				    shown_card.height > 0) {

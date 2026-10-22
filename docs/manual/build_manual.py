@@ -375,9 +375,10 @@ def s1_que_es(pdf: Manual):
     )
     pdf.p("En la práctica, te da:")
     pdf.bullets([
-        "Identificación automática: detector YOLO OBB + clasificador de tipo (14 tipos "
-        "de carta) + OCR sobre el nombre, con identificación por imagen contra una "
-        "base de más de 4.000 cartas.",
+        "Identificación automática: detector YOLO OBB + embeddings visuales como "
+        "vía principal incluso en cartas pequeñas + clasificador de tipo (14 tipos). "
+        "El OCR del nombre solo se usa como apoyo en primeros planos, a partir de "
+        "200 px de alto; la decisión final es del embedding.",
         "Overlay de emisión: tu cámara dentro del diseño del ankh, la última carta "
         "aprobada pintada completa sobre el símbolo y las rulings dibujadas sobre "
         "la carta.",
@@ -400,8 +401,10 @@ def s2_requisitos(pdf: Manual):
     pdf.h1("2 · Requisitos")
     pdf.bullets([
         "OBS Studio 30 o superior, en Windows 10/11 de 64 bits.",
-        "Cámara: una webcam USB. Cuanta mejor óptica y enfoque, mejor lee el OCR; "
-        "la cámara debe poder encuadrar las cartas a una distancia cómoda.",
+        "Cámara: una webcam USB. Cuanta mejor óptica y enfoque, mejor funciona "
+        "el embedding, que es la vía principal; el OCR solo entra en cartas "
+        "grandes. La cámara debe poder encuadrar las cartas a una distancia "
+        "cómoda.",
         "GPU: NVIDIA con CUDA (recomendado). Alternativa: cualquier GPU mediante "
         "DirectML. Modo CPU disponible (lento; solo para probar).",
         "Iluminación uniforme sobre la mesa, sin reflejos directos ni cambios "
@@ -472,19 +475,27 @@ def s4_primeros_pasos(pdf: Manual):
     pdf.callout(
         "Consejos de cámara",
         "Encuadra las cartas lo más grandes posible y dentro de las zonas de su "
-        "jugador. Evita sombras de la mano sobre la banda del nombre (el OCR lee "
-        "ahí). Si tu mesa queda muy en perspectiva, sube un poco la cámara.",
+        "jugador. Evita sombras y reflejos sobre la carta: el embedding usa la "
+        "imagen completa y el OCR solo se ejecuta cuando la carta es un primer "
+        "plano de al menos 200 px de alto. Si tu mesa queda muy en perspectiva, "
+        "sube un poco la cámara.",
     )
 
 
 def s5_overlay(pdf: Manual):
     pdf.h1("5 · El overlay de emisión (el diseño del ankh)")
     pdf.p(
-        "El resultado del filtro es la imagen final para emitir: tu cámara se coloca "
-        "dentro del hueco del diseño decorativo (se ajusta entera, sin recortar) y el "
-        "diseño se dibuja encima con transparencia real. El diseño es 3:2 "
-        "(1536×1024), así que en una escena 16:9 quedan bandas a los lados: es parte "
-        "del estilo."
+        "El resultado del filtro es la imagen final para emitir: tu cámara cubre "
+        "el hueco del diseño (escala «cover»: llena el hueco sin barras negras y "
+        "recorta lo que sobra) y el diseño se dibuja encima con transparencia "
+        "real. El zoom (100–300 %) y la posición permiten elegir el encuadre; el "
+        "desplazamiento se recorta automáticamente para que la cámara no deje "
+        "bordes. Con «Cámara a sangre» la cámara ocupa también las bandas "
+        "laterales y el diseño se dibuja encima. El diseño es 3:2 (1536×1024), "
+        "así que en una escena 16:9, sin «a sangre», quedan bandas a los lados: "
+        "es parte del estilo. El encuadre solo afecta a la composición visual; "
+        "la detección y el embedding siguen usando el fotograma completo y el OCR "
+        "solo se aplica a cartas grandes."
     )
     pdf.image_block(ASSETS / "overlay_diagram.jpg", 174,
                     "Anatomía del overlay: el diseño real con la cámara en su hueco.")
@@ -492,9 +503,17 @@ def s5_overlay(pdf: Manual):
         "Panel izquierdo: una fila por jugador (hasta 5) con su nombre y su pool.",
         "Ankh: la última carta puesta en el overlay se pinta completa sobre el "
         "símbolo.",
+        "Iconos de carta: debajo de la carta mostrada se dibuja una fila con el "
+        "tipo, el clan o credo y las disciplinas o virtudes. Son los símbolos "
+        "oficiales de KRCP, se deduplican y se adaptan al ancho de la carta.",
         "Rulings: el texto de reglas de la carta mostrada se dibuja encima de ella; "
         "su altura se ajusta con «Desplazamiento de rulings».",
-        "Ventana de cámara: tu captura de vídeo.",
+        "Ventana de cámara: tu captura de vídeo, encajada con «cover» y ajustable "
+        "con zoom y posición.",
+        "Cámara a sangre: la cámara llena también las bandas laterales; el diseño "
+        "se dibuja encima.",
+        "Nombres y pool: se dibujan con la fuente elegida (Cinzel, Grenze Gotisch "
+        "o clásica).",
         "Carta grande: ocupa media pantalla; pensada para emisiones vistas en móvil "
         "(se activa en las propiedades).",
         "Mostrar zonas: dibuja los rectángulos de las zonas de cada jugador "
@@ -525,6 +544,24 @@ def s6_ajustes(pdf: Manual):
     pdf.defitem("Desplazamiento de rulings (0 %)",
                 "Sube o baja el bloque de rulings sobre la carta mostrada (0–100 %). "
                 "0 es la posición base.")
+    pdf.h2("Fuente y encuadre")
+    pdf.defitem("Fuente de los nombres (Cinzel)",
+                "Cinzel (romana) es la predeterminada; «Grenze Gotisch (gótica)» "
+                "y «Clásica (OpenCV)» son las alternativas. Si una fuente no está "
+                "disponible, se usa la clásica. Afecta a los nombres y al pool del "
+                "panel.")
+    pdf.defitem("Zoom de cámara (100 %)",
+                "De 100 a 300 %. 100 % es el mínimo recorte que cubre el hueco; "
+                "súbelo para acercar. En «Cámara a sangre» hace falta más de 100 % "
+                "para poder mover el encuadre.")
+    pdf.defitem("Posición horizontal / vertical de la cámara (0)",
+                "Desplaza el encuadre. El plugin recorta el desplazamiento para que "
+                "la cámara siga cubriendo el hueco (o el fotograma completo, con "
+                "«Cámara a sangre»).")
+    pdf.defitem("Cámara a sangre (desactivado)",
+                "La cámara ocupa todo el fotograma, incluidas las bandas laterales "
+                "del diseño 3:2; el diseño se dibuja encima. Útil para planos más "
+                "amplios.")
     pdf.h2("Detección")
     pdf.defitem("Umbral de confianza (0,50)",
                 "De 0 a 1. Súbelo si aparecen detecciones falsas; bájalo si le "
@@ -542,8 +579,19 @@ def s6_ajustes(pdf: Manual):
                 "Red de visión que reconoce los 14 tipos de carta (Action, Master, "
                 "Combat…). Mejora el filtrado y la información de la web.")
     pdf.defitem("OCR — leer nombres con Tesseract (activado)",
-                "Lee el nombre impreso y lo compara con la base de cartas; junto con "
-                "la identificación por imagen, resuelve los nombres parecidos.")
+                "Lee el nombre impreso y lo compara con la base de cartas. Solo "
+                "se ejecuta cuando la carta mide al menos 200 px de alto en el "
+                "fotograma y el embedding no la ha resuelto con seguridad; en "
+                "cartas pequeñas no se usa. Si el embedding duda entre dos cartas, "
+                "la decisión pasa a la cola de Pendientes.")
+    pdf.callout(
+        "Cartas pequeñas",
+        "El detector y el embedding están pensados para cartas reales de tamaño "
+        "reducido. Cuanto más pequeña es la carta, más "
+        "importante es el enfoque y la luz; el OCR no se fuerza por debajo de "
+        "200 px. Si aparecen dos candidatas, elige en Pendientes en lugar de "
+        "confiar en una lectura de texto.",
+    )
     pdf.defitem("Escalado NIS (desactivado, requiere CUDA)",
                 "Realce del texto pequeño antes del OCR. Mejora la lectura a costa "
                 "de algo más de GPU.")
@@ -583,29 +631,35 @@ def s7_web(pdf: Manual):
         "En el móvil (misma red WiFi): http://IP-DEL-PC:8080 — la primera vez "
         "Windows pedirá permitir a OBS en la red privada; acepta el aviso.",
     ])
+    pdf.p(
+        "La web usa las mismas fuentes oficiales de iconos que el overlay: cada "
+        "carta muestra su tipo, clan o credo y disciplinas o virtudes. Las fuentes "
+        "se sirven desde /fonts/ del propio plugin; no hace falta conexión."
+    )
     pdf.p("La barra superior enlaza todas las páginas: Buscar · Pool · Detecciones · "
           "Partida · Pendientes.")
     pdf.defitem("Buscar (/)",
                 "Buscador sobre la base de cartas. Admite nombre (en español, inglés "
                 "o francés), type:, clan:, disc: (abreviatura de disciplina), cap: "
                 "(capacidad exacta), cap>N, group: y texto libre, combinables. "
-                "Muestra hasta 50 resultados; al abrir una carta puedes enviarla al "
-                "overlay con un clic.")
+                "Muestra hasta 50 resultados con los iconos oficiales de tipo, clan "
+                "y disciplinas; al abrir una carta puedes enviarla al overlay con un "
+                "clic.")
     pdf.defitem("Pool (/pool)",
                 "Control del pool de cada jugador con botones. El pool no se puede "
                 "leer por cámara (bleeds, costes), así que se ajusta a mano desde "
                 "aquí o desde Partida.")
     pdf.defitem("Detecciones (/detections)",
-                "Últimas detecciones del directo con su imagen, nombre y hora. Un "
-                "clic en cualquiera la pinta en el ankh al momento.")
+                "Últimas detecciones del directo con su imagen, nombre, hora y sus "
+                "iconos. Un clic en cualquiera la pinta en el ankh al momento.")
     pdf.defitem("Partida (/game)",
                 "Estado de la partida: por jugador, el pool, cuántas cartas están "
                 "giradas o listas, sus minions detectados y las cartas en cripta. "
                 "Abajo, el Registro con los últimos eventos (giros, influencia, "
                 "pool, ousted) y su antigüedad.")
     pdf.defitem("Pendientes (/pending, alias /pendientes)",
-                "La cola del modo realizador: aquí apruebas qué se muestra en el "
-                "overlay (sección 8).")
+                "La cola del modo realizador: cada pendiente muestra sus iconos y "
+                "aquí apruebas qué se muestra en el overlay (sección 8).")
 
 
 def s8_director(pdf: Manual):
@@ -632,6 +686,9 @@ def s8_director(pdf: Manual):
     pdf.bullets([
         "Dedupe por carta: si la misma carta vuelve a detectarse, se refresca en la "
         "cola en vez de duplicarse.",
+        "Si dos cartas quedan casi empatadas (por ejemplo, con una captura borrosa), "
+        "la cola muestra las dos candidatas para que elijas la correcta; el plugin "
+        "no pinta ninguna de ellas automáticamente.",
         "La cola guarda hasta 24 pendientes; las que no vuelven a verse caducan a "
         "los 120 segundos.",
         "La vista se comparte entre dispositivos: el móvil y el PC ven la misma "
@@ -736,9 +793,14 @@ def s10_problemas(pdf: Manual):
                 "Revisa el ángulo de la zona de minions de ese jugador en las "
                 "propiedades: debe coincidir con la orientación real de la mesa.")
     pdf.defitem("El OCR confunde nombres de cartas",
-                "Mejora la luz y evita reflejos en la banda del nombre; la "
-                "identificación por imagen del plugin corrige la mayoría de los "
-                "casos dudosos.")
+                "Mejora la luz y evita reflejos sobre la carta. La identificación "
+                "por embedding es la vía principal y corrige la mayoría de los "
+                "casos; el OCR solo se usa en cartas de al menos 200 px de alto.")
+    pdf.defitem("La carta es pequeña y no se identifica",
+                "Acércala o mejora el enfoque: el embedding necesita que la carta "
+                "se vea nítida. Por debajo de 200 px no se ejecuta OCR; si el "
+                "embedding devuelve dos candidatas, aparecen en Pendientes para "
+                "elegir con un clic.")
     pdf.defitem("¿Dónde consulto los errores?",
                 "Herramientas → Registro de errores de OBS. Las marcas [Game], "
                 "[Director], [WebServer] y [OCR] siguen el flujo del plugin.")

@@ -86,6 +86,14 @@ struct filter_data {
 	bool always_active;
 	bool show_zones; // dibuja las zonas de jugadores sobre el preview
 	bool big_card;   // dibuja la carta principal a media pantalla (modo torneo)
+	// Encuadre de la camara bajo el overlay: la imagen cubre el hueco entero
+	// (sin barras negras). zoom 1.0 = cubrir justo; offsets en px de diseno.
+	double cam_zoom = 1.0;
+	int    cam_off_x = 0;
+	int    cam_off_y = 0;
+	bool   cam_full_frame = false; // a sangre: cubre todo el frame, no solo el hueco
+	// Fuente de nombres/pool: 0 = Cinzel, 1 = Grenze Gotisch, 2 = Hershey.
+	int    overlay_font_mode = 0;
 
 	std::mutex inputBGRALock;
 	std::mutex outputLock;
@@ -130,6 +138,9 @@ struct filter_data {
 		std::string tracked_card_name;
 		int identity_hits = 0;         // frames where this identity was matched
 		int identity_total = 0;         // total frames tracked
+		float identity_score = 0.0f;    // confianza de la identificacion
+		uint64_t last_crop_hash = 0;    // dHash del ultimo recorte asociado
+		int last_label = 0;             // etiqueta de tipo para el preview
 		static constexpr int IDENTITY_WINDOW = 10;
 
 		std::deque<bool> history; // sliding window of detections
@@ -151,6 +162,11 @@ struct filter_data {
 
 	// --- Embedding-based card identification ---
 	EmbeddingMatcher embedder;
+	// Margen minimo entre la mejor carta y la segunda carta distinta para
+	// aceptar una identificacion automatica. En capturas borrosas No Trace
+	// y Dust Up quedan a pocas milesimas; sin este margen la cola del
+	// realizador se llenaba de falsos positivos.
+	float embed_min_margin = 0.06f;
 	std::unordered_map<std::string, CardInfo> card_info_by_id;    // card ID -> card info
 
 	// --- VTES Card Classifier ---
@@ -173,6 +189,7 @@ struct filter_data {
 		int64_t id;
 		cv::Mat card_region;
 		std::string type_filter;
+		uint64_t crop_hash = 0;
 	};
 	struct OcrJobResult {
 		int64_t id;
@@ -181,6 +198,7 @@ struct filter_data {
 		std::string card_name;
 		std::string card_id;
 		float confidence = 0.0f;
+		uint64_t crop_hash = 0;
 	};
 
 	std::thread ocr_worker;
@@ -204,6 +222,9 @@ struct filter_data {
 	// hasta que se elija otra o se limpie desde la web.
 	std::string current_overlay_card_url;
 	std::string current_overlay_card_id;
+	// Recorte de la pendiente elegida, usado si la caratula oficial no se
+	// pudo descargar/cachear. Asi el clic siempre pinta algo.
+	cv::Mat current_overlay_fallback;
 	float card_overlay_duration = 5.0f;
 
 	// --- Performance: minimum detection interval ---
@@ -291,6 +312,17 @@ struct filter_data {
 		std::string card_id, card_name, card_url;
 		cv::Mat card_image;
 
+		// Última identificación aceptada. Se usa para no repetir el
+		// embedding en cada frame mientras la carta siga delante de la
+		// cámara con el mismo recorte (dHash). El embedding es la parte
+		// más cara del filtro (~34 ms por carta en CPU) y bloquear el
+		// hilo de vídeo con él baja los FPS aunque la GPU esté libre.
+		uint64_t last_crop_hash = 0;
+		float    identity_confidence = 0.0f;
+		int      last_label = 0;
+		float    last_width = 0.0f;
+		float    last_height = 0.0f;
+
 		// Lock state: una carta está girada (tapped) cuando su ángulo
 		// difiere ~90° del de la zona minion de su jugador.
 		int64_t first_seen_ns   = 0;
@@ -329,5 +361,9 @@ struct filter_data {
 
 	// Overlay background (loaded from data/obs-plugins/…/overlay-bg.png)
 	cv::Mat overlay_bg;
+
+	// Ventana de camara del diseno, leida del canal alfa del overlay
+	// (coords de diseno 1536x1024). Vacia = usar las constantes kWin*.
+	cv::Rect overlay_cam_window;
 };
 #endif /* FILTERDATA_H */

@@ -191,9 +191,10 @@ def s1_what(pdf: ManualEN):
     )
     pdf.p("In practice, it gives you:")
     pdf.bullets([
-        "Automatic identification: YOLO OBB detector + type classifier (14 card "
-        "types) + OCR on the name, with image-based matching against a database "
-        "of over 4,000 cards.",
+        "Automatic identification: YOLO OBB detector + visual embeddings as the "
+        "main path even on small cards + type classifier (14 card types). OCR on "
+        "the name is only a backup for close-ups from 200 px high; the final "
+        "decision comes from the embedding.",
         "Broadcast overlay: your camera inside the ankh design, the last approved "
         "card shown whole over the symbol, and the rulings drawn on top of the "
         "card.",
@@ -217,7 +218,8 @@ def s2_requirements(pdf: ManualEN):
     pdf.bullets([
         "OBS Studio 30 or newer, on Windows 10/11 64-bit.",
         "Camera: a USB webcam. The better the optics and focus, the better the "
-        "OCR reads; the camera must be able to frame the cards at a comfortable "
+        "embedding works; it is the main path, while OCR only runs on large "
+        "cards. The camera must be able to frame the cards at a comfortable "
         "distance.",
         "GPU: NVIDIA with CUDA (recommended). Alternative: any GPU via DirectML. "
         "CPU mode available (slow; testing only).",
@@ -288,7 +290,8 @@ def s4_getting_started(pdf: ManualEN):
     pdf.callout(
         "Camera tips",
         "Frame the cards as large as possible and inside their player's zone. "
-        "Avoid hand shadows over the name band (that is where the OCR reads). If "
+        "Avoid shadows and glare on the card: the embedding uses the whole image "
+        "and OCR only runs when the card is a close-up at least 200 px high. If "
         "your table is at a steep angle, raise the camera a little.",
     )
 
@@ -296,20 +299,33 @@ def s4_getting_started(pdf: ManualEN):
 def s5_overlay(pdf: ManualEN):
     pdf.h1("5 · The broadcast overlay (the ankh design)")
     pdf.p(
-        "The filter's output is the final broadcast image: your camera is placed "
-        "inside the decorative design's window (it fits whole, uncropped) and the "
-        "design is drawn on top with real transparency. The design is 3:2 "
-        "(1536×1024), so a 16:9 scene will have bands at the sides: that is part "
-        "of the style."
+        "The filter's output is the final broadcast image: your camera covers the "
+        "decorative design's window («cover» scale: it fills the window with no "
+        "black bars, cropping the excess) and the design is drawn on top with real "
+        "transparency. Zoom (100–300%) and position let you choose the framing; "
+        "the offset is clamped automatically so the camera never leaves edges. "
+        "With «Full-bleed camera» the camera also fills the side bands and the "
+        "design is drawn on top. The design is 3:2 (1536×1024), so a 16:9 scene "
+        "without full-bleed will have bands at the sides: that is part of the "
+        "style. Framing only affects the visual composition; detection and the "
+        "embedding still use the full frame, and OCR only runs on large cards."
     )
     pdf.image_block(ASSETS / "overlay_diagram_en.jpg", 174,
                     "Overlay anatomy: the real design with the camera in its window.")
     pdf.bullets([
         "Left panel: one row per player (up to 5) with their name and pool.",
         "Ankh: the last card sent to the overlay is shown whole over the symbol.",
+        "Card icons: a row under the shown card with its type, clan or creed and "
+        "disciplines or virtues. They are the official KRCP symbols, deduplicated "
+        "and fitted to the card width.",
         "Rulings: the rules text of the shown card is drawn on top of it; its "
         "height is adjusted with «Rulings scroll».",
-        "Camera window: your video feed.",
+        "Camera window: your video feed, cover-fitted and adjustable with zoom and "
+        "position.",
+        "Full-bleed camera: the camera also fills the side bands; the design is "
+        "drawn on top.",
+        "Names and pool: drawn with the selected font (Cinzel, Grenze Gotisch or "
+        "Classic).",
         "Big card: takes half the screen; meant for streams watched on a phone "
         "(enable it in the properties).",
         "Show zones: draws the rectangles of each player's zones (minions and "
@@ -339,6 +355,21 @@ def s6_settings(pdf: ManualEN):
     pdf.defitem("Rulings scroll (0 %)",
                 "Moves the rulings block up or down over the shown card (0–100 %). "
                 "0 is the base position.")
+    pdf.h2("Font and framing")
+    pdf.defitem("Player name font (Cinzel)",
+                "Cinzel (Roman) is the default; «Grenze Gotisch (gothic)» and "
+                "«Classic (OpenCV)» are the alternatives. If a font is missing, the "
+                "classic one is used. Affects the panel's names and pool.")
+    pdf.defitem("Camera zoom (100%)",
+                "100 to 300%. 100% is the minimum crop that covers the window; "
+                "raise it to zoom in. In full-bleed mode you need more than 100% to "
+                "be able to move the framing.")
+    pdf.defitem("Camera horizontal / vertical position (0)",
+                "Moves the framing. The plugin clamps the offset so the camera keeps "
+                "covering the window (or the whole frame, with full-bleed).")
+    pdf.defitem("Full-bleed camera (off)",
+                "The camera fills the whole frame, including the side bands of the "
+                "3:2 design; the design is drawn on top. Useful for wider shots.")
     pdf.h2("Detection")
     pdf.defitem("Confidence threshold (0.50)",
                 "From 0 to 1. Raise it if false detections appear; lower it if "
@@ -356,9 +387,18 @@ def s6_settings(pdf: ManualEN):
                 "Vision network that recognises the 14 card types (Action, "
                 "Master, Combat…). Improves filtering and the web info.")
     pdf.defitem("OCR — read card names with Tesseract (on)",
-                "Reads the printed name and matches it against the card database; "
-                "together with image-based identification it resolves similar "
-                "names.")
+                "Reads the printed name and matches it against the card database. "
+                "It only runs when the card is at least 200 px high in the frame "
+                "and the embedding is not already confident; it is not used on "
+                "small cards. If the embedding is torn between two cards, the "
+                "decision goes to the Pending queue.")
+    pdf.callout(
+        "Small cards",
+        "The detector and embedding are designed for real cards at reduced size. "
+        "The smaller the card, the more focus and light "
+        "matter; OCR is not forced below 200 px. If two candidates appear, choose "
+        "in Pending instead of trusting a text read.",
+    )
     pdf.defitem("NIS upscaling (off, requires CUDA)",
                 "Sharpens small text before OCR. Better reading at some GPU "
                 "cost.")
@@ -399,28 +439,33 @@ def s7_web(pdf: ManualEN):
         "On the phone (same WiFi): http://PC-IP:8080 — the first time Windows "
         "will ask to allow OBS on the private network; accept the prompt.",
     ])
+    pdf.p(
+        "The web uses the same official icon fonts as the overlay: every card "
+        "shows its type, clan or creed and disciplines or virtues. The fonts are "
+        "served from the plugin's own /fonts/ path; no connection is needed."
+    )
     pdf.p("The top bar links every page: Search · Pool · Detections · Game · "
           "Pending.")
     pdf.defitem("Search (/)",
                 "Search across the card database. Accepts name (Spanish, English "
                 "or French), type:, clan:, disc: (discipline abbreviation), cap: "
                 "(exact capacity), cap>N, group: and free text, all combinable. "
-                "Shows up to 50 results; open a card to send it to the overlay "
-                "with one click.")
+                "Shows up to 50 results with the official type, clan and discipline "
+                "icons; open a card to send it to the overlay with one click.")
     pdf.defitem("Pool (/pool)",
                 "Pool control per player with buttons. The pool cannot be read "
                 "from the camera (bleeds, costs), so it is adjusted by hand here "
                 "or from Game.")
     pdf.defitem("Detections (/detections)",
-                "Latest live detections with image, name and time. One click on "
-                "any of them draws it on the ankh instantly.")
+                "Latest live detections with image, name, time and icons. One click "
+                "on any of them draws it on the ankh instantly.")
     pdf.defitem("Game (/game)",
                 "Game state: per player, the pool, how many cards are locked or "
                 "unlocked, detected minions and crypt cards. Below, the Log with "
                 "recent events (locks, influence, pool, ousted) and their age.")
     pdf.defitem("Pending (/pending, alias /pendientes)",
-                "The director mode queue: here you approve what gets shown on "
-                "the overlay (section 8).")
+                "The director mode queue: each pending card shows its icons and "
+                "here you approve what gets shown on the overlay (section 8).")
 
 
 def s8_director(pdf: ManualEN):
@@ -448,6 +493,9 @@ def s8_director(pdf: ManualEN):
     pdf.bullets([
         "Per-card dedupe: if the same card is detected again, it refreshes in "
         "the queue instead of duplicating.",
+        "If two cards are nearly tied (for example, in a blurry capture), the "
+        "queue shows both candidates so you can pick the right one; the plugin "
+        "draws neither of them automatically.",
         "The queue holds up to 24 pending cards; ones not seen again expire "
         "after 120 seconds.",
         "The view is shared between devices: phone and PC see the same queue; "
@@ -552,8 +600,13 @@ def s10_troubleshooting(pdf: ManualEN):
                 "Check that player's minion zone angle in the properties: it "
                 "must match the real orientation of the table.")
     pdf.defitem("OCR mixes up card names",
-                "Improve the light and avoid glare on the name band; the "
-                "plugin's image-based identification fixes most doubtful cases.")
+                "Improve the light and avoid glare on the card. Image embedding "
+                "is the main path and fixes most doubtful cases; OCR only runs "
+                "on cards at least 200 px high.")
+    pdf.defitem("A small card is not identified",
+                "Move it closer or improve focus: the embedding needs a sharp "
+                "card. OCR does not run below 200 px; if the embedding returns "
+                "two candidates, they appear in Pending for a one-click choice.")
     pdf.defitem("Where do I check errors?",
                 "Tools → Log files in OBS. The [Game], [Director], [WebServer] "
                 "and [OCR] tags follow the plugin flow.")

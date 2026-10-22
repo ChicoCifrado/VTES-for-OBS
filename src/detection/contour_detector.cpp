@@ -169,6 +169,8 @@ std::vector<OBBObject> detect_by_contour(
         obj.rect.y = y0;
         obj.rect.width = x1 - x0;
         obj.rect.height = y1 - y0;
+        obj.obb_w = rw;
+        obj.obb_h = rh;
         obj.angle = angle_deg * kPI / 180.0f;
         obj.label = 0;
         obj.prob = 1.0f;
