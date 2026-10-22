@@ -2,12 +2,16 @@
 #define VTES_WEB_SERVER_H
 
 #include "vtes_database.hpp"
+#include "vtes_icons.h"
 #include "i18n.h"
+#include <obs-module.h>
 #include <string>
 #include <thread>
 #include <atomic>
 #include <memory>
 #include <sstream>
+#include <fstream>
+#include <iterator>
 #include <cctype>
 #include <cstring>
 #include <cstdio>
@@ -45,10 +49,17 @@ public:
 
     // Callbacks to communicate with the filter instance
     std::function<std::vector<DetectionEntry>()> get_detections_fn;
-    std::function<void(const std::string& url)> on_overlay_fn;
+    std::function<void(const std::string& url, const std::string& card_id)> on_overlay_fn;
     std::function<void()> on_overlay_clear_fn;
     std::function<void(int player_idx, int delta)> on_pool_fn;
     std::function<std::vector<std::pair<std::string,int>>()> get_pool_fn;
+    // Estado de partida (minions y giro de cartas por jugador) como JSON.
+    std::function<nlohmann::json()> get_game_fn;
+    // Modo realizador: cola de detecciones pendientes + feedback de entrenamiento
+    std::function<nlohmann::json()> get_pending_fn;
+    std::function<nlohmann::json(uint64_t)> on_pending_select_fn;
+    std::function<nlohmann::json()> on_pending_clear_fn;
+    std::function<std::string(uint64_t)> get_pending_crop_fn;
 
     bool start(int port, const VTESCardDatabase *db) {
         if (running_) stop();
@@ -182,6 +193,20 @@ private:
             servePoolSet(client, query);
         } else if (uri == "/api/pool/status") {
             servePoolStatus(client);
+        } else if (uri == "/api/game/status") {
+            serveGameStatus(client);
+        } else if (uri == "/game") {
+            serveGamePage(client);
+        } else if (uri == "/api/pending") {
+            servePendingStatus(client);
+        } else if (uri == "/api/pending/select") {
+            servePendingSelect(client, query);
+        } else if (uri == "/api/pending/clear") {
+            servePendingClear(client);
+        } else if (uri == "/api/pending/crop") {
+            servePendingCrop(client, query);
+        } else if (uri == "/pending" || uri == "/pendientes") {
+            servePendingPage(client);
         } else if (uri == "/search") {
             serveHtmlResult(client, q);
         } else if (uri == "/detections") {
@@ -190,6 +215,8 @@ private:
             servePoolPage(client);
         } else if (uri == "/favicon.ico") {
             send204(client);
+        } else if (uri.rfind("/fonts/", 0) == 0) {
+            serveFont(client, uri.substr(7));
         } else if (uri == "/") {
             serveForm(client);
         } else {
@@ -226,6 +253,42 @@ private:
             "\r\n";
         sendAll(client, header);
         sendAll(client, body);
+    }
+
+    // Sirve las fuentes de iconos que usa la web. El navegador las cachea:
+    // son ficheros inmutables dentro de una version del plugin.
+    void serveFont(SOCKET client, const std::string &name) {
+        if (name != "ankha2.otf" && name != "vtes-clans.otf") {
+            send404(client);
+            return;
+        }
+        const std::string rel = "fonts/" + name;
+        char *path = obs_module_file(rel.c_str());
+        if (!path) {
+            send404(client);
+            return;
+        }
+        std::ifstream f(path, std::ios::binary);
+        bfree(path);
+        if (!f) {
+            send404(client);
+            return;
+        }
+        std::string data((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+        if (data.empty()) {
+            send404(client);
+            return;
+        }
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: font/otf\r\n"
+            "Cache-Control: public, max-age=86400\r\n"
+            "Content-Length: " + std::to_string(data.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, data);
     }
 
     void serveHtmlResult(SOCKET client, const std::string &q) {
@@ -479,6 +542,63 @@ private:
     }
 
     // /card?id=N — readable page with the card and its rulings.
+    // ── Iconos oficiales (fuentes ankha2 / vtes-clans) ───────────────────
+    static std::string iconSpan(const VtesIcon &ic) {
+        std::string h = "<span class=\"";
+        h += (ic.font == 1 ? "vtes-clan" : "vtes-icon");
+        h += "\" title=\"";
+        h += escapeHtml(ic.label);
+        h += "\">";
+        h += escapeHtml(ic.glyph);
+        h += "</span>";
+        return h;
+    }
+
+    // Fila compacta para las tarjetas de Pendientes / Detecciones.
+    static std::string iconsRow(const VTESCardEntry &e) {
+        std::vector<VtesIcon> icons = vtes_icons::forCard(e);
+        if (icons.empty())
+            return std::string();
+        std::string h = "<span class=\"vtes-icons\">";
+        for (const auto &ic : icons)
+            h += iconSpan(ic);
+        h += "</span>";
+        return h;
+    }
+
+    static std::string typeIconSpan(const std::string &t) {
+        const std::string g = vtes_icons::typeGlyph(t);
+        if (g.empty())
+            return std::string();
+        VtesIcon ic;
+        ic.font = 0;
+        ic.glyph = g;
+        ic.label = t;
+        return iconSpan(ic);
+    }
+
+    static std::string clanIconSpan(const std::string &c) {
+        const std::string g = vtes_icons::clanGlyph(c);
+        if (g.empty())
+            return std::string();
+        VtesIcon ic;
+        ic.font = 1;
+        ic.glyph = g;
+        ic.label = c;
+        return iconSpan(ic);
+    }
+
+    static std::string discIconSpan(const std::string &d) {
+        const std::string g = vtes_icons::discGlyph(d);
+        if (g.empty())
+            return std::string();
+        VtesIcon ic;
+        ic.font = 0;
+        ic.glyph = g;
+        ic.label = d;
+        return iconSpan(ic);
+    }
+
     void serveCardPage(SOCKET client, const std::string& query) {
         const std::string id = paramId(query);
         const VTESCardEntry* entry = (db_ && !id.empty()) ? db_->get_by_id(id) : nullptr;
@@ -496,6 +616,8 @@ private:
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\">" << tf_text("WebPending") << "</a>"
           << "<span class=\"status-bar\">Rulings</span></div>";
 
         if (!entry) {
@@ -513,17 +635,28 @@ private:
             }
             h << "<div>";
             for (const auto& t : entry->types)
-                h << "<span class=\"type\">" << escapeHtml(t) << "</span>";
+                h << "<span class=\"type\">" << typeIconSpan(t)
+                  << escapeHtml(t) << "</span>";
             for (const auto& c : entry->clans)
-                h << "<span class=\"type\">" << escapeHtml(c) << "</span>";
+                h << "<span class=\"type\">" << clanIconSpan(c)
+                  << escapeHtml(c) << "</span>";
             if (entry->capacity > 0)
                 h << "<span class=\"type\">Cap " << entry->capacity << "</span>";
             if (entry->group > 0)
                 h << "<span class=\"type\">G" << entry->group << "</span>";
             h << "</div>";
+            if (!entry->disciplines.empty()) {
+                h << "<div>";
+                for (const auto& d : entry->disciplines)
+                    h << "<span class=\"type\">" << discIconSpan(d)
+                      << escapeHtml(d) << "</span>";
+                h << "</div>";
+            }
             if (!entry->url.empty())
                 h << "<div class=\"result\"><img src=\"" << escapeHtml(entry->url)
-                  << "\" alt=\"" << escapeHtml(title) << "\"></div>";
+                  << "\" alt=\"" << escapeHtml(title)
+                  << "\" class=\"clickable\" onclick=\"showOverlay('" << entry->url
+                  << "',this," << entry->id << ")\"></div>";
             if (!entry->card_text.empty())
                 h << "<div class=\"result\"><div class=\"detail\">"
                   << escapeHtml(entry->card_text) << "</div></div>";
@@ -532,6 +665,10 @@ private:
         }
 
         h << "<div class=\"footer\">VTES Card Scanner</div>"
+          << "<script>function showOverlay(url,img,id){"
+          << "fetch('/api/overlay?url='+encodeURIComponent(url)+'&id='+encodeURIComponent(id||''));"
+          << "document.querySelectorAll('img.clickable').forEach(function(i){i.classList.remove('active')});"
+          << "if(img)img.classList.add('active');}</script>"
           << "</div></body></html>";
 
         std::string body = h.str();
@@ -555,6 +692,10 @@ private:
                 card["card_id"] = e.card_id;
                 card["card_url"] = e.card_url;
                 card["timestamp_ns"] = e.timestamp_ns;
+                const VTESCardEntry *entry = (!e.card_id.empty() && db_)
+                    ? db_->get_by_id(e.card_id) : nullptr;
+                if (entry)
+                    card["icons_html"] = iconsRow(*entry);
                 j.push_back(std::move(card));
             }
         }
@@ -571,16 +712,23 @@ private:
     }
 
     void serveOverlaySet(SOCKET client, const std::string& query) {
-        // Extract url= parameter from query string
-        std::string url;
-        size_t pos = query.find("url=");
-        if (pos != std::string::npos) {
-            url = urlDecode(query.substr(pos + 4));
-            size_t amp = url.find('&');
-            if (amp != std::string::npos) url.resize(amp);
-        }
+        // url= imagen que se pinta; id= carta de la base (opcional) para que
+        // el overlay pueda dibujar tambien sus iconos de tipo/clan/disciplinas.
+        auto param = [&](const char *key) -> std::string {
+            const std::string k = std::string(key) + "=";
+            size_t p = query.find(k);
+            if (p == std::string::npos)
+                return std::string();
+            const size_t start = p + k.size();
+            const size_t end = query.find('&', start);
+            return urlDecode(query.substr(start, end == std::string::npos
+                                                   ? std::string::npos
+                                                   : end - start));
+        };
+        const std::string url = param("url");
+        const std::string id = param("id");
         if (on_overlay_fn && !url.empty()) {
-            on_overlay_fn(url);
+            on_overlay_fn(url, id);
         }
         std::string body = "{\"ok\":true}";
         std::string header =
@@ -649,6 +797,8 @@ private:
           << "<div class=\"nav-bar\">"
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\">" << tf_text("WebPending") << "</a>"
           << "<a href=\"/pool\" class=\"active\">Pool</a>"
           << "<span class=\"status\" id=\"status\">" << tf_text("WebConnected") << "</span>"
           << "</div>"
@@ -716,6 +866,283 @@ private:
         sendAll(client, body);
     }
 
+    void serveGameStatus(SOCKET client) {
+        nlohmann::json j;
+        if (get_game_fn)
+            j = get_game_fn();
+        else
+            j["players"] = nlohmann::json::array();
+        std::string body = j.dump(2);
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    // ─── Modo realizador: API + pagina de pendientes ─────────────────
+    void sendJsonResponse(SOCKET client, const nlohmann::json &j) {
+        std::string body = j.dump(2);
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    uint64_t parseIdParam(const std::string &query) {
+        uint64_t id = 0;
+        size_t pos = query.find("id=");
+        if (pos == std::string::npos)
+            return 0;
+        const char *s = query.c_str() + pos + 3;
+        while (*s >= '0' && *s <= '9') {
+            id = id * 10 + (uint64_t)(*s - '0');
+            ++s;
+        }
+        return id;
+    }
+
+    void servePendingStatus(SOCKET client) {
+        nlohmann::json j;
+        if (get_pending_fn) {
+            j = get_pending_fn();
+        } else {
+            j["director_mode"] = false;
+            j["pending"] = nlohmann::json::array();
+        }
+        // Iconos de la carta para cada pendiente (los pinta el JS de /pending).
+        if (db_ && j.contains("pending") && j["pending"].is_array()) {
+            for (auto &p : j["pending"]) {
+                std::string id;
+                if (p.contains("card_id")) {
+                    if (p["card_id"].is_string())
+                        id = p["card_id"].get<std::string>();
+                    else if (p["card_id"].is_number_integer())
+                        id = std::to_string(p["card_id"].get<long long>());
+                    else if (p["card_id"].is_number_unsigned())
+                        id = std::to_string(p["card_id"].get<unsigned long long>());
+                }
+                const VTESCardEntry *e = id.empty() ? nullptr : db_->get_by_id(id);
+                if (e)
+                    p["icons_html"] = iconsRow(*e);
+            }
+        }
+        sendJsonResponse(client, j);
+    }
+
+    void servePendingSelect(SOCKET client, const std::string &query) {
+        uint64_t id = parseIdParam(query);
+        nlohmann::json j;
+        if (on_pending_select_fn && id > 0) {
+            j = on_pending_select_fn(id);
+        } else {
+            j["ok"] = false;
+            j["error"] = "bad_id";
+        }
+        sendJsonResponse(client, j);
+    }
+
+    void servePendingClear(SOCKET client) {
+        nlohmann::json j;
+        if (on_pending_clear_fn)
+            j = on_pending_clear_fn();
+        else
+            j["ok"] = false;
+        sendJsonResponse(client, j);
+    }
+
+    void servePendingCrop(SOCKET client, const std::string &query) {
+        uint64_t id = parseIdParam(query);
+        std::string body;
+        if (get_pending_crop_fn && id > 0)
+            body = get_pending_crop_fn(id);
+        if (body.empty()) {
+            send404(client);
+            return;
+        }
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: image/jpeg\r\n"
+            "Cache-Control: no-store\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    void servePendingPage(SOCKET client) {
+        std::ostringstream h;
+        h << "<!DOCTYPE html><html lang=\"" << tf_i18n_code() << "\"><head><meta charset=\"UTF-8\">"
+          << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+          << "<title>VTES — " << tf_text("WebPending") << "</title><style>"
+          << PAGE_CSS
+          << "</style></head><body><div class=\"container\">"
+          << "<h1>" << tf_text("WebPending") << "</h1>"
+          << "<div class=\"nav-bar\">"
+          << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
+          << "<a href=\"/pool\">Pool</a>"
+          << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\" class=\"active\">" << tf_text("WebPending") << "</a>"
+          << "</div>"
+          << "<div class=\"game-legend\">" << tf_text("WebPendingHint") << "</div>"
+          << "<div id=\"msgEmpty\" class=\"empty\" style=\"display:none\">" << tf_text("WebPendingEmpty") << "</div>"
+          << "<div id=\"msgOff\" class=\"empty\" style=\"display:none\">" << tf_text("WebPendingModeOff") << "</div>"
+          << "<div id=\"grid\" class=\"detection-grid\"></div>"
+          << "<div class=\"pending-actions\">"
+          << "<button id=\"discardBtn\">" << tf_text("WebPendingDiscard") << "</button>"
+          << "<button id=\"overlayBtn\">" << tf_text("WebPendingClearOverlay") << "</button>"
+          << "</div>"
+          << "<div class=\"footer\" id=\"fb\"></div>"
+          << "</div>"
+          << "<script>"
+          << "async function selectCard(id){try{"
+          << "const r=await fetch('/api/pending/select?id='+id);const j=await r.json();"
+          << "if(j.ok){load();}}catch(e){}}"
+          << "function cardEl(p){"
+          << "const d=document.createElement('div');d.className='pending-card';"
+          << "d.onclick=function(){selectCard(p.id);};"
+          << "const row=document.createElement('div');row.className='pending-imgs';"
+          << "const img=document.createElement('img');img.loading='lazy';"
+          << "img.src=p.card_url?p.card_url:('/api/pending/crop?id='+p.id);row.appendChild(img);"
+          << "if(p.card_url){const ev=document.createElement('img');ev.loading='lazy';"
+          << "ev.src='/api/pending/crop?id='+p.id;row.appendChild(ev);}"
+          << "d.appendChild(row);"
+          << "const nm=document.createElement('div');nm.className='pending-name';"
+          << "nm.innerHTML=p.icons_html||'';"
+          << "const nmt=document.createElement('div');nmt.textContent=p.card_name||p.card_id;nm.appendChild(nmt);"
+          << "d.appendChild(nm);"
+          << "const mt=document.createElement('div');mt.className='pending-meta';"
+          << "mt.textContent='conf '+(p.confidence||0).toFixed(2)+' · x'+p.hits+' · "
+          << "Math.round((p.fresh_ms||0)/1000)+'s';d.appendChild(mt);"
+          << "return d;}"
+          << "async function load(){try{"
+          << "const r=await fetch('/api/pending');const d=await r.json();"
+          << "const grid=document.getElementById('grid');const mE=document.getElementById('msgEmpty');"
+          << "const mO=document.getElementById('msgOff');"
+          << "grid.innerHTML='';mE.style.display='none';mO.style.display='none';"
+          << "if(!d.director_mode){mO.style.display='block';}"
+          << "else if(!d.pending.length){mE.style.display='block';}"
+          << "else{for(const p of d.pending){grid.appendChild(cardEl(p));}}"
+          << "document.getElementById('fb').textContent='Feedback: '+(d.feedback_dir||'');"
+          << "}catch(e){}}"
+          << "document.getElementById('discardBtn').onclick=async function(){"
+          << "try{await fetch('/api/pending/clear');load();}catch(e){}};"
+          << "document.getElementById('overlayBtn').onclick=async function(){"
+          << "try{await fetch('/api/overlay/clear');}catch(e){}};"
+          << "load();setInterval(load,2000);"
+          << "</script>"
+          << "</div></body></html>";
+        std::string body = h.str();
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    void serveGamePage(SOCKET client) {
+        std::ostringstream h;
+        h << "<!DOCTYPE html><html lang=\"" << tf_i18n_code() << "\"><head><meta charset=\"UTF-8\">"
+          << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+          << "<title>VTES — " << tf_text("WebGame") << "</title><style>"
+          << PAGE_CSS
+          << "</style></head><body><div class=\"container\">"
+          << "<h1>" << tf_text("WebGame") << "</h1>"
+          << "<div class=\"nav-bar\">"
+          << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
+          << "<a href=\"/pool\">Pool</a>"
+          << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\" class=\"active\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\">" << tf_text("WebPending") << "</a>"
+          << "<span class=\"status\" id=\"status\">" << tf_text("WebConnected") << "</span>"
+          << "</div>"
+          << "<div class=\"game-legend\">&#128274; " << tf_text("WebLockedWord")
+          << " &middot; &#10004; " << tf_text("WebUnlockedWord") << "</div>"
+          << "<div id=\"players\"></div>"
+          << "<h2 class=\"game-log-title\">" << tf_text("WebGameLog") << "</h2>"
+          << "<div id=\"log\" class=\"game-log\"></div>"
+          << "<script>"
+          << "const I18N={locked:\"" << tf_text("WebEvLocked") << "\","
+          << "unlocked:\"" << tf_text("WebEvUnlocked") << "\","
+          << "zoneminion:\"" << tf_text("WebEvZoneMinion") << "\","
+          << "zonecrypt:\"" << tf_text("WebEvZoneCrypt") << "\","
+          << "pool:\"" << tf_text("WebEvPool") << "\","
+          << "ousted:\"" << tf_text("WebEvOusted") << "\","
+          << "revived:\"" << tf_text("WebEvRevived") << "\"};"
+          << "function evFmt(t,c,f,to){return t.split('{card}').join(c||'?').split('{from}').join(f).split('{to}').join(to);}"
+          << "async function loadGame(){"
+          << "try{"
+          << "const r=await fetch('/api/game/status');"
+          << "const data=await r.json();"
+          << "const c=document.getElementById('players');"
+          << "let html='';"
+          << "for(const p of data.players){"
+          << "html+='<div class=\"game-player'+(p.active?'':' game-out')+'\">';"
+          << "html+='<div class=\"game-head\"><span class=\"game-pname\">'+p.name+'</span>';"
+          << "html+='<span class=\"badge pool\">Pool '+p.pool+'</span>';"
+          << "html+='<span class=\"badge locked\">&#128274; '+p.locked_count+'</span>';"
+          << "html+='<span class=\"badge ready\">&#10004; '+p.unlocked_count+'</span>';"
+          << "if(p.crypt_count>0)html+='<span class=\"badge\">'+p.crypt_count+' "
+          << tf_text("WebCryptWord") << "</span>';"
+          << "if(!p.active)html+='<span class=\"badge out\">" << tf_text("WebOusted") << "</span>';"
+          << "html+='</div>';"
+          << "for(const m of p.minions){"
+          << "html+='<div class=\"game-minion'+(m.locked?' locked':'')+'\">';"
+          << "html+='<span class=\"mi\">'+(m.locked?'&#128274;':'&#10004;')+'</span> '+m.name;"
+          << "if(m.capacity)html+=' <span class=\"cap\">'+m.capacity+'</span>';"
+          << "html+='</div>';"
+          << "}"
+          << "if(p.minions.length===0)html+='<div class=\"game-empty\">"
+          << tf_text("WebNoMinions") << "</div>';"
+          << "html+='</div>';"
+          << "}"
+          << "c.innerHTML=html;"
+          << "const lg=document.getElementById('log');"
+          << "let lh='';"
+          << "const evs=(data.events||[]).slice().reverse();"
+          << "for(const e of evs){"
+          << "const nm=(data.players[e.player]||{}).name||('J'+e.player);"
+          << "let msg='';"
+          << "if(e.type==='lock')msg=evFmt(I18N.locked,e.card,0,0);"
+          << "else if(e.type==='unlock')msg=evFmt(I18N.unlocked,e.card,0,0);"
+          << "else if(e.type==='zone')msg=evFmt(e.to===0?I18N.zoneminion:I18N.zonecrypt,e.card,0,0);"
+          << "else if(e.type==='pool')msg=evFmt(I18N.pool,'',e.from,e.to);"
+          << "else if(e.type==='ousted')msg=I18N.ousted;"
+          << "else if(e.type==='revived')msg=evFmt(I18N.revived,'',0,e.to);"
+          << "if(msg)lh+='<div class=\"game-ev\"><span class=\"ev-time\">'+Math.round((e.age_ms||0)/1000)+'s</span> <span class=\"ev-who\">'+nm+':</span> '+msg+'</div>';"
+          << "}"
+          << "lg.innerHTML=lh;"
+          << "}catch(e){document.getElementById('status').textContent='Error'}}"
+          << "loadGame();"
+          << "setInterval(loadGame,2000);"
+          << "</script>"
+          << "<div class=\"footer\">VTES Card Scanner — " << tf_text("WebGame") << "</div>"
+          << "</div></body></html>";
+        std::string body = h.str();
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
     void serveDetectionsPage(SOCKET client) {
         std::ostringstream h;
         h << "<!DOCTYPE html><html lang=\"" << tf_i18n_code() << "\"><head><meta charset=\"UTF-8\">"
@@ -728,6 +1155,8 @@ private:
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\" class=\"active\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\">" << tf_text("WebPending") << "</a>"
           << "<span class=\"status\" id=\"status\">" << tf_text("WebConnected") << "</span>"
           << "</div>"
           << "<div id=\"grid\" class=\"detection-grid\"></div>"
@@ -744,10 +1173,10 @@ private:
           << "const time=new Date(Number(d.timestamp_ns)/1e6);"
           << "const timeStr=time.toLocaleTimeString();"
           << "div.innerHTML=(d.card_url?'<img src=\"'+d.card_url+'\" alt=\"'+d.card_name+'\" loading=\"lazy\">':'')"
-          << "+'<div class=\"name\">'+d.card_name+'</div>'"
-          << "'<div class=\"time\">'+timeStr+'</div>';"
+          << "+'<div class=\"name\">'+(d.icons_html||'')+d.card_name+'</div>'"
+          << "+'<div class=\"time\">'+timeStr+'</div>';"
           << "div.onclick=function(){"
-          << "fetch('/api/overlay?url='+encodeURIComponent(d.card_url));"
+          << "fetch('/api/overlay?url='+encodeURIComponent(d.card_url)+'&id='+encodeURIComponent(d.card_id||''));"
           << "document.querySelectorAll('.detection-card').forEach(c=>c.classList.remove('active'));"
           << "this.classList.add('active');"
           << "};"
@@ -815,6 +1244,8 @@ private:
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\">" << tf_text("WebPending") << "</a>"
           << "<span class=\"status-bar\">" << tf_text("WebDbLabel") << " <span class=\"status-" << dbStatus << "\">"
           << dbStatusText << "</span>"
           << (dbSize > 0 ? " (" + std::to_string(dbSize) + " " + tf_text("WebCardsWord") + ")" : "")
@@ -853,6 +1284,8 @@ private:
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\">" << tf_text("WebPending") << "</a>"
           << "<span class=\"status-bar\">" << tf_text("WebDbLabel") << " <span class=\"status-" << dbStatus << "\">"
           << dbStatusText << "</span>"
           << (dbSize > 0 ? " (" + std::to_string(dbSize) + " " + tf_text("WebCardsWord") + ")" : "")
@@ -884,13 +1317,15 @@ private:
                 }
                 h << "<div>";
                 for (const auto &t : entry.types)
-                    h << "<span class=\"type\">" << escapeHtml(t) << "</span>";
+                    h << "<span class=\"type\">" << typeIconSpan(t)
+                      << escapeHtml(t) << "</span>";
                 h << "</div><div class=\"detail\">";
                 if (!entry.clans.empty()) {
                     h << "Clan: ";
                     for (size_t i = 0; i < entry.clans.size(); i++) {
                         if (i > 0) h << "/";
-                        h << escapeHtml(entry.clans[i]);
+                        h << clanIconSpan(entry.clans[i])
+                          << escapeHtml(entry.clans[i]);
                     }
                 }
                 if (entry.capacity > 0) h << " | Cap: " << entry.capacity;
@@ -899,12 +1334,15 @@ private:
                     h << " | ";
                     for (size_t i = 0; i < entry.disciplines.size(); i++) {
                         if (i > 0) h << "/";
-                        h << escapeHtml(entry.disciplines[i]);
+                        h << discIconSpan(entry.disciplines[i])
+                          << escapeHtml(entry.disciplines[i]);
                     }
                 }
                 h << "</div>";
                 if (!entry.url.empty())
-                    h << "<img src=\"" << entry.url << "\" alt=\"" << escapeHtml(entry.name) << "\" loading=\"lazy\" onclick=\"showOverlay('" << entry.url << "',this)\" class=\"clickable\">";
+                    h << "<img src=\"" << entry.url << "\" alt=\"" << escapeHtml(entry.name)
+                      << "\" loading=\"lazy\" onclick=\"showOverlay('" << entry.url
+                      << "',this," << entry.id << ")\" class=\"clickable\">";
                 h << "</div>";
                 count++;
                 if (count >= 50) {
@@ -919,8 +1357,8 @@ private:
 
         h << "</div><div class=\"footer\">VTES Card Scanner — " << tf_text("WebClickOverlay") << "</div>"
           << "<script>"
-          << "function showOverlay(url,img){"
-          << "fetch('/api/overlay?url='+encodeURIComponent(url));"
+          << "function showOverlay(url,img,id){"
+          << "fetch('/api/overlay?url='+encodeURIComponent(url)+'&id='+encodeURIComponent(id||''));"
           << "document.querySelectorAll('.result img.clickable').forEach(function(i){i.classList.remove('active')});"
           << "img.classList.add('active');"
           << "}"
@@ -1006,6 +1444,15 @@ private:
         ".detection-card .name{color:#c9a84c;font-size:.85rem;text-align:center}"
         ".detection-card .time{color:#666;font-size:.7rem;text-align:center;margin-top:4px}"
         ".detection-card.active{border-color:#4caf50;box-shadow:0 0 12px rgba(76,175,80,.3)}"
+        ".pending-card{border:1px solid #333;border-radius:8px;padding:12px;background:#16213e;cursor:pointer;transition:border-color .2s}"
+        ".pending-card:hover{border-color:#c9a84c;box-shadow:0 0 12px rgba(201,168,76,.25)}"
+        ".pending-imgs{display:flex;gap:6px;margin-bottom:8px}"
+        ".pending-imgs img{width:50%;border-radius:4px;background:#0d1b3e;object-fit:cover}"
+        ".pending-name{color:#c9a84c;font-size:.85rem;text-align:center}"
+        ".pending-meta{color:#666;font-size:.7rem;text-align:center;margin-top:4px}"
+        ".pending-actions{margin-top:16px;display:flex;gap:10px;justify-content:center}"
+        ".pending-actions button{padding:8px 16px;border:none;border-radius:6px;background:#0f3460;color:#c9a84c;font-size:.9rem;cursor:pointer;font-family:inherit}"
+        ".pending-actions button:hover{background:#1a4a80}"
         ".status-bar{margin-bottom:20px;font-size:.85rem;color:#888;padding:8px 12px;background:#0d1b3e;border-radius:4px}"
         ".status-bar a{color:#c9a84c;text-decoration:none}"
         ".status-bar a:hover{text-decoration:underline}"
@@ -1021,6 +1468,14 @@ private:
         ".result h2{font-size:1rem;color:#c9a84c;margin-bottom:4px}"
         ".result .i18n{font-size:.8rem;color:#888;margin-bottom:4px}"
         ".result .type{display:inline-block;background:#0f3460;color:#aaa;font-size:.75rem;padding:2px 8px;border-radius:3px;margin-right:4px}"
+        ".type{display:inline-block;background:#0f3460;color:#aaa;font-size:.75rem;padding:2px 8px;border-radius:3px;margin:2px 4px 2px 0}"
+        "@font-face{font-family:'VTES Icons';src:url('/fonts/ankha2.otf') format('opentype');font-display:block}"
+        "@font-face{font-family:'VTES Clans';src:url('/fonts/vtes-clans.otf') format('opentype');font-display:block}"
+        ".vtes-icon{font-family:'VTES Icons';font-style:normal;font-weight:normal;font-size:1.3em;line-height:1;color:#c9a84c;vertical-align:-0.15em;display:inline-block;margin-right:2px}"
+        ".vtes-clan{font-family:'VTES Clans';font-style:normal;font-weight:normal;font-size:1.3em;line-height:1;color:#c9a84c;vertical-align:-0.15em;display:inline-block;margin-right:2px}"
+        ".vtes-icons{display:inline-flex;gap:3px;align-items:center;margin-right:5px;vertical-align:middle}"
+        ".vtes-icons .vtes-icon,.vtes-icons .vtes-clan{font-size:1.15em;margin-right:0}"
+        ".pending-name .vtes-icons,.detection-card .name .vtes-icons{display:flex;justify-content:center;margin:0 0 3px 0}"
         ".result .detail{font-size:.85rem;color:#999;margin-top:4px}"
         ".result img{max-width:200px;margin-top:8px;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.4)}"
         ".result img.clickable{cursor:pointer;border:2px solid transparent;transition:border-color .2s}"
@@ -1046,6 +1501,26 @@ private:
         ".pool-btns button:first-child{background:#d32f2f;color:#fff}"
         ".pool-btns button:last-child{background:#388e3c;color:#fff}"
         ".pool-btns button:hover{opacity:.85}"
+        ".game-legend{font-size:.8rem;color:#888;margin-bottom:14px}"
+        ".game-player{margin-bottom:18px;padding:12px 16px;background:#0d1b3e;border-radius:8px}"
+        ".game-player.game-out{opacity:.45}"
+        ".game-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}"
+        ".game-pname{font-weight:600;color:#e0e0e0;font-size:1.05rem}"
+        ".badge{font-size:.8rem;padding:3px 10px;border-radius:12px;background:#16213e;border:1px solid #333;color:#bbb}"
+        ".badge.pool{color:#c9a84c;border-color:#574a1d}"
+        ".badge.locked{color:#ffd166;border-color:#7a5c00}"
+        ".badge.ready{color:#7ee787;border-color:#1f6f2e}"
+        ".game-minion{padding:5px 8px;margin:3px 0;border-radius:5px;background:#101f47;color:#ddd;border-left:3px solid #1f6f2e}"
+        ".game-minion.locked{border-left-color:#ffd166;background:#2a2413;color:#ffd166}"
+        ".game-minion .cap{color:#888;font-size:.85rem}"
+        ".game-empty{color:#888;font-size:.85rem;padding:4px 0}"
+        ".game-log-title{color:#c9a84c;font-size:1rem;margin:22px 0 8px}"
+        ".game-log{max-height:260px;overflow-y:auto;background:#0d1b3e;border-radius:8px;padding:10px 14px}"
+        ".game-ev{font-size:.85rem;color:#bbb;padding:3px 0;border-bottom:1px solid #14213d}"
+        ".game-ev:last-child{border-bottom:none}"
+        ".ev-time{color:#666;font-size:.72rem;margin-right:6px}"
+        ".ev-who{color:#c9a84c}"
+        ".badge.out{color:#ff6b6b;border-color:#7a1f1f}"
         ".empty{text-align:center;color:#666;padding:40px;font-size:1.1rem}"
         ".error{text-align:center;color:#ff5722;padding:40px;font-size:1.1rem}"
         ".footer{text-align:center;color:#444;font-size:.75rem;margin-top:40px}";

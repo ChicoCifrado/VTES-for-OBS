@@ -86,6 +86,14 @@ struct filter_data {
 	bool always_active;
 	bool show_zones; // dibuja las zonas de jugadores sobre el preview
 	bool big_card;   // dibuja la carta principal a media pantalla (modo torneo)
+	// Encuadre de la camara bajo el overlay: la imagen cubre el hueco entero
+	// (sin barras negras). zoom 1.0 = cubrir justo; offsets en px de diseno.
+	double cam_zoom = 1.0;
+	int    cam_off_x = 0;
+	int    cam_off_y = 0;
+	bool   cam_full_frame = false; // a sangre: cubre todo el frame, no solo el hueco
+	// Fuente de nombres/pool: 0 = Cinzel, 1 = Grenze Gotisch, 2 = Hershey.
+	int    overlay_font_mode = 0;
 
 	std::mutex inputBGRALock;
 	std::mutex outputLock;
@@ -130,6 +138,9 @@ struct filter_data {
 		std::string tracked_card_name;
 		int identity_hits = 0;         // frames where this identity was matched
 		int identity_total = 0;         // total frames tracked
+		float identity_score = 0.0f;    // confianza de la identificacion
+		uint64_t last_crop_hash = 0;    // dHash del ultimo recorte asociado
+		int last_label = 0;             // etiqueta de tipo para el preview
 		static constexpr int IDENTITY_WINDOW = 10;
 
 		std::deque<bool> history; // sliding window of detections
@@ -151,6 +162,11 @@ struct filter_data {
 
 	// --- Embedding-based card identification ---
 	EmbeddingMatcher embedder;
+	// Margen minimo entre la mejor carta y la segunda carta distinta para
+	// aceptar una identificacion automatica. En capturas borrosas No Trace
+	// y Dust Up quedan a pocas milesimas; sin este margen la cola del
+	// realizador se llenaba de falsos positivos.
+	float embed_min_margin = 0.06f;
 	std::unordered_map<std::string, CardInfo> card_info_by_id;    // card ID -> card info
 
 	// --- VTES Card Classifier ---
@@ -173,6 +189,7 @@ struct filter_data {
 		int64_t id;
 		cv::Mat card_region;
 		std::string type_filter;
+		uint64_t crop_hash = 0;
 	};
 	struct OcrJobResult {
 		int64_t id;
@@ -181,6 +198,7 @@ struct filter_data {
 		std::string card_name;
 		std::string card_id;
 		float confidence = 0.0f;
+		uint64_t crop_hash = 0;
 	};
 
 	std::thread ocr_worker;
@@ -200,8 +218,13 @@ struct filter_data {
 
 	// --- Card image cache for overlay display ---
 	std::unordered_map<std::string, cv::Mat> card_image_cache;
-	std::chrono::steady_clock::time_point last_overlay_detection_time;
+	// Carta elegida por el operador (modo realizador): se pinta en el ankh
+	// hasta que se elija otra o se limpie desde la web.
 	std::string current_overlay_card_url;
+	std::string current_overlay_card_id;
+	// Recorte de la pendiente elegida, usado si la caratula oficial no se
+	// pudo descargar/cachear. Asi el clic siempre pinta algo.
+	cv::Mat current_overlay_fallback;
 	float card_overlay_duration = 5.0f;
 
 	// --- Performance: minimum detection interval ---
@@ -217,10 +240,34 @@ struct filter_data {
 	// --- Web server notification flag (show popup once per filter instance) ---
 	bool web_server_notified = false;
 
-	// --- Manual overlay (triggered from web UI, overrides auto-detection) ---
-	std::string manual_overlay_url;
-	int64_t manual_overlay_set_time_ns = 0;
-	bool click_to_overlay = false;  // when true, only show cards manually clicked from web UI
+	// --- Modo realizador: las detecciones no se muestran solas; se acumulan
+	// como pendientes y el operador elige cual se muestra desde la web. ---
+	bool click_to_overlay = true;
+	struct PendingDetection {
+		uint64_t id = 0;
+		std::string card_id, card_name, card_url;
+		float confidence = 0.0f;     // deteccion (objetos) o identificacion (OCR)
+		int64_t first_seen_ns = 0;
+		int64_t last_seen_ns = 0;
+		int hits = 0;                // veces re-detectada mientras esperaba
+		std::vector<uchar> crop_jpg; // recorte del frame (datos de entrenamiento)
+	};
+	std::deque<PendingDetection> pending_detections;
+	uint64_t pending_next_id = 1;
+	std::mutex pending_lock;
+	// Carpeta de datos de entrenamiento (feedback del realizador).
+	std::string feedback_dir;
+
+	// --- Registro de eventos de partida (historial para la web) ---
+	struct GameEvent {
+		int64_t ts_ns = 0;
+		std::string type; // lock | unlock | zone | pool | ousted | revived
+		int player_idx = -1;
+		std::string card_name;
+		int from = 0;     // pool anterior / zona: 1 cripta, 0 minion
+		int to = 0;
+	};
+	std::deque<GameEvent> game_events; // max 100; el mas reciente al final
 
 	// --- Detection history for web server ---
 	struct DetectedCard {
@@ -265,11 +312,25 @@ struct filter_data {
 		std::string card_id, card_name, card_url;
 		cv::Mat card_image;
 
-		// Lock state (default = Unlocked)
+		// Última identificación aceptada. Se usa para no repetir el
+		// embedding en cada frame mientras la carta siga delante de la
+		// cámara con el mismo recorte (dHash). El embedding es la parte
+		// más cara del filtro (~34 ms por carta en CPU) y bloquear el
+		// hilo de vídeo con él baja los FPS aunque la GPU esté libre.
+		uint64_t last_crop_hash = 0;
+		float    identity_confidence = 0.0f;
+		int      last_label = 0;
+		float    last_width = 0.0f;
+		float    last_height = 0.0f;
+
+		// Lock state: una carta está girada (tapped) cuando su ángulo
+		// difiere ~90° del de la zona minion de su jugador.
 		int64_t first_seen_ns   = 0;
-		float   initial_angle   = 0.0f;
+		float   initial_angle   = 0.0f;  // radianes; baseline si no hay zona
+		float   last_rel_angle  = 0.0f;  // grados normalizados a [-90, 90)
 		CardLockState lock_state = CardLockState::Unlocked;
-		bool   rotation_checked = false;  // true after 1 s observation
+		int     lock_votes      = 0;     // histéresis (+ girada / - lista)
+		int64_t lock_changed_ns = 0;     // último cambio de estado
 
 		// Player assignment (determined by zone overlap)
 		int  player_idx = -1;   // -1 = unassigned
@@ -300,5 +361,9 @@ struct filter_data {
 
 	// Overlay background (loaded from data/obs-plugins/…/overlay-bg.png)
 	cv::Mat overlay_bg;
+
+	// Ventana de camara del diseno, leida del canal alfa del overlay
+	// (coords de diseno 1536x1024). Vacia = usar las constantes kWin*.
+	cv::Rect overlay_cam_window;
 };
 #endif /* FILTERDATA_H */

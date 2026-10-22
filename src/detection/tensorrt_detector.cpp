@@ -281,6 +281,8 @@ void TensorRTDetector::decode_outputs(const float* prob, std::vector<OBBObject>&
             obj.rect.y = y0;
             obj.rect.width = x1 - x0;
             obj.rect.height = y1 - y0;
+            obj.obb_w = w / scale;
+            obj.obb_h = h / scale;
             obj.angle = angle;
             obj.label = 0;
             obj.prob = score;

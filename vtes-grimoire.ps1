@@ -246,11 +246,15 @@ function Invoke-Build {
     Write-Success ("Plugin instalado en: " + $releaseDir)
     # ── Copy CUDA runtime DLLs to release dir (for NSIS installer) ─
     $cudaPaths = @(
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin\x64",
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin",
         "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin",
         "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin",
         "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin"
     )
-    $cudaDlls = @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll",
+    $cudaDlls = @("cudart64_13.dll", "cublas64_13.dll", "cublasLt64_13.dll",
+                  "cufft64_12.dll",
+                  "cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll",
                   "cufft64_11.dll")
     $cudaCopied = 0
     $releasePluginDir = "$releaseDir/obs-plugins/64bit"
@@ -388,11 +392,15 @@ function Invoke-Deploy {
     }
     # ── CUDA Runtime DLLs ─
     $cudaPaths = @(
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin\x64",
+        "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin",
         "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin",
         "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin",
         "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin"
     )
-    $cudaDlls = @("cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll",
+    $cudaDlls = @("cudart64_13.dll", "cublas64_13.dll", "cublasLt64_13.dll",
+                  "cufft64_12.dll",
+                  "cudart64_12.dll", "cublas64_12.dll", "cublasLt64_12.dll",
                   "cufft64_11.dll")
     $cudaCopied = 0
     foreach ($cudaPath in $cudaPaths) {
@@ -448,7 +456,7 @@ function Invoke-Deploy {
     Write-Host ""
     Write-Success "Invocacion completa. Abriendo OBS..."
     $obsExe = "C:\Program Files\obs-studio\bin\64bit\obs64.exe"
-    if (Test-Path $obsExe) { Start-Process $obsExe }
+    if (Test-Path $obsExe) { Start-Process $obsExe -WorkingDirectory (Split-Path $obsExe) }
     return $true
 }
 
@@ -584,7 +592,12 @@ Section "Plugin" SEC_PLUGIN
   ; 3rd-party DLLs (all present in release dir after cmake --install)
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime_providers_shared.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime_providers_dml.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\onnxruntime_providers_cuda.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cudart64_13.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cublas64_13.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cublasLt64_13.dll"
+  File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cufft64_12.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cudart64_12.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cublas64_12.dll"
   File /nonfatal "__RELEASE_DIR__\obs-plugins\64bit\cublasLt64_12.dll"
@@ -619,7 +632,12 @@ Section Uninstall
   ; ── Remove 3rd-party runtime DLLs (only ours — nonfatal if shared) ─
   Delete "$INSTDIR\obs-plugins\64bit\onnxruntime.dll"
   Delete "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_shared.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_dml.dll"
   Delete "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_cuda.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\cudart64_13.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\cublas64_13.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\cublasLt64_13.dll"
+  Delete "$INSTDIR\obs-plugins\64bit\cufft64_12.dll"
   Delete "$INSTDIR\obs-plugins\64bit\cudart64_12.dll"
   Delete "$INSTDIR\obs-plugins\64bit\cublas64_12.dll"
   Delete "$INSTDIR\obs-plugins\64bit\cublasLt64_12.dll"
@@ -634,7 +652,12 @@ Section Uninstall
   Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\vtes-card-scanner.pdb"
   Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\onnxruntime.dll"
   Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_shared.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_dml.dll"
   Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\onnxruntime_providers_cuda.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cudart64_13.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cublas64_13.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cublasLt64_13.dll"
+  Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cufft64_12.dll"
   Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cudart64_12.dll"
   Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cublas64_12.dll"
   Delete /REBOOTOK "$INSTDIR\obs-plugins\64bit\cublasLt64_12.dll"
