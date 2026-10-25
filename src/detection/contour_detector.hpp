@@ -11,7 +11,10 @@ namespace vtes_detection {
 
 struct ContourParams {
     // Adaptive threshold (mtg_card_detector style, replaces Canny)
-    int adaptive_block_size = 5;    // must be odd, default 5
+    // 0 = automatic (odd block ~3-5% of the shorter frame side). A fixed 5
+    // produced fragmented contours on 720p/1080p frames and the card was not
+    // an outermost contour, so the detector returned no objects.
+    int adaptive_block_size = 0;    // 0 = auto; set an odd value to force it
     double adaptive_c = 5;          // constant subtracted from mean
 
     // Alternative: Canny fallback if adaptive fails on simple backgrounds

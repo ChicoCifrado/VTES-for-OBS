@@ -60,6 +60,7 @@ static constexpr int kSlotY[5] = {89, 170, 249, 327, 401};
 #include <bitset>
 #include <cmath>
 #include <climits>
+#include <limits>
 #include <iterator>
 
 // stb_truetype (dominio publico): rasteriza los TTF de los nombres.
@@ -103,7 +104,17 @@ static InferenceDevice deviceStringToEnum(const std::string& s) {
 static const char *DETECT_MODE_CONTOUR = "contour";
 static const char *DETECT_MODE_ONNX = "onnx";
 
+// En VTES ningún vampiro tiene capacidad superior a 11. Es el coste máximo
+// de una influencia completa; se valida por si el dato de la base de cartas
+// viniera corrupto o la carta no fuera un vampiro influenciable.
+static constexpr int kMaxVampireCapacity = 11;
+
 struct detect_filter_obb : public filter_data {};
+
+// Forward declarations: se usan al construir el JSON de /game/status,
+// mucho antes de la implementación que está junto al video tick.
+static int activeAutoZonePlayers(const detect_filter_obb *tf);
+static int committedAutoZonePlayers(const detect_filter_obb *tf);
 
 // El OCR necesita bastantes pixeles por letra para ser fiable. En una mesa de
 // juego la carta completa suele ocupar 50-150 px de alto y el nombre queda en
@@ -908,6 +919,8 @@ const char *tf_property_key(const char *name)
 		{"card_search_btn", "OpenCardSearch"},
 		{"player_count", "PlayerCount"},
 		{"show_zones", "ShowZones"},
+		{"auto_zones", "AutoZones"},
+		{"auto_zones_hint", "AutoZonesHint"},
 		{"big_card", "BigCard"},
 		{"overlay_font", "OverlayFont"},
 		{"cam_hint", "CamHint"},
@@ -1142,6 +1155,9 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	// ─── Game State: Player configuration ───────────────────────────────
 	obs_properties_add_int_slider(props, "player_count", tf_text("PlayerCount"), 4, 5, 1);
 	obs_properties_add_bool(props, "show_zones", tf_text("ShowZones"));
+	obs_properties_add_bool(props, "auto_zones", tf_text("AutoZones"));
+	obs_properties_add_text(props, "auto_zones_hint",
+		tf_text("AutoZonesHint"), OBS_TEXT_INFO);
 	obs_properties_add_bool(props, "big_card", tf_text("BigCard"));
 
 	obs_property_t *p_font = obs_properties_add_list(
@@ -1244,6 +1260,7 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 	// Game state defaults
 	obs_data_set_default_int(settings, "player_count", 5);
 	obs_data_set_default_bool(settings, "show_zones", true);
+	obs_data_set_default_bool(settings, "auto_zones", false);
 	obs_data_set_default_bool(settings, "big_card", false);
 	obs_data_set_default_string(settings, "overlay_font", "cinzel");
 	obs_data_set_default_bool(settings, "cam_full_frame", false);
@@ -1358,9 +1375,41 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		int new_count = (int)obs_data_get_int(settings, "player_count");
 		if (new_count < 4) new_count = 4;
 		if (new_count > filter_data::MAX_PLAYERS) new_count = filter_data::MAX_PLAYERS;
+		const bool count_changed = (new_count != tf->player_count);
 		tf->player_count = new_count;
 		tf->show_zones = obs_data_get_bool(settings, "show_zones");
 		tf->big_card = obs_data_get_bool(settings, "big_card");
+
+		// La detección automática se reinicia al activarla/desactivarla o
+		// al cambiar el número de jugadores. Las zonas manuales se siguen
+		// leyendo como respaldo hasta que el detector confirme un grupo.
+		const bool auto_wanted = obs_data_get_bool(settings, "auto_zones");
+		const bool auto_changed =
+			(auto_wanted != tf->auto_zones) ||
+			(auto_wanted && count_changed);
+		if (auto_changed) {
+			std::lock_guard<std::mutex> alock(tf->auto_zone_lock);
+			tf->auto_zones = auto_wanted;
+			if (!tf->auto_zone_detector)
+				tf->auto_zone_detector =
+					std::make_unique<vtes_detection::AutoZoneDetector>();
+			else
+				tf->auto_zone_detector->reset();
+			tf->auto_zone_commit_count = 0;
+			tf->auto_zone_last_run_ns = 0;
+			tf->auto_zone_batch_start_ns = 0;
+			{
+				std::lock_guard<std::mutex> vlock(tf->auto_zone_view_lock);
+				tf->auto_zone_views.clear();
+			}
+			std::lock_guard<std::mutex> glock(tf->game_state_lock);
+			for (int i = 0; i < filter_data::MAX_PLAYERS; ++i) {
+				tf->players[i].auto_zone = false;
+				tf->players[i].auto_zone_id = -1;
+			}
+		} else {
+			tf->auto_zones = auto_wanted;
+		}
 
 		const char *font = obs_data_get_string(settings, "overlay_font");
 		const std::string font_name = font ? font : "";
@@ -1377,27 +1426,40 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		tf->cam_off_x = std::max(-400, std::min(400, tf->cam_off_x));
 		tf->cam_off_y = std::max(-400, std::min(400, tf->cam_off_y));
 
+		std::lock_guard<std::mutex> glock(tf->game_state_lock);
 		for (int i = 0; i < filter_data::MAX_PLAYERS; i++) {
 			std::string p = "player_" + std::to_string(i);
 			tf->players[i].name = obs_data_get_string(settings, (p + "_name").c_str());
 			tf->players[i].pool = (int)obs_data_get_int(settings, (p + "_pool").c_str());
-			tf->players[i].minion_zone.nx = (float)obs_data_get_double(settings, (p + "_minion_x").c_str());
-			tf->players[i].minion_zone.ny = (float)obs_data_get_double(settings, (p + "_minion_y").c_str());
-			tf->players[i].minion_zone.nw = (float)obs_data_get_double(settings, (p + "_minion_w").c_str());
-			tf->players[i].minion_zone.nh = (float)obs_data_get_double(settings, (p + "_minion_h").c_str());
-			tf->players[i].crypt_zone.nx = (float)obs_data_get_double(settings, (p + "_crypt_x").c_str());
-			tf->players[i].crypt_zone.ny = (float)obs_data_get_double(settings, (p + "_crypt_y").c_str());
-			tf->players[i].crypt_zone.nw = (float)obs_data_get_double(settings, (p + "_crypt_w").c_str());
-			tf->players[i].crypt_zone.nh = (float)obs_data_get_double(settings, (p + "_crypt_h").c_str());
-			tf->players[i].minion_zone.angle = (float)obs_data_get_int(settings, (p + "_minion_angle").c_str());
-			tf->players[i].crypt_zone.angle = (float)obs_data_get_int(settings, (p + "_crypt_angle").c_str());
+
+			// Si la zona la ha creado el detector automático, no se pisa
+			// con los valores manuales mientras la opción siga activa.
+			const bool keep_auto =
+				tf->auto_zones && tf->players[i].auto_zone;
+			if (!keep_auto) {
+				tf->players[i].minion_zone.nx = (float)obs_data_get_double(settings, (p + "_minion_x").c_str());
+				tf->players[i].minion_zone.ny = (float)obs_data_get_double(settings, (p + "_minion_y").c_str());
+				tf->players[i].minion_zone.nw = (float)obs_data_get_double(settings, (p + "_minion_w").c_str());
+				tf->players[i].minion_zone.nh = (float)obs_data_get_double(settings, (p + "_minion_h").c_str());
+				tf->players[i].crypt_zone.nx = (float)obs_data_get_double(settings, (p + "_crypt_x").c_str());
+				tf->players[i].crypt_zone.ny = (float)obs_data_get_double(settings, (p + "_crypt_y").c_str());
+				tf->players[i].crypt_zone.nw = (float)obs_data_get_double(settings, (p + "_crypt_w").c_str());
+				tf->players[i].crypt_zone.nh = (float)obs_data_get_double(settings, (p + "_crypt_h").c_str());
+				tf->players[i].minion_zone.angle = (float)obs_data_get_int(settings, (p + "_minion_angle").c_str());
+				tf->players[i].crypt_zone.angle = (float)obs_data_get_int(settings, (p + "_crypt_angle").c_str());
+				tf->players[i].minion_zone.lock_angle = tf->players[i].minion_zone.angle;
+				tf->players[i].crypt_zone.lock_angle = tf->players[i].crypt_zone.angle;
+				if (!tf->auto_zones) {
+					tf->players[i].auto_zone = false;
+					tf->players[i].auto_zone_id = -1;
+				}
+			}
 
 			// Un jugador que sale de la partida (ousted) deja su sitio libre:
 			// su zona deja de asignar cartas y se le quitan las ya asignadas.
 			const bool was_active = tf->players[i].active;
 			tf->players[i].active = obs_data_get_bool(settings, (p + "_active").c_str());
 			if (was_active && !tf->players[i].active) {
-				std::lock_guard<std::mutex> lock(tf->game_state_lock);
 				for (auto it = tf->tracked_cards.begin(); it != tf->tracked_cards.end();) {
 					if (it->second.player_idx == i)
 						it = tf->tracked_cards.erase(it);
@@ -1681,6 +1743,7 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		obs_log(LOG_INFO, "  Show Boxes: %s", tf->preview ? "true" : "false");
 		obs_log(LOG_INFO, "  Always Active: %s", tf->always_active ? "true" : "false");
 		obs_log(LOG_INFO, "  Show Zones: %s", tf->show_zones ? "true" : "false");
+		obs_log(LOG_INFO, "  Auto Zones: %s", tf->auto_zones ? "true" : "false");
 		obs_log(LOG_INFO, "  Big Card: %s", tf->big_card ? "true" : "false");
 		obs_log(LOG_INFO, "  Threshold: %.2f", tf->conf_threshold);
 	}
@@ -1727,7 +1790,12 @@ static void recordDirectorFeedback(detect_filter_obb *tf, const char *kind,
 // game_state_lock.
 static void pushGameEvent(detect_filter_obb *tf, const char *type,
 						  int player_idx, const std::string &card_name,
-						  int from, int to, int64_t now_ns);
+						  int from, int to, int64_t now_ns,
+						  int capacity = 0);
+// Ajusta el pool y gestiona auto-ousted. El llamador debe tener
+// game_state_lock. Devuelve el delta realmente aplicado.
+static int applyPoolDeltaLocked(detect_filter_obb *tf, int player_idx,
+				int delta, int64_t now_ns);
 
 void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 {
@@ -1738,6 +1806,8 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 	tf->source = source;
 	tf->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
 	tf->lastDetectedObjectId = -1;
+	tf->auto_zone_detector =
+		std::make_unique<vtes_detection::AutoZoneDetector>();
 
 	// Read inference device from settings before loading models
 	tf->inference_device = obs_data_get_string(settings, "inference_device");
@@ -1818,34 +1888,10 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 		obs_log(LOG_INFO, "[WebServer] Overlay manual limpiado");
 	};
 	tf->web_server->on_pool_fn = [tf](int player_idx, int delta) {
-		if (player_idx < 0 || player_idx >= tf->player_count)
-			return;
 		const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 			std::chrono::steady_clock::now().time_since_epoch()).count();
 		std::lock_guard<std::mutex> lock(tf->game_state_lock);
-		auto &pl = tf->players[player_idx];
-		const int old_pool = pl.pool;
-		pl.pool += delta;
-		if (pl.pool < 0)
-			pl.pool = 0;
-		if (pl.pool > 99)
-			pl.pool = 99;
-		if (pl.pool != old_pool)
-			pushGameEvent(tf, "pool", player_idx, std::string(), old_pool, pl.pool, now_ns);
-		// Auto-ousted: pool 0 = eliminado; volver a subir pool lo reactiva.
-		if (pl.pool == 0 && pl.active) {
-			pl.active = false;
-			pushGameEvent(tf, "ousted", player_idx, std::string(), 0, 0, now_ns);
-			obs_log(LOG_INFO, "[Game] Jugador %d (%s) ousted: pool 0",
-				player_idx + 1, pl.name.c_str());
-		} else if (pl.pool > 0 && !pl.active) {
-			pl.active = true;
-			pushGameEvent(tf, "revived", player_idx, std::string(), 0, pl.pool, now_ns);
-			obs_log(LOG_INFO, "[Game] Jugador %d (%s) reactivado (pool %d)",
-				player_idx + 1, pl.name.c_str(), pl.pool);
-		}
-		obs_log(LOG_INFO, "[WebServer] Pool: %s = %d (delta %+d)",
-			pl.name.c_str(), pl.pool, delta);
+		applyPoolDeltaLocked(tf, player_idx, delta, now_ns);
 	};
 	tf->web_server->get_pool_fn = [tf]() -> std::vector<std::pair<std::string,int>> {
 		std::vector<std::pair<std::string,int>> out;
@@ -1867,6 +1913,7 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 			pj["name"] = pl.name;
 			pj["pool"] = pl.pool;
 			pj["active"] = pl.active;
+			pj["auto_zone"] = pl.auto_zone;
 			pj["zone_angle"] = pl.minion_zone.angle;
 			int locked_n = 0, unlocked_n = 0, crypt_n = 0;
 			nlohmann::json minions = nlohmann::json::array();
@@ -1889,6 +1936,12 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 				auto cit = tf->card_info_by_id.find(tc.card_id);
 				if (cit != tf->card_info_by_id.end())
 					capacity = cit->second.capacity;
+				if (capacity == 0) {
+					const VTESCardEntry *entry =
+						tf->vtes_db.get_by_id(tc.card_id);
+					if (entry)
+						capacity = entry->capacity;
+				}
 				mj["capacity"] = capacity;
 				if (mj["locked"].get<bool>())
 					locked_n++;
@@ -1900,7 +1953,30 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 			pj["locked_count"] = locked_n;
 			pj["unlocked_count"] = unlocked_n;
 			pj["crypt_count"] = crypt_n;
+			pj["influence_count"] = pl.influence_count;
+			pj["influence_cost"] = pl.influence_cost;
 			players_json.push_back(std::move(pj));
+		}
+		out["auto_zones"] = tf->auto_zones;
+		out["auto_zone_committed"] = committedAutoZonePlayers(tf);
+		{
+			nlohmann::json views = nlohmann::json::array();
+			std::lock_guard<std::mutex> view_lock(tf->auto_zone_view_lock);
+			for (const auto &v : tf->auto_zone_views) {
+				nlohmann::json vj;
+				vj["stable"] = v.stable;
+				vj["player"] = v.player_idx;
+				vj["cards"] = v.card_count;
+				vj["score"] = v.score;
+				vj["crypt"] = {{"x", v.crypt.nx}, {"y", v.crypt.ny},
+					       {"w", v.crypt.nw}, {"h", v.crypt.nh},
+					       {"angle", v.crypt.angle}};
+				vj["minion"] = {{"x", v.minion.nx}, {"y", v.minion.ny},
+						{"w", v.minion.nw}, {"h", v.minion.nh},
+						{"angle", v.minion.angle}};
+				views.push_back(std::move(vj));
+			}
+			out["auto_zone_views"] = std::move(views);
 		}
 		nlohmann::json events = nlohmann::json::array();
 		const size_t ev_total = tf->game_events.size();
@@ -1913,6 +1989,7 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 			ej["card"] = ev.card_name;
 			ej["from"] = ev.from;
 			ej["to"] = ev.to;
+			ej["capacity"] = ev.capacity;
 			ej["age_ms"] = (now_ns - ev.ts_ns) / 1000000LL;
 			events.push_back(std::move(ej));
 		}
@@ -2838,38 +2915,65 @@ static PlayerZoneHit resolvePlayerZone(const struct detect_filter_obb *tf,
 				       const cv::Point2f &c, int fw, int fh)
 {
 	PlayerZoneHit hit;
+	float best_dist = std::numeric_limits<float>::max();
+
+	// Las zonas automáticas de cinco jugadores convergen en el centro de la
+	// mesa y pueden solaparse. Cuando un punto cae en varias, se elige la
+	// zona en la que queda más centrado, no la del primer jugador. Así una
+	// carta colocada en la zona de minions de un jugador no se atribuye al
+	// vecino por orden de índice.
+	auto checkZone = [&](const filter_data::PlayerZone &z, bool crypt,
+			     int player_idx) {
+		const float zw = z.nw * fw, zh = z.nh * fh;
+		if (zw <= 0.0f || zh <= 0.0f)
+			return false;
+		const float zx = z.nx * fw, zy = z.ny * fh;
+		float dx = c.x - (zx + zw * 0.5f);
+		float dy = c.y - (zy + zh * 0.5f);
+		if (z.angle != 0.0f) {
+			// Zona rotada (positivo = horario): se pasa el punto
+			// al sistema de la zona aplicando el giro inverso.
+			const float ra = z.angle * kPI / 180.0f;
+			const float ca = std::cos(ra), sa = std::sin(ra);
+			const float rx = ca * dx + sa * dy;
+			const float ry = -sa * dx + ca * dy;
+			dx = rx;
+			dy = ry;
+		}
+		if (std::fabs(dx) > zw * 0.5f || std::fabs(dy) > zh * 0.5f)
+			return false;
+		// Distancia normalizada por el tamaño de la zona: 0 en el centro
+		// y 1 en el borde. Favorece la zona más pequeña y específica.
+		const float nx = dx / (zw * 0.5f);
+		const float ny = dy / (zh * 0.5f);
+		const float dist = nx * nx + ny * ny;
+		if (dist < best_dist) {
+			best_dist = dist;
+			hit.player_idx = player_idx;
+			hit.in_crypt = crypt;
+		}
+		return true;
+	};
+
+	// Primero minions (una carta en minions no debe caer en la cripta de
+	// otro jugador por solapamiento); sólo si no hay minion, cripta.
+	bool found_minion = false;
 	for (int pi = 0; pi < tf->player_count; pi++) {
 		const filter_data::PlayerState &pl = tf->players[pi];
 		if (!pl.active)
-			continue; // jugador fuera de partida: su sitio queda libre
-		auto checkZone = [&](const filter_data::PlayerZone &z, bool crypt) -> bool {
-			const float zw = z.nw * fw, zh = z.nh * fh;
-			if (zw <= 0.0f || zh <= 0.0f)
-				return false;
-			const float zx = z.nx * fw, zy = z.ny * fh;
-			float dx = c.x - (zx + zw * 0.5f);
-			float dy = c.y - (zy + zh * 0.5f);
-			if (z.angle != 0.0f) {
-				// Zona rotada (positivo = horario): se pasa el punto
-				// al sistema de la zona aplicando el giro inverso.
-				const float ra = z.angle * kPI / 180.0f;
-				const float ca = std::cos(ra), sa = std::sin(ra);
-				const float rx = ca * dx + sa * dy;
-				const float ry = -sa * dx + ca * dy;
-				dx = rx;
-				dy = ry;
-			}
-			if (std::fabs(dx) <= zw * 0.5f && std::fabs(dy) <= zh * 0.5f) {
-				hit.player_idx = pi;
-				hit.in_crypt = crypt;
-				return true;
-			}
-			return false;
-		};
-		if (checkZone(pl.minion_zone, false))
-			return hit;
-		if (checkZone(pl.crypt_zone, true))
-			return hit;
+			continue;
+		if (checkZone(pl.minion_zone, false, pi))
+			found_minion = true;
+	}
+	if (found_minion)
+		return hit;
+
+	best_dist = std::numeric_limits<float>::max();
+	for (int pi = 0; pi < tf->player_count; pi++) {
+		const filter_data::PlayerState &pl = tf->players[pi];
+		if (!pl.active)
+			continue;
+		checkZone(pl.crypt_zone, true, pi);
 	}
 	return hit;
 }
@@ -3150,7 +3254,7 @@ static void recordDirectorFeedback(detect_filter_obb *tf, const char *kind,
 // carta se deduplican 10 s para evitar rafagas si la carta oscila.
 static void pushGameEvent(detect_filter_obb *tf, const char *type,
 			  int player_idx, const std::string &card_name,
-			  int from, int to, int64_t now_ns)
+			  int from, int to, int64_t now_ns, int capacity)
 {
 	const std::string type_s = type ? type : "event";
 	if (type_s == "zone" && !card_name.empty()) {
@@ -3169,10 +3273,531 @@ static void pushGameEvent(detect_filter_obb *tf, const char *type,
 	ev.card_name = card_name;
 	ev.from = from;
 	ev.to = to;
+	ev.capacity = capacity;
 	tf->game_events.push_back(std::move(ev));
 	const size_t max_events = 100;
 	if (tf->game_events.size() > max_events)
 		tf->game_events.pop_front();
+}
+
+// Ajusta el pool de un jugador y mantiene coherentes el auto-ousted y el
+// registro. El llamador debe tener game_state_lock.
+static int applyPoolDeltaLocked(detect_filter_obb *tf, int player_idx,
+				int delta, int64_t now_ns)
+{
+	if (player_idx < 0 || player_idx >= tf->player_count)
+		return 0;
+
+	auto &pl = tf->players[player_idx];
+	const int old_pool = pl.pool;
+	int new_pool = old_pool + delta;
+	if (new_pool < 0)
+		new_pool = 0;
+	if (new_pool > 99)
+		new_pool = 99;
+	if (new_pool == old_pool)
+		return 0;
+
+	pl.pool = new_pool;
+	pushGameEvent(tf, "pool", player_idx, std::string(), old_pool,
+		      new_pool, now_ns);
+
+	// Auto-ousted: pool 0 = eliminado; volver a subir pool lo reactiva.
+	if (pl.pool == 0 && pl.active) {
+		pl.active = false;
+		pushGameEvent(tf, "ousted", player_idx, std::string(), 0, 0,
+			      now_ns);
+		obs_log(LOG_INFO, "[Game] Jugador %d (%s) ousted: pool 0",
+			player_idx + 1, pl.name.c_str());
+	} else if (pl.pool > 0 && !pl.active) {
+		pl.active = true;
+		pushGameEvent(tf, "revived", player_idx, std::string(), 0,
+			      pl.pool, now_ns);
+		obs_log(LOG_INFO, "[Game] Jugador %d (%s) reactivado (pool %d)",
+			player_idx + 1, pl.name.c_str(), pl.pool);
+	}
+	obs_log(LOG_INFO, "[Game] Pool: %s = %d (delta %+d)",
+		pl.name.c_str(), pl.pool, new_pool - old_pool);
+	return new_pool - old_pool;
+}
+
+// Heuristica de influencia: la camara no puede leer la sangre acumulada
+// sobre la carta, pero si puede seguir la carta fisica y ver cuando pasa
+// de la cripta a la zona minion. Se guardan dos claves:
+//   - track: sirve para cartas boca abajo, que aun no tienen card_id;
+//   - card:  sirve si SORT cambia el track_id al mover la carta.
+// Al completarse el paso a minion se descuenta la capacidad del pool. La
+// capacidad es el maximo de sangre del vampiro y, por tanto, el coste de
+// influencia completa. No se descuenta nada por una carta que ya aparece
+// en minion sin haber sido vista antes en la cripta.
+static void updateInfluenceHeuristic(detect_filter_obb *tf,
+				     const filter_data::TrackedCardState &tc,
+				     int player_idx, bool in_crypt,
+				     int64_t now_ns)
+{
+	if (player_idx < 0 || player_idx >= filter_data::MAX_PLAYERS)
+		return;
+
+	const std::string track_key =
+		"t:" + std::to_string(tc.track_id);
+	std::string card_key;
+	if (!tc.card_id.empty())
+		card_key = "c:" + std::to_string(player_idx) + "|" +
+			   tc.card_id;
+
+	auto mark_crypt = [&](const std::string &key) {
+		if (key.empty())
+			return;
+		auto &mem = tf->influence_memory[key];
+		mem.crypt_seen_ns = now_ns;
+		// Un flicker de zona no debe duplicar la influencia: solo se
+		// rearma si la carta lleva un tiempo real en la cripta.
+		if (mem.influenced_ns != 0 &&
+		    now_ns - mem.influenced_ns > 3000000000LL)
+			mem.influenced_ns = 0;
+	};
+	auto crypt_seen = [&](const std::string &key) {
+		if (key.empty())
+			return false;
+		auto it = tf->influence_memory.find(key);
+		return it != tf->influence_memory.end() &&
+		       it->second.crypt_seen_ns != 0 &&
+		       it->second.influenced_ns == 0;
+	};
+	auto mark_influenced = [&](const std::string &key) {
+		if (!key.empty())
+			tf->influence_memory[key].influenced_ns = now_ns;
+	};
+
+	if (in_crypt) {
+		mark_crypt(track_key);
+		mark_crypt(card_key);
+		return;
+	}
+
+	// La carta acaba de entrar en minion. Si aun no tiene identidad,
+	// esperamos: la capacidad se necesita para cobrar el pool y para
+	// mostrar el nombre en el registro.
+	if (tc.card_id.empty())
+		return;
+	if (!crypt_seen(track_key) && !crypt_seen(card_key))
+		return;
+
+	int capacity = 0;
+	auto cit = tf->card_info_by_id.find(tc.card_id);
+	if (cit != tf->card_info_by_id.end())
+		capacity = cit->second.capacity;
+	if (capacity == 0) {
+		const VTESCardEntry *entry = tf->vtes_db.get_by_id(tc.card_id);
+		if (entry)
+			capacity = entry->capacity;
+	}
+
+	// La capacidad de un vampiro está entre 1 y 11. Si el dato viniera
+	// fuera de rango no se debe descontar más de lo que cuesta un vampiro
+	// real; una capacidad 0 tampoco cuenta como influencia completada.
+	if (capacity > kMaxVampireCapacity) {
+		obs_log(LOG_WARNING,
+			"[Game] Capacidad anomala %d para \"%s\"; se limita a %d",
+			capacity, tc.card_name.c_str(), kMaxVampireCapacity);
+		capacity = kMaxVampireCapacity;
+	}
+	if (capacity <= 0) {
+		obs_log(LOG_WARNING,
+			"[Game] Sin capacidad valida para \"%s\"; no se cobra influencia",
+			tc.card_name.c_str());
+		// Evitar repetir el aviso en cada frame mientras la carta siga
+		// en minions; el retorno a la cripta vuelve a armar la memoria.
+		mark_influenced(track_key);
+		mark_influenced(card_key);
+		return;
+	}
+
+	auto &pl = tf->players[player_idx];
+	const int charged =
+		applyPoolDeltaLocked(tf, player_idx, -capacity, now_ns);
+	pl.influence_count++;
+	pl.influence_cost += charged < 0 ? -charged : 0;
+	mark_influenced(track_key);
+	mark_influenced(card_key);
+
+	const char *cname = tc.card_name.empty() ? "?" : tc.card_name.c_str();
+	obs_log(LOG_INFO,
+		"[Game] Jugador %d: \"%s\" influencia completada (cap %d, pool %d, heuristico)",
+		player_idx + 1, cname, capacity, charged);
+	pushGameEvent(tf, "influence", player_idx, tc.card_name, 1,
+		      charged < 0 ? -charged : 0, now_ns, capacity);
+}
+
+// ─── Zonas automáticas: cuatro cartas boca abajo ─────────────────────
+//
+// La cripta inicial son cuatro cartas boca abajo. No se intenta leer su
+// identidad (pueden llevar fundas que el modelo VTES no reconoce): se buscan
+// cuatro rectángulos parecidos, próximos y alineados. El grupo se confirma
+// tras tres detecciones y se convierte en dos zonas:
+//   - cripta: alrededor de las cuatro cartas;
+//   - minions: hacia el centro de la mesa, delante de la cripta.
+// La asignación a jugadores se hace por orden de asiento.
+
+struct AutoZoneLayout {
+	cv::Point2f centroid;
+	cv::Point2f table_center;
+	bool line_layout = false;
+};
+
+static filter_data::PlayerZone playerZoneFromRect(
+	const cv::RotatedRect &rr, const cv::Size &frame, float lock_angle)
+{
+	filter_data::PlayerZone z;
+	const float fw = (float)std::max(1, frame.width);
+	const float fh = (float)std::max(1, frame.height);
+	z.nw = rr.size.width / fw;
+	z.nh = rr.size.height / fh;
+	z.nx = rr.center.x / fw - z.nw * 0.5f;
+	z.ny = rr.center.y / fh - z.nh * 0.5f;
+	z.angle = rr.angle;
+	z.lock_angle = lock_angle;
+	return z;
+}
+
+static int activeAutoZonePlayers(const detect_filter_obb *tf)
+{
+	int n = 0;
+	for (int i = 0; i < tf->player_count; ++i)
+		if (tf->players[i].active)
+			n++;
+	return n;
+}
+
+static int committedAutoZonePlayers(const detect_filter_obb *tf)
+{
+	int n = 0;
+	for (int i = 0; i < tf->player_count; ++i)
+		if (tf->players[i].active && tf->players[i].auto_zone)
+			n++;
+	return n;
+}
+
+static AutoZoneLayout computeAutoZoneLayout(
+	const std::vector<vtes_detection::AutoZoneCluster> &clusters,
+	const cv::Size &frame)
+{
+	AutoZoneLayout layout;
+	layout.table_center = cv::Point2f(frame.width * 0.5f, frame.height * 0.5f);
+	layout.centroid = layout.table_center;
+
+	std::vector<cv::Point2f> pts;
+	for (const auto &c : clusters)
+		if (c.stable || c.player_idx >= 0)
+			pts.push_back(c.center);
+	if (pts.empty())
+		return layout;
+
+	cv::Point2f mean(0.0f, 0.0f);
+	for (const auto &p : pts)
+		mean += p;
+	mean /= (float)pts.size();
+	layout.centroid = mean;
+	layout.table_center = mean;
+
+	if (pts.size() == 1) {
+		// Con un solo grupo no hay forma de deducir la mesa. Se usa el
+		// centro de la imagen para que la zona de minions quede delante
+		// de la cripta (arriba o abajo), no en diagonal.
+		layout.line_layout = true;
+		layout.table_center = cv::Point2f(frame.width * 0.5f,
+						  frame.height * 0.5f);
+	} else if (pts.size() >= 2) {
+		float sxx = 0.0f, syy = 0.0f, sxy = 0.0f;
+		for (const auto &p : pts) {
+			const cv::Point2f d = p - mean;
+			sxx += d.x * d.x;
+			syy += d.y * d.y;
+			sxy += d.x * d.y;
+		}
+		const float tr = sxx + syy;
+		const float disc = std::sqrt(std::max(0.0f,
+			(sxx - syy) * (sxx - syy) + 4.0f * sxy * sxy));
+		const float l1 = 0.5f * (tr + disc);
+		const float l2 = 0.5f * (tr - disc);
+		if (l1 > 1.0f && l2 / l1 < 0.12f) {
+			layout.line_layout = true;
+			// En una fila, "hacia el centro" es hacia el centro de la
+			// imagen, no hacia la media de la propia fila.
+			layout.table_center = cv::Point2f(
+				frame.width * 0.5f, frame.height * 0.5f);
+		}
+	}
+	return layout;
+}
+
+static void sortAutoZoneClusters(
+	std::vector<vtes_detection::AutoZoneCluster> &clusters,
+	const AutoZoneLayout &layout)
+{
+	if (clusters.empty())
+		return;
+	if (layout.line_layout) {
+		float minx = clusters[0].center.x, maxx = minx;
+		float miny = clusters[0].center.y, maxy = miny;
+		for (const auto &c : clusters) {
+			minx = std::min(minx, c.center.x);
+			maxx = std::max(maxx, c.center.x);
+			miny = std::min(miny, c.center.y);
+			maxy = std::max(maxy, c.center.y);
+		}
+		if (maxx - minx >= maxy - miny)
+			std::sort(clusters.begin(), clusters.end(),
+				  [](const auto &a, const auto &b) {
+					  return a.center.x < b.center.x;
+				  });
+		else
+			std::sort(clusters.begin(), clusters.end(),
+				  [](const auto &a, const auto &b) {
+					  return a.center.y < b.center.y;
+				  });
+		return;
+	}
+
+	const float start = (float)(kPI * 0.5); // abajo, 6 en punto
+	std::sort(clusters.begin(), clusters.end(),
+		  [&](const auto &a, const auto &b) {
+			  const float aa = std::atan2(a.center.y - layout.centroid.y,
+						      a.center.x - layout.centroid.x);
+			  const float ab = std::atan2(b.center.y - layout.centroid.y,
+						      b.center.x - layout.centroid.x);
+			  float ra = std::fmod(aa - start + 2.0f * kPI, 2.0f * kPI);
+			  float rb = std::fmod(ab - start + 2.0f * kPI, 2.0f * kPI);
+			  if (ra < 0.0f) ra += 2.0f * kPI;
+			  if (rb < 0.0f) rb += 2.0f * kPI;
+			  return ra < rb;
+		  });
+}
+
+static void updateAutoZoneViews(
+	detect_filter_obb *tf,
+	const std::vector<vtes_detection::AutoZoneCluster> &clusters,
+	const AutoZoneLayout &layout, const cv::Size &frame)
+{
+	std::vector<filter_data::AutoZoneView> views;
+	views.reserve(clusters.size());
+
+	int auto_ids[filter_data::MAX_PLAYERS];
+	int auto_slots[filter_data::MAX_PLAYERS];
+	{
+		std::lock_guard<std::mutex> lock(tf->game_state_lock);
+		for (int i = 0; i < filter_data::MAX_PLAYERS; ++i) {
+			auto_ids[i] = tf->players[i].auto_zone_id;
+			auto_slots[i] = tf->players[i].auto_zone ? i : -1;
+		}
+	}
+
+	for (const auto &c : clusters) {
+		vtes_detection::AutoZoneGeometry g =
+			vtes_detection::AutoZoneDetector::deriveGeometry(
+				c, layout.table_center, frame, layout.line_layout);
+		if (!g.valid)
+			continue;
+		filter_data::AutoZoneView v;
+		v.crypt = playerZoneFromRect(g.crypt, frame, g.lock_angle_deg);
+		v.minion = playerZoneFromRect(g.minion, frame, g.lock_angle_deg);
+		v.stable = c.stable;
+		v.card_count = (int)c.cards.size();
+		v.score = c.score;
+		v.player_idx = -1;
+		for (int i = 0; i < filter_data::MAX_PLAYERS; ++i) {
+			if (auto_slots[i] >= 0 && auto_ids[i] == c.id) {
+				v.player_idx = auto_slots[i];
+				break;
+			}
+		}
+		views.push_back(std::move(v));
+	}
+
+	std::lock_guard<std::mutex> lock(tf->auto_zone_view_lock);
+	tf->auto_zone_views = std::move(views);
+}
+
+static bool autoZoneNearCommitted(
+	const detect_filter_obb *tf, const cv::Point2f &center,
+	const cv::Size &frame)
+{
+	for (int i = 0; i < tf->player_count; ++i) {
+		const filter_data::PlayerState &pl = tf->players[i];
+		if (!pl.active || !pl.auto_zone)
+			continue;
+		const cv::Point2f zc(
+			(pl.crypt_zone.nx + pl.crypt_zone.nw * 0.5f) * frame.width,
+			(pl.crypt_zone.ny + pl.crypt_zone.nh * 0.5f) * frame.height);
+		const float span = std::max(pl.crypt_zone.nw * frame.width,
+					    pl.crypt_zone.nh * frame.height);
+		if (cv::norm(center - zc) < 0.55f * span)
+			return true;
+	}
+	return false;
+}
+
+static void runAutoZoneDetection(detect_filter_obb *tf,
+				 const cv::Mat &bgra, int64_t now_ns)
+{
+	if (!tf->auto_zones)
+		return;
+
+	std::lock_guard<std::mutex> auto_lock(tf->auto_zone_lock);
+	if (!tf->auto_zone_detector)
+		return;
+
+	int expected = 0;
+	{
+		std::lock_guard<std::mutex> lock(tf->game_state_lock);
+		expected = activeAutoZonePlayers(tf);
+		if (expected <= 0)
+			return;
+		if (committedAutoZonePlayers(tf) >= expected)
+			return;
+	}
+
+	const int64_t interval_ns = 500000000LL; // 2 Hz
+	if (now_ns - tf->auto_zone_last_run_ns < interval_ns)
+		return;
+	tf->auto_zone_last_run_ns = now_ns;
+
+	cv::Mat bgr;
+	cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
+
+	std::vector<cv::Rect2f> exclude;
+	{
+		std::lock_guard<std::mutex> lock(tf->game_state_lock);
+		for (const auto &kv : tf->tracked_cards) {
+			const auto &tc = kv.second;
+			if (tc.card_id.empty() || tc.last_width <= 1.0f ||
+			    tc.last_height <= 1.0f)
+				continue;
+			exclude.emplace_back(
+				tc.last_position.x - tc.last_width * 0.5f,
+				tc.last_position.y - tc.last_height * 0.5f,
+				tc.last_width, tc.last_height);
+		}
+	}
+
+	std::vector<vtes_detection::AutoZoneCluster> clusters =
+		tf->auto_zone_detector->detect(bgr, now_ns, exclude);
+
+	// La media de los grupos sirve para orientar las zonas en una mesa
+	// circular. Si sólo hay un grupo, se usa el centro del frame.
+	std::vector<vtes_detection::AutoZoneCluster> stable;
+	for (const auto &c : clusters)
+		if (c.stable)
+			stable.push_back(c);
+	AutoZoneLayout layout = computeAutoZoneLayout(stable, bgr.size());
+
+	int committed = 0;
+	{
+		std::lock_guard<std::mutex> lock(tf->game_state_lock);
+		committed = committedAutoZonePlayers(tf);
+	}
+
+	if (!stable.empty()) {
+		// El temporizador debe arrancar también si se perdieron zonas ya
+		// asignadas y hay que volver a detectar desde cero.
+		if (committed == 0 && tf->auto_zone_batch_start_ns == 0)
+			tf->auto_zone_batch_start_ns = now_ns;
+
+		// Esperar un poco para que los jugadores coloquen los cuatro
+		// grupos antes de fijar el orden de asiento.
+		const bool settle_done =
+			(tf->auto_zone_batch_start_ns > 0 &&
+			 now_ns - tf->auto_zone_batch_start_ns >= 2500000000LL);
+		if (committed == 0 && (int)stable.size() < expected &&
+		    !settle_done) {
+			updateAutoZoneViews(tf, clusters, layout, bgr.size());
+			return;
+		}
+
+		sortAutoZoneClusters(stable, layout);
+
+		{
+			std::lock_guard<std::mutex> lock(tf->game_state_lock);
+			const int fw = bgr.cols, fh = bgr.rows;
+			int next_free = 0;
+			bool first_commit = (committed == 0);
+			int assigned_this_round = 0;
+
+			for (const auto &c : stable) {
+				if (autoZoneNearCommitted(tf, c.center, bgr.size()))
+					continue;
+				while (next_free < tf->player_count &&
+				       (!tf->players[next_free].active ||
+					tf->players[next_free].auto_zone))
+					next_free++;
+				if (next_free >= tf->player_count)
+					break;
+
+				vtes_detection::AutoZoneGeometry g =
+					vtes_detection::AutoZoneDetector::deriveGeometry(
+						c, layout.table_center, bgr.size(),
+						layout.line_layout);
+				if (!g.valid)
+					continue;
+
+				filter_data::PlayerState &pl =
+					tf->players[next_free];
+				pl.crypt_zone = playerZoneFromRect(
+					g.crypt, cv::Size(fw, fh), g.lock_angle_deg);
+				pl.minion_zone = playerZoneFromRect(
+					g.minion, cv::Size(fw, fh), g.lock_angle_deg);
+				pl.auto_zone = true;
+				pl.auto_zone_id = c.id;
+				tf->auto_zone_commit_count++;
+				assigned_this_round++;
+
+				obs_log(LOG_INFO,
+					"[AutoZones] Jugador %d: %d cartas -> cripta (%.0f,%.0f) %.0fx%.0f, minions (%.0f,%.0f) %.0fx%.0f",
+					next_free + 1, (int)c.cards.size(),
+					g.crypt.center.x, g.crypt.center.y,
+					g.crypt.size.width, g.crypt.size.height,
+					g.minion.center.x, g.minion.center.y,
+					g.minion.size.width, g.minion.size.height);
+				next_free++;
+			}
+
+			// Al pasar de zonas manuales a automáticas se reasignan las
+			// cartas y se borra la memoria de influencia: si no, el cambio
+			// de rectángulo podría interpretarse como una influencia.
+			if (first_commit && assigned_this_round > 0) {
+				tf->influence_memory.clear();
+				for (auto &kv : tf->tracked_cards) {
+					kv.second.player_idx = -1;
+					kv.second.in_crypt = false;
+					kv.second.lock_votes = 0;
+				}
+				obs_log(LOG_INFO,
+					"[AutoZones] Zonas automáticas aplicadas (%d/%d)",
+					committedAutoZonePlayers(tf), expected);
+			}
+		}
+		tf->auto_zone_batch_start_ns = 0;
+	}
+
+	updateAutoZoneViews(tf, clusters, layout, bgr.size());
+
+	{
+		std::lock_guard<std::mutex> lock(tf->game_state_lock);
+		committed = committedAutoZonePlayers(tf);
+	}
+	if (committed >= expected) {
+		tf->auto_zone_detector->reset();
+		// Las vistas de propuesta ya no aportan nada y, si el detector
+		// conservara algún track antiguo, sus etiquetas se quedarían
+		// dibujadas sobre la escena. Las zonas confirmadas se dibujan
+		// aparte desde PlayerZone.
+		{
+			std::lock_guard<std::mutex> lock(tf->auto_zone_view_lock);
+			tf->auto_zone_views.clear();
+		}
+		obs_log(LOG_INFO,
+			"[AutoZones] Detección completada: %d zonas", committed);
+	}
 }
 
 void detect_filter_obb_video_tick(void *data, float seconds)
@@ -3182,9 +3807,6 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 	struct detect_filter_obb *tf = reinterpret_cast<detect_filter_obb *>(data);
 
 	if (tf->isDisabled) {
-		return;
-	}
-	if (tf->detectionMode == DETECT_MODE_ONNX && !tf->yolo_detector) {
 		return;
 	}
 
@@ -3224,6 +3846,11 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 
 	try {
 
+	// ─── Zonas automáticas: 4 cartas boca abajo ───────────────────────
+	// Se ejecuta a 2 Hz y sólo hasta confirmar las zonas. No depende del
+	// detector de cartas ni del modelo de embeddings.
+	runAutoZoneDetection(tf, imageBGRA, now_ns);
+
 	// ─── Cooldown: skip detection after successful card identification ─────
 	// (Always Active bypasses cooldown entirely)
 	auto _cd_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3233,7 +3860,12 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 
 	std::vector<vtes_detection::OBBObject> raw_objects;
 
-	if (should_detect && !in_cooldown) {
+	// Las zonas automáticas no necesitan el modelo de cartas. El detector
+	// de cartas sí: si ONNX está seleccionado pero el modelo no cargó, se
+	// omite sólo esta parte y se mantiene el escaneo de zonas.
+	const bool detector_ready =
+		tf->detectionMode != DETECT_MODE_ONNX || tf->yolo_detector;
+	if (should_detect && !in_cooldown && detector_ready) {
 	cv::Mat inferenceFrame;
 	cv::cvtColor(imageBGRA, inferenceFrame, cv::COLOR_BGRA2BGR);
 	if (tf->detectionMode == DETECT_MODE_CONTOUR) {
@@ -3546,7 +4178,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				}
 			}
 		}
-	} // end if (should_detect && !in_cooldown)
+	} // end if (should_detect && !in_cooldown && detector_ready)
 
 	// ─── SORT tracking (optional) ────────────────────────────────────────
 	if (tf->sortTracking) {
@@ -3644,6 +4276,8 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				PlayerZoneHit zone = resolvePlayerZone(tf, tc.last_position, fw, fh);
 				tc.player_idx = zone.player_idx;
 				tc.in_crypt = zone.in_crypt;
+				updateInfluenceHeuristic(tf, tc, zone.player_idx,
+							 zone.in_crypt, now_ns);
 
 				tf->tracked_cards[obj.id] = std::move(tc);
 			} else {
@@ -3686,13 +4320,18 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 						tc.player_idx = zone.player_idx;
 						tc.in_crypt = zone.in_crypt;
 						tc.lock_votes = 0; // la histéresis previa ya no aplica
+						// La cripta→minion la registra la heurística
+						// de influencia; aquí solo el retorno a cripta.
 						if (zone.player_idx >= 0 && zone.player_idx == prev_player &&
-						    zone.in_crypt != was_crypt)
+						    !was_crypt && zone.in_crypt)
 							pushGameEvent(tf, "zone", zone.player_idx,
-								tc.card_name, was_crypt ? 1 : 0,
-								zone.in_crypt ? 1 : 0, now_ns);
+								tc.card_name, 0, 1, now_ns);
 					}
 				}
+				// Mantener la memoria cripta/minion actualizada cada
+				// frame, incluso cuando SORT ha cambiado el track_id.
+				updateInfluenceHeuristic(tf, tc, tc.player_idx,
+							 tc.in_crypt, now_ns);
 
 				// ── Estado de giro: evaluación continua (una carta puede
 				//    girarse/enderezarse en cualquier momento) y relativa a
@@ -3700,7 +4339,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				{
 					const bool in_minion_zone = tc.player_idx >= 0 && !tc.in_crypt;
 					const float base_deg = in_minion_zone
-						? tf->players[tc.player_idx].minion_zone.angle
+						? tf->players[tc.player_idx].minion_zone.lock_angle
 						: tc.initial_angle * 180.0f / kPI;
 					const float rel = relativeLockAngleDeg(obj.angle, base_deg);
 					tc.last_rel_angle = rel;
@@ -3948,6 +4587,57 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 					cv::Scalar(0, 220, 220),   // amarillo
 					cv::Scalar(220, 60, 220),  // magenta
 				};
+
+				// Zonas propuestas por el detector de 4 cartas boca abajo
+				// que todavía no se han asignado a un jugador. Se dibujan
+				// en blanco para distinguirlas de las zonas manuales.
+				if (tf->auto_zones) {
+					std::vector<filter_data::AutoZoneView> views;
+					{
+						std::lock_guard<std::mutex> lock(
+							tf->auto_zone_view_lock);
+						views = tf->auto_zone_views;
+					}
+					for (const auto &v : views) {
+						if (v.player_idx >= 0)
+							continue;
+						const cv::Scalar col = v.stable
+							? cv::Scalar(255, 255, 255)
+							: cv::Scalar(180, 180, 180);
+						auto drawProposal = [&](const filter_data::PlayerZone &z) {
+							const cv::Point2f zc(
+								(float)(cam.ox + (z.nx + z.nw * 0.5) * fw * cam.scale),
+								(float)(cam.oy + (z.ny + z.nh * 0.5) * fh * cam.scale));
+							const cv::Size2f zs(
+								(float)(z.nw * fw * cam.scale),
+								(float)(z.nh * fh * cam.scale));
+							if (zs.width < 4.0f || zs.height < 4.0f)
+								return;
+							cv::RotatedRect rr(zc, zs, z.angle);
+							cv::Point2f pts[4];
+							rr.points(pts);
+							std::vector<std::vector<cv::Point>> poly = {{
+								cv::Point((int)(pts[0].x + 0.5f), (int)(pts[0].y + 0.5f)),
+								cv::Point((int)(pts[1].x + 0.5f), (int)(pts[1].y + 0.5f)),
+								cv::Point((int)(pts[2].x + 0.5f), (int)(pts[2].y + 0.5f)),
+								cv::Point((int)(pts[3].x + 0.5f), (int)(pts[3].y + 0.5f))}};
+							cv::polylines(display, poly, true, col, 1);
+						};
+						drawProposal(v.crypt);
+						drawProposal(v.minion);
+						std::string label = tf_text("AutoZoneCards");
+						if (!v.stable)
+							label += "...";
+						const cv::Point2f top(
+							(float)(v.crypt.nx * fw * cam.scale + cam.ox),
+							(float)(v.crypt.ny * fh * cam.scale + cam.oy));
+						cv::putText(display, label,
+							cv::Point((int)top.x + 3, (int)top.y + 14),
+							cv::FONT_HERSHEY_SIMPLEX, 0.42,
+							col, 1);
+					}
+				}
+
 				for (int pi = 0; pi < tf->player_count; pi++) {
 					auto& pl = tf->players[pi];
 					const cv::Scalar col = pl.active ? palette[pi % 5]
@@ -3989,6 +4679,9 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 
 						// Etiqueta junto al vertice superior del rectangulo
 						std::string label = pl.name + " - " + tag;
+						if (pl.auto_zone)
+							label += std::string(" [") +
+								 tf_text("ZoneAuto") + "]";
 						if (!pl.active)
 							label += std::string(" [") + tf_text("ZoneOut") + "]";
 						cv::Point2f top = pts[0];

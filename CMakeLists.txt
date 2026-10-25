@@ -321,6 +321,7 @@ target_sources(
           src/obs-utils/obs-utils.cpp
           src/detection/yolo_detector.cpp
           src/detection/contour_detector.cpp
+          src/detection/auto_zone_detector.cpp
           src/sort/Sort.cpp
           src/classifier/vtes_card_classifier.cpp
           src/ocr/vtes_ocr.cpp

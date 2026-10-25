@@ -728,6 +728,33 @@ def s9_partida(pdf: Manual):
         "Una carta pertenece al jugador cuya zona contiene su centro; si no cae en "
         "ninguna, queda «fuera» y no cuenta para el estado.",
     ])
+    pdf.h2("Zonas automáticas (cuatro cartas boca abajo)")
+    pdf.p(
+        "Activa «Detectar zonas automáticamente (4 cartas boca abajo)» en las "
+        "propiedades del filtro. En la zona de cada jugador coloca sus cuatro "
+        "cartas de cripta boca abajo, en fila, juntas y con fundas del mismo "
+        "diseño. El detector no intenta leer su cara: agrupa los cuatro dorsos "
+        "por forma, tamaño, color y alineación."
+    )
+    pdf.bullets([
+        "La cripta se crea alrededor de la fila; la zona de minions ocupa la "
+        "mitad superior hacia el centro de la mesa, con la misma anchura que la "
+        "fila.",
+        "Las zonas se asignan por orden de asiento: empezando por abajo y "
+        "siguiendo el sentido horario en una mesa circular, o de izquierda a "
+        "derecha / de arriba abajo en una fila. Comprueba el resultado en /game "
+        "con «Zonas automáticas: n/total».",
+        "Mientras falten grupos se usan las zonas manuales como respaldo. Al "
+        "desactivar la opción vuelven las zonas manuales.",
+        "Las zonas automáticas se recalculan al activar la opción o cambiar el "
+        "número de jugadores; no se guardan en la configuración del filtro.",
+    ])
+    pdf.callout(
+        "Si no detecta una fila",
+        "Comprueba que se ven los cuatro bordes, que las cartas no son demasiado "
+        "pequeñas y que hay contraste con la mesa. Evita reflejos y fundas "
+        "transparentes. Como respaldo, ajusta las zonas manuales.",
+    )
     pdf.h2("Cartas giradas (lock)")
     pdf.bullets([
         "Solo se evalúan las cartas en la zona de minions: en la cripta no se giran.",
@@ -738,14 +765,31 @@ def s9_partida(pdf: Manual):
     ])
     pdf.h2("Influencia (cripta → minions)")
     pdf.p(
-        "Cuando una carta cambia de la zona de cripta a la de minions (la influencia "
-        "que se completa en la mesa real), el cambio queda anotado en el Registro "
-        "como «influenciada»."
+        "Cuando una carta identificada pasa de la zona de cripta a la de minions "
+        "(la influencia que se completa en la mesa real), el Registro muestra "
+        "«influencia completada» y se descuenta del pool la capacidad del "
+        "vampiro, que es el coste de una influencia completa. La ficha del "
+        "jugador muestra cuántas influencias lleva y el pool gastado."
     )
+    pdf.bullets([
+        "Para cobrar el coste la carta debe estar identificada por el embedding; "
+        "si aún no tiene identidad, el paso a minions no descuenta pool.",
+        "La capacidad de un vampiro está entre 1 y 11 y es el coste de una "
+        "influencia completa. El plugin no puede leer los contadores de sangre "
+        "de la carta boca abajo, así que descuenta la capacidad cuando la carta "
+        "aparece en minions, no transferencia a transferencia.",
+        "Si la carta vuelve a la cripta y permanece allí unos segundos, el "
+        "detector se rearma para una nueva influencia. Un parpadeo breve de zona "
+        "no duplica el cobro.",
+        "El pool también se puede ajustar a mano desde la web para bleeds y "
+        "otros efectos.",
+    ])
     pdf.h2("Pool y eliminación")
     pdf.bullets([
         "El pool se controla desde la web: el plugin no puede leer los contadores "
         "de sangre ni el pool a través de la cámara.",
+        "La influencia completada descuenta automáticamente la capacidad del "
+        "vampiro; el resto de cambios se ajustan a mano.",
         "Si un pool llega a 0, el jugador se marca como eliminado (ousted), con "
         "etiqueta y aspecto atenuado. Si lo subes de nuevo (por ejemplo, tras un "
         "toque accidental), se reactiva solo.",

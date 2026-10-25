@@ -536,6 +536,31 @@ def s9_game_state(pdf: ManualEN):
         "A card belongs to the player whose zone contains its centre; if it "
         "falls in none, it is «outside» and does not count for the state.",
     ])
+    pdf.h2("Automatic zones (four face-down cards)")
+    pdf.p(
+        "Enable «Detect zones automatically (4 face-down cards)» in the filter "
+        "properties. In each player's area, place their four crypt cards face "
+        "down, in a row, close together and with matching sleeves. The detector "
+        "does not try to read their faces: it groups the four backs by shape, "
+        "size, colour and alignment."
+    )
+    pdf.bullets([
+        "The crypt is created around the row; the minions zone covers the upper "
+        "half toward the centre of the table, with the same width as the row.",
+        "Zones are assigned by seating order: starting at the bottom and going "
+        "clockwise at a round table, or left to right / top to bottom in a row. "
+        "Check the result on /game under «Auto zones: n/total».",
+        "While groups are missing, the manual zones are used as a fallback. "
+        "Turning the option off restores the manual zones.",
+        "Automatic zones are recalculated when the option is enabled or the "
+        "player count changes; they are not saved in the filter settings.",
+    ])
+    pdf.callout(
+        "If a row is not detected",
+        "Check that all four edges are visible, that the cards are not too small "
+        "and that they contrast with the table. Avoid glare and transparent "
+        "sleeves. As a fallback, adjust the manual zones.",
+    )
     pdf.h2("Locked cards (lock)")
     pdf.bullets([
         "Only cards in the minion zone are evaluated: crypt cards are not "
@@ -547,14 +572,32 @@ def s9_game_state(pdf: ManualEN):
     ])
     pdf.h2("Influence (crypt → minions)")
     pdf.p(
-        "When a card moves from the crypt zone to the minions zone (influence "
-        "completed on the real table), the change is recorded in the Log as "
-        "«influenced»."
+        "When an identified card moves from the crypt zone to the minions zone "
+        "(influence completed on the real table), the Log shows «influence "
+        "completed» and the vampire's capacity is deducted from the pool, which "
+        "is the cost of a full influence. The player card shows how many "
+        "influences they have completed and the pool spent."
     )
+    pdf.bullets([
+        "The card must be identified by the embedding for the cost to be "
+        "charged; if it has no identity yet, moving to minions does not deduct "
+        "pool.",
+        "Vampire capacity is between 1 and 11 and is the cost of a full "
+        "influence. The plugin cannot read the blood counters on a face-down "
+        "card, so it deducts the capacity when the card appears in minions, not "
+        "transfer by transfer.",
+        "If the card returns to the crypt and stays there for a few seconds, the "
+        "detector re-arms for another influence. A brief zone flicker does not "
+        "charge twice.",
+        "The pool can also be adjusted by hand from the web for bleeds and other "
+        "effects.",
+    ])
     pdf.h2("Pool and elimination")
     pdf.bullets([
         "The pool is controlled from the web: the plugin cannot read blood "
         "counters or pool through the camera.",
+        "A completed influence automatically deducts the vampire's capacity; "
+        "other changes are adjusted by hand.",
         "If a pool reaches 0, the player is marked as ousted, with a label and a "
         "dimmed look. If you raise it again (say, an accidental tap), it "
         "reactivates on its own.",

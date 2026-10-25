@@ -5,6 +5,7 @@
 #include <opencv2/dnn.hpp>
 #include <onnxruntime_cxx_api.h>
 #include "detection/detector_base.hpp"
+#include "detection/auto_zone_detector.hpp"
 #include "sort/Sort.h"
 #include "classifier/vtes_card_classifier.hpp"
 #include "embedding_matcher.h"
@@ -21,6 +22,7 @@
 #include <vector>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 // Card info (name, types, disciplines) loaded from byId section of card-hash-index.json
 struct CardInfo {
@@ -261,11 +263,12 @@ struct filter_data {
 	// --- Registro de eventos de partida (historial para la web) ---
 	struct GameEvent {
 		int64_t ts_ns = 0;
-		std::string type; // lock | unlock | zone | pool | ousted | revived
+		std::string type; // lock | unlock | zone | influence | pool | ousted | revived
 		int player_idx = -1;
 		std::string card_name;
 		int from = 0;     // pool anterior / zona: 1 cripta, 0 minion
-		int to = 0;
+		int to = 0;       // pool nuevo / zona; influence: pool gastado
+		int capacity = 0; // influencia inferida: capacidad de la carta
 	};
 	std::deque<GameEvent> game_events; // max 100; el mas reciente al final
 
@@ -288,6 +291,10 @@ struct filter_data {
 	struct PlayerZone {
 		float nx = 0.0f, ny = 0.0f, nw = 0.0f, nh = 0.0f;
 		float angle = 0.0f; // grados; positivo = horario en pantalla
+		// Referencia para detectar si una carta está girada. En las zonas
+		// manuales coincide con `angle`; en las automáticas se toma de la
+		// orientación real de las cuatro cartas de cripta.
+		float lock_angle = 0.0f;
 	};
 
 	// Per-player persistent state
@@ -297,6 +304,33 @@ struct filter_data {
 		bool active = true; // en partida; un ousted deja su sitio libre
 		PlayerZone minion_zone;  // far (top) zone
 		PlayerZone crypt_zone;   // near (bottom) zone
+		// Zona creada por el detector de 4 cartas boca abajo. Se conserva
+		// aunque luego desaparezcan las cartas (influyeron o se movieron).
+		bool auto_zone = false;
+		int auto_zone_id = -1;
+		// Heuristica de influencia: cartas que pasaron de cripta a minion
+		// y suma de capacidades (coste de pool inferido).
+		int influence_count = 0;
+		int influence_cost = 0;
+	};
+
+	// Zona propuesta por el detector automático, para dibujarla en el
+	// overlay mientras se confirma el grupo de cuatro cartas.
+	struct AutoZoneView {
+		PlayerZone crypt;
+		PlayerZone minion;
+		bool stable = false;
+		int player_idx = -1;
+		int card_count = 0;
+		float score = 0.0f;
+	};
+
+	// Memoria por track fisico (cartas boca abajo) y por
+	// (jugador, card_id), para reconocer la influencia aunque SORT cambie
+	// el track_id al mover la carta de la cripta a minion.
+	struct InfluenceMemory {
+		int64_t crypt_seen_ns = 0;
+		int64_t influenced_ns = 0;
 	};
 
 	// Lock state — cards are Unlocked by default (straight/enderezada)
@@ -355,8 +389,23 @@ struct filter_data {
 	int                    rulings_scroll = 0;
 	PlayerState            players[MAX_PLAYERS];
 
+	// Detección automática de zonas a partir de 4 cartas boca abajo.
+	// El estado vive separado de las zonas manuales: cuando una zona se
+	// confirma, se copia a players[i] y se ignora la zona manual de ese
+	// jugador mientras `auto_zones` siga activo.
+	bool                   auto_zones = false;
+	int                    auto_zone_commit_count = 0;
+	int64_t                auto_zone_last_run_ns = 0;
+	int64_t                auto_zone_batch_start_ns = 0;
+	std::unique_ptr<vtes_detection::AutoZoneDetector> auto_zone_detector;
+	std::mutex             auto_zone_lock;
+	std::vector<AutoZoneView> auto_zone_views;
+	std::mutex             auto_zone_view_lock;
+
 	// Per-track state (track_id → TrackedCardState)
 	std::unordered_map<int, TrackedCardState> tracked_cards;
+	// Historial cripta/minion por carta, independiente del track_id.
+	std::unordered_map<std::string, InfluenceMemory> influence_memory;
 	std::mutex                                game_state_lock;
 
 	// Overlay background (loaded from data/obs-plugins/…/overlay-bg.png)
