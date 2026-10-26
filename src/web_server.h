@@ -52,6 +52,8 @@ public:
     std::function<void(const std::string& url, const std::string& card_id)> on_overlay_fn;
     std::function<void()> on_overlay_clear_fn;
     std::function<void(int player_idx, int delta)> on_pool_fn;
+    std::function<void(int player_idx, int track_id, const std::string &resource,
+                       int delta)> on_minion_resource_fn;
     std::function<std::vector<std::pair<std::string,int>>()> get_pool_fn;
     // Estado de partida (minions y giro de cartas por jugador) como JSON.
     std::function<nlohmann::json()> get_game_fn;
@@ -193,6 +195,8 @@ private:
             servePoolSet(client, query);
         } else if (uri == "/api/pool/status") {
             servePoolStatus(client);
+        } else if (uri == "/api/game/resource") {
+            serveMinionResourceSet(client, query);
         } else if (uri == "/api/game/status") {
             serveGameStatus(client);
         } else if (uri == "/game") {
@@ -408,6 +412,9 @@ private:
         card["disciplines"] = entry.disciplines;
         card["capacity"] = entry.capacity;
         card["group"] = entry.group;
+        card["pool_cost"] = entry.pool_cost;
+        card["blood_cost"] = entry.blood_cost;
+        card["conviction_cost"] = entry.conviction_cost;
         card["card_text"] = entry.card_text;
         card["url"] = entry.url;
         if (!entry.name_es.empty()) card["name_es"] = entry.name_es;
@@ -500,6 +507,26 @@ private:
             "\r\n";
         sendAll(client, header);
         sendAll(client, body);
+    }
+
+    // Texto compacto de los costes de biblioteca. No mezcla capacidad ni
+    // influencia: las cartas de cripta no tienen pool_cost/blood_cost.
+    static std::string costSummary(const VTESCardEntry &entry)
+    {
+        std::string out;
+        auto add = [&](const std::string &value, const char *unit_key) {
+            if (value.empty())
+                return;
+            if (!out.empty())
+                out += " + ";
+            out += value;
+            out += " ";
+            out += tf_text(unit_key);
+        };
+        add(entry.pool_cost, "WebCostPool");
+        add(entry.blood_cost, "WebCostBlood");
+        add(entry.conviction_cost, "WebCostConviction");
+        return out;
     }
 
     // Rulings of a card as an HTML block, grouped by the ruling group heading.
@@ -644,6 +671,10 @@ private:
                 h << "<span class=\"type\">Cap " << entry->capacity << "</span>";
             if (entry->group > 0)
                 h << "<span class=\"type\">G" << entry->group << "</span>";
+            const std::string costs = costSummary(*entry);
+            if (!costs.empty())
+                h << "<span class=\"type cost\">" << tf_text("WebCostLabel")
+                  << ": " << escapeHtml(costs) << "</span>";
             h << "</div>";
             if (!entry->disciplines.empty()) {
                 h << "<div>";
@@ -776,6 +807,51 @@ private:
         // We can't read the pool back directly, so return a dummy
         std::string body = "{\"ok\":true,\"player\":" + std::to_string(player) +
             ",\"delta\":" + std::to_string(delta) + "}";
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
+    void serveMinionResourceSet(SOCKET client, const std::string& query) {
+        int player = -1, track = -1, delta = 0;
+        std::string resource;
+        auto value = [&](const char *key) -> std::string {
+            const std::string k = std::string(key) + "=";
+            size_t pos = query.find(k);
+            if (pos == std::string::npos)
+                return std::string();
+            size_t start = pos + k.size();
+            size_t end = query.find('&', start);
+            return urlDecode(query.substr(start, end == std::string::npos
+                                                   ? std::string::npos
+                                                   : end - start));
+        };
+        try {
+            player = std::stoi(value("player"));
+            track = std::stoi(value("track"));
+            delta = std::stoi(value("delta"));
+        } catch (...) {
+            player = track = -1;
+            delta = 0;
+        }
+        resource = value("resource");
+        if (on_minion_resource_fn && player >= 0 && track >= 0 &&
+            (resource == "blood" || resource == "life" ||
+             resource == "conviction")) {
+            on_minion_resource_fn(player, track, resource, delta);
+        }
+        nlohmann::json out;
+        out["ok"] = true;
+        out["player"] = player;
+        out["track"] = track;
+        out["resource"] = resource;
+        out["delta"] = delta;
+        const std::string body = out.dump();
         std::string header =
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json; charset=utf-8\r\n"
@@ -1073,6 +1149,7 @@ private:
           << "<div class=\"game-legend\">&#128274; " << tf_text("WebLockedWord")
           << " &middot; &#10004; " << tf_text("WebUnlockedWord") << "</div>"
           << "<div class=\"game-hint\">" << tf_text("WebInfluenceHint") << "</div>"
+          << "<div class=\"game-hint\">" << tf_text("WebCostHint") << "</div>"
           << "<div class=\"game-hint\" id=\"autoZones\"></div>"
           << "<div id=\"players\"></div>"
           << "<h2 class=\"game-log-title\">" << tf_text("WebGameLog") << "</h2>"
@@ -1086,8 +1163,22 @@ private:
           << "influencebadge:\"" << tf_text("WebInfluenceBadge") << "\","
           << "pool:\"" << tf_text("WebEvPool") << "\","
           << "ousted:\"" << tf_text("WebEvOusted") << "\","
-          << "revived:\"" << tf_text("WebEvRevived") << "\"};"
+          << "revived:\"" << tf_text("WebEvRevived") << "\","
+          << "poolstat:\"" << tf_text("WebMethuselahPool") << "\","
+          << "cost:\"" << tf_text("WebCostLabel") << "\","
+          << "costpool:\"" << tf_text("WebCostPool") << "\","
+          << "costblood:\"" << tf_text("WebCostBlood") << "\","
+          << "costconv:\"" << tf_text("WebCostConviction") << "\","
+          << "blood:\"" << tf_text("WebBlood") << "\","
+          << "life:\"" << tf_text("WebLife") << "\","
+          << "conviction:\"" << tf_text("WebConviction") << "\","
+          << "costevent:\"" << tf_text("WebEvCost") << "\","
+          << "resourceevent:\"" << tf_text("WebEvResource") << "\"};"
           << "function evFmt(t,c,f,to,cap){return t.split('{card}').join(c||'?').split('{from}').join(f).split('{to}').join(to).split('{cap}').join(cap==null?'?':cap);}"
+          << "async function adjustResource(p,t,r,d){try{await fetch('/api/game/resource?player='+p+'&track='+t+'&resource='+r+'&delta='+d);loadGame();}catch(e){}}"
+          << "function resBadge(p,t,r,label,val){return '<span class=\"badge '+r+'\">'+label+' '+val+"
+          << "' <button class=\"res-btn\" onclick=\"adjustResource('+p+','+t+',\\''+r+'\\',-1)\">-</button>"
+          << "<button class=\"res-btn\" onclick=\"adjustResource('+p+','+t+',\\''+r+'\\',1)\">+</button></span>';}"
           << "async function loadGame(){"
           << "try{"
           << "const r=await fetch('/api/game/status');"
@@ -1103,7 +1194,7 @@ private:
           << "for(const p of data.players){"
           << "html+='<div class=\"game-player'+(p.active?'':' game-out')+'\">';"
           << "html+='<div class=\"game-head\"><span class=\"game-pname\">'+p.name+'</span>';"
-          << "html+='<span class=\"badge pool\">Pool '+p.pool+'</span>';"
+          << "html+='<span class=\"badge pool\">'+I18N.poolstat+' '+p.pool+'</span>';"
           << "html+='<span class=\"badge locked\">&#128274; '+p.locked_count+'</span>';"
           << "html+='<span class=\"badge ready\">&#10004; '+p.unlocked_count+'</span>';"
           << "if(p.crypt_count>0)html+='<span class=\"badge\">'+p.crypt_count+' "
@@ -1115,6 +1206,15 @@ private:
           << "html+='<div class=\"game-minion'+(m.locked?' locked':'')+'\">';"
           << "html+='<span class=\"mi\">'+(m.locked?'&#128274;':'&#10004;')+'</span> '+m.name;"
           << "if(m.capacity)html+=' <span class=\"cap\">'+m.capacity+'</span>';"
+          << "if(m.types&&m.types.length&&!m.capacity)html+=' <span class=\"badge type\">'+m.types.join('/')+'</span>';"
+          << "if(m.blood!==undefined&&m.blood>=0)html+=resBadge(p.index,m.track_id,'blood',I18N.blood,m.blood);"
+          << "if(m.life!==undefined&&m.life>=0)html+=resBadge(p.index,m.track_id,'life',I18N.life,m.life);"
+          << "if(m.conviction!==undefined&&m.conviction>=0)html+=resBadge(p.index,m.track_id,'conviction',I18N.conviction,m.conviction);"
+          << "let costs=[];"
+          << "if(m.pool_cost)costs.push(m.pool_cost+' '+I18N.costpool);"
+          << "if(m.blood_cost)costs.push(m.blood_cost+' '+I18N.costblood);"
+          << "if(m.conviction_cost)costs.push(m.conviction_cost+' '+I18N.costconv);"
+          << "if(costs.length)html+=' <span class=\"badge cost\">'+I18N.cost+': '+costs.join(' + ')+'</span>';"
           << "html+='</div>';"
           << "}"
           << "if(p.minions.length===0)html+='<div class=\"game-empty\">"
@@ -1132,6 +1232,8 @@ private:
           << "else if(e.type==='unlock')msg=evFmt(I18N.unlocked,e.card,0,0);"
           << "else if(e.type==='zone')msg=evFmt(e.to===0?I18N.zoneminion:I18N.zonecrypt,e.card,0,0);"
           << "else if(e.type==='influence')msg=evFmt(I18N.influence,e.card,0,e.to,e.capacity);"
+          << "else if(e.type==='cost')msg=I18N.costevent.split('{card}').join(e.card||'?').split('{amount}').join(e.to);"
+          << "else if(e.type==='resource'){let rn=e.resource==='blood'?I18N.blood:(e.resource==='life'?I18N.life:I18N.conviction);msg=evFmt(I18N.resourceevent,e.card,e.from,e.to).split('{resource}').join(rn);}"
           << "else if(e.type==='pool')msg=evFmt(I18N.pool,'',e.from,e.to);"
           << "else if(e.type==='ousted')msg=I18N.ousted;"
           << "else if(e.type==='revived')msg=evFmt(I18N.revived,'',0,e.to);"
@@ -1331,6 +1433,10 @@ private:
                 for (const auto &t : entry.types)
                     h << "<span class=\"type\">" << typeIconSpan(t)
                       << escapeHtml(t) << "</span>";
+                const std::string costs = costSummary(entry);
+                if (!costs.empty())
+                    h << "<span class=\"type cost\">" << tf_text("WebCostLabel")
+                      << ": " << escapeHtml(costs) << "</span>";
                 h << "</div><div class=\"detail\">";
                 if (!entry.clans.empty()) {
                     h << "Clan: ";
@@ -1524,6 +1630,14 @@ private:
         ".badge.locked{color:#ffd166;border-color:#7a5c00}"
         ".badge.ready{color:#7ee787;border-color:#1f6f2e}"
         ".badge.influence{color:#9cc7ff;border-color:#274b7a}"
+        ".badge.blood{color:#ff9b9b;border-color:#7a1f1f}"
+        ".badge.life{color:#7ee787;border-color:#1f6f2e}"
+        ".badge.conviction{color:#d7b3ff;border-color:#573a7a}"
+        ".badge.cost{color:#ffd166;border-color:#7a5c00}"
+        ".badge.type{color:#a9b7d0;border-color:#2a3f5f;font-size:.72rem}"
+        ".type.cost{background:#3a2a12;color:#ffd166}"
+        ".res-btn{padding:0 4px;margin-left:2px;border:none;border-radius:3px;background:#0f3460;color:#ddd;font-size:.8rem;cursor:pointer}"
+        ".res-btn:hover{background:#1a4a80}"
         ".game-minion{padding:5px 8px;margin:3px 0;border-radius:5px;background:#101f47;color:#ddd;border-left:3px solid #1f6f2e}"
         ".game-minion.locked{border-left-color:#ffd166;background:#2a2413;color:#ffd166}"
         ".game-minion .cap{color:#888;font-size:.85rem}"

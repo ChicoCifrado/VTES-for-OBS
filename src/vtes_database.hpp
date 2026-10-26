@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <sstream>
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
@@ -24,6 +25,28 @@ struct VTESCardRuling {
     std::vector<VTESCardReference> references;
 };
 
+// krcg stores printed costs as numbers or as the string "X". Keep them as
+// strings so the UI can show dynamic costs and the game logic can decide when
+// an amount is safe to charge automatically.
+inline std::string vtesCostString(const nlohmann::json &card, const char *key)
+{
+    if (!card.contains(key) || card[key].is_null())
+        return "";
+    const auto &value = card[key];
+    if (value.is_string())
+        return value.get<std::string>();
+    if (value.is_number_integer())
+        return std::to_string(value.get<long long>());
+    if (value.is_number_unsigned())
+        return std::to_string(value.get<unsigned long long>());
+    if (value.is_number_float()) {
+        std::ostringstream out;
+        out << value.get<double>();
+        return out.str();
+    }
+    return "";
+}
+
 struct VTESCardEntry {
     int id = 0;
     std::string name;
@@ -39,8 +62,18 @@ struct VTESCardEntry {
     std::vector<VTESCardRuling> rulings;
     int capacity = 0;
     int group = 0;
+    // Costes de las cartas de biblioteca. No son capacidad ni coste de
+    // influencia: pool lo paga el Matusalén, sangre el vampiro que juega la
+    // carta y convicción un Imbued.
+    std::string pool_cost;
+    std::string blood_cost;
+    std::string conviction_cost;
 
     bool has_rulings() const { return !rulings.empty(); }
+    bool has_cost() const {
+        return !pool_cost.empty() || !blood_cost.empty() ||
+               !conviction_cost.empty();
+    }
 };
 
 class VTESCardDatabase {
@@ -125,6 +158,10 @@ public:
                         catch (...) {}
                     }
                 }
+
+                entry.pool_cost = vtesCostString(card, "pool_cost");
+                entry.blood_cost = vtesCostString(card, "blood_cost");
+                entry.conviction_cost = vtesCostString(card, "conviction_cost");
 
                 std::string id_str = std::to_string(entry.id);
                 by_id_[id_str] = entry;

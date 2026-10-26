@@ -14,6 +14,7 @@
 #include <opencv2/geometry.hpp>
 #include <opencv2/dnn.hpp>
 #include <cstring>
+#include <cctype>
 
 static constexpr float kPI = 3.14159265358979323846f;
 // ─── Overlay: geometria de referencia ───────────────────────────────────────
@@ -1791,7 +1792,8 @@ static void recordDirectorFeedback(detect_filter_obb *tf, const char *kind,
 static void pushGameEvent(detect_filter_obb *tf, const char *type,
 						  int player_idx, const std::string &card_name,
 						  int from, int to, int64_t now_ns,
-						  int capacity = 0);
+						  int capacity = 0,
+						  const std::string &resource = std::string());
 // Ajusta el pool y gestiona auto-ousted. El llamador debe tener
 // game_state_lock. Devuelve el delta realmente aplicado.
 static int applyPoolDeltaLocked(detect_filter_obb *tf, int player_idx,
@@ -1893,6 +1895,58 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 		std::lock_guard<std::mutex> lock(tf->game_state_lock);
 		applyPoolDeltaLocked(tf, player_idx, delta, now_ns);
 	};
+	tf->web_server->on_minion_resource_fn =
+		[tf](int player_idx, int track_id, const std::string &resource,
+		     int delta) {
+			const auto now_ns =
+				std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now().time_since_epoch())
+					.count();
+			std::lock_guard<std::mutex> lock(tf->game_state_lock);
+			auto it = tf->tracked_cards.find(track_id);
+			if (it == tf->tracked_cards.end() ||
+			    it->second.player_idx != player_idx)
+				return;
+			auto &tc = it->second;
+			if (tc.in_crypt || tc.card_id.empty())
+				return;
+			// No permitir contadores que no correspondan al tipo de carta:
+			// los aliados/retainers tienen vida, no sangre.
+			const VTESCardEntry *entry = tf->vtes_db.get_by_id(tc.card_id);
+			auto has_type = [&](const char *type) {
+				if (!entry)
+					return false;
+				for (const auto &t : entry->types)
+					if (t == type)
+						return true;
+				return false;
+			};
+			int *value = nullptr;
+			if (resource == "blood" && has_type("Vampire"))
+				value = &tc.blood;
+			else if (resource == "life" &&
+				 (has_type("Ally") || has_type("Retainer")))
+				value = &tc.life;
+			else if (resource == "conviction" && has_type("Imbued"))
+				value = &tc.conviction;
+			if (!value)
+				return;
+			const int old_value = *value < 0 ? 0 : *value;
+			int new_value = old_value + delta;
+			if (new_value < 0)
+				new_value = 0;
+			if (new_value > 99)
+				new_value = 99;
+			if (new_value == old_value && *value >= 0)
+				return;
+			*value = new_value;
+			pushGameEvent(tf, "resource", player_idx, tc.card_name,
+				      old_value, new_value, now_ns, 0, resource);
+			obs_log(LOG_INFO,
+				"[Game] Jugador %d: \"%s\" %s = %d (delta %+d)",
+				player_idx + 1, tc.card_name.c_str(),
+				resource.c_str(), new_value, delta);
+		};
 	tf->web_server->get_pool_fn = [tf]() -> std::vector<std::pair<std::string,int>> {
 		std::vector<std::pair<std::string,int>> out;
 		for (int i = 0; i < tf->player_count; i++)
@@ -1926,6 +1980,7 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 					continue;
 				}
 				nlohmann::json mj;
+				mj["track_id"] = tc.track_id;
 				mj["name"] = tc.card_name;
 				mj["card_id"] = tc.card_id;
 				mj["locked"] = (tc.lock_state == filter_data::CardLockState::Locked);
@@ -1936,13 +1991,20 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 				auto cit = tf->card_info_by_id.find(tc.card_id);
 				if (cit != tf->card_info_by_id.end())
 					capacity = cit->second.capacity;
-				if (capacity == 0) {
-					const VTESCardEntry *entry =
-						tf->vtes_db.get_by_id(tc.card_id);
-					if (entry)
-						capacity = entry->capacity;
-				}
+				const VTESCardEntry *entry =
+					tf->vtes_db.get_by_id(tc.card_id);
+				if (capacity == 0 && entry)
+					capacity = entry->capacity;
 				mj["capacity"] = capacity;
+				mj["blood"] = tc.blood;
+				mj["life"] = tc.life;
+				mj["conviction"] = tc.conviction;
+				if (entry) {
+					mj["types"] = entry->types;
+					mj["pool_cost"] = entry->pool_cost;
+					mj["blood_cost"] = entry->blood_cost;
+					mj["conviction_cost"] = entry->conviction_cost;
+				}
 				if (mj["locked"].get<bool>())
 					locked_n++;
 				else
@@ -1990,6 +2052,8 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 			ej["from"] = ev.from;
 			ej["to"] = ev.to;
 			ej["capacity"] = ev.capacity;
+			if (!ev.resource.empty())
+				ej["resource"] = ev.resource;
 			ej["age_ms"] = (now_ns - ev.ts_ns) / 1000000LL;
 			events.push_back(std::move(ej));
 		}
@@ -3254,7 +3318,8 @@ static void recordDirectorFeedback(detect_filter_obb *tf, const char *kind,
 // carta se deduplican 10 s para evitar rafagas si la carta oscila.
 static void pushGameEvent(detect_filter_obb *tf, const char *type,
 			  int player_idx, const std::string &card_name,
-			  int from, int to, int64_t now_ns, int capacity)
+			  int from, int to, int64_t now_ns, int capacity,
+			  const std::string &resource)
 {
 	const std::string type_s = type ? type : "event";
 	if (type_s == "zone" && !card_name.empty()) {
@@ -3274,6 +3339,7 @@ static void pushGameEvent(detect_filter_obb *tf, const char *type,
 	ev.from = from;
 	ev.to = to;
 	ev.capacity = capacity;
+	ev.resource = resource;
 	tf->game_events.push_back(std::move(ev));
 	const size_t max_events = 100;
 	if (tf->game_events.size() > max_events)
@@ -3321,6 +3387,154 @@ static int applyPoolDeltaLocked(detect_filter_obb *tf, int player_idx,
 	return new_pool - old_pool;
 }
 
+// ─── Recursos y costes de cartas de biblioteca ──────────────────────
+//
+// La capacidad de un vampiro no es su sangre actual: al completar la
+// influencia el pool gastado se convierte en la sangre inicial del vampiro.
+// Los aliados/retainers usan vida y los Imbued conviccion. La camara no lee
+// esos contadores; se inicializan con los valores conocidos de la carta y se
+// pueden corregir desde /game.
+static bool cardHasType(const VTESCardEntry *entry, const char *type)
+{
+	if (!entry)
+		return false;
+	for (const auto &t : entry->types)
+		if (t == type)
+			return true;
+	return false;
+}
+
+static int parsePrintedCost(const std::string &value)
+{
+	if (value.empty() || value == "X" || value == "x")
+		return 0;
+	try {
+		size_t used = 0;
+		int cost = std::stoi(value, &used);
+		return used == value.size() ? cost : 0;
+	} catch (...) {
+		return 0;
+	}
+}
+
+// Los aliados y retainers muestran su vida en el texto ("Demon with 4
+// life."). No hay un campo life en vtes.json. Se toma el primer numero que
+// precede a "life"; si el texto usa X, queda desconocido.
+static int parseLifeFromText(const std::string &text)
+{
+	size_t pos = 0;
+	while ((pos = text.find("life", pos)) != std::string::npos) {
+		size_t end = pos;
+		while (end > 0 && std::isspace((unsigned char)text[end - 1]))
+			--end;
+		size_t start = end;
+		while (start > 0 && std::isdigit((unsigned char)text[start - 1]))
+			--start;
+		if (start < end) {
+			try {
+				return std::stoi(text.substr(start, end - start));
+			} catch (...) {
+				return -1;
+			}
+		}
+		pos += 4;
+	}
+	return -1;
+}
+
+// Inicializa los contadores que se pueden conocer al identificar la carta.
+// No cobra nada: la sangre de un vampiro se fija al completar la influencia
+// y la vida de un aliado/retainer es su valor impreso.
+static void initializeTrackedResources(detect_filter_obb *tf,
+				       filter_data::TrackedCardState &tc)
+{
+	if (tc.card_id.empty())
+		return;
+	// Si la identidad del track cambia, los contadores del recurso anterior
+	// ya no son validos. No se resetean al perder la identidad (card_id
+	// vacio): una carta tapada puede recuperar la misma identidad.
+	if (tc.resource_card_id != tc.card_id) {
+		tc.resource_card_id = tc.card_id;
+		tc.blood = -1;
+		tc.life = -1;
+		tc.conviction = -1;
+	}
+
+	const VTESCardEntry *entry = tf->vtes_db.get_by_id(tc.card_id);
+	if (!entry)
+		return;
+
+	if (cardHasType(entry, "Vampire")) {
+		if (tc.blood < 0 && entry->capacity > 0)
+			tc.blood = entry->capacity;
+	} else if (cardHasType(entry, "Ally") ||
+		   cardHasType(entry, "Retainer")) {
+		if (tc.life < 0) {
+			const int life = parseLifeFromText(entry->card_text);
+			if (life >= 0)
+				tc.life = life;
+		}
+	}
+}
+
+// Cobra automaticamente solo el coste en pool de cartas de biblioteca
+// permanentes (Master, Equipment, Ally, Retainer). Es el unico caso en el
+// que el pagador es inequivoco: el Matusalén. Los costes en sangre,
+// conviccion y X quedan para ajuste manual porque dependen del minion que
+// juega la carta o de una cantidad variable.
+static void maybeChargeLibraryPoolCost(detect_filter_obb *tf,
+				       filter_data::TrackedCardState &tc,
+				       int64_t now_ns)
+{
+	if (tc.player_idx < 0 || tc.in_crypt || tc.card_id.empty())
+		return;
+	if (tc.library_pool_cost_paid &&
+	    tc.library_pool_cost_paid_id == tc.card_id)
+		return;
+
+	const VTESCardEntry *entry = tf->vtes_db.get_by_id(tc.card_id);
+	if (!entry)
+		return;
+	const bool permanent =
+		cardHasType(entry, "Master") || cardHasType(entry, "Equipment") ||
+		cardHasType(entry, "Ally") || cardHasType(entry, "Retainer");
+	if (!permanent)
+		return;
+
+	const int cost = parsePrintedCost(entry->pool_cost);
+	if (cost <= 0)
+		return;
+
+	// SORT puede crear un track nuevo para la misma carta fisica. Durante
+	// unos segundos se recuerda el cobro por jugador+carta para no descontar
+	// dos veces el pool si el track se recrea o la carta se mueve. Dos copias
+	// iguales jugadas en ese margen se pueden ajustar a mano desde /pool; es
+	// preferible a un doble cobro silencioso.
+	const std::string cost_key =
+		std::to_string(tc.player_idx) + "|" + tc.card_id;
+	auto memo = tf->library_cost_memory.find(cost_key);
+	if (memo != tf->library_cost_memory.end() &&
+	    now_ns - memo->second < 8000000000LL) {
+		tc.library_pool_cost_paid = true;
+		tc.library_pool_cost_paid_id = tc.card_id;
+		return;
+	}
+
+	// Marcar antes de aplicar: applyPoolDeltaLocked puede generar eventos y
+	// no queremos volver a entrar en este camino en el mismo frame.
+	tc.library_pool_cost_paid = true;
+	tc.library_pool_cost_paid_id = tc.card_id;
+	tf->library_cost_memory[cost_key] = now_ns;
+	const int applied = applyPoolDeltaLocked(tf, tc.player_idx, -cost, now_ns);
+	if (applied != 0) {
+		pushGameEvent(tf, "cost", tc.player_idx, tc.card_name, 0,
+			      -applied, now_ns, 0, "pool");
+		obs_log(LOG_INFO,
+			"[Game] Jugador %d: coste de biblioteca \"%s\" = %d pool",
+			tc.player_idx + 1, tc.card_name.c_str(), -applied);
+	}
+}
+
 // Heuristica de influencia: la camara no puede leer la sangre acumulada
 // sobre la carta, pero si puede seguir la carta fisica y ver cuando pasa
 // de la cripta a la zona minion. Se guardan dos claves:
@@ -3331,7 +3545,7 @@ static int applyPoolDeltaLocked(detect_filter_obb *tf, int player_idx,
 // influencia completa. No se descuenta nada por una carta que ya aparece
 // en minion sin haber sido vista antes en la cripta.
 static void updateInfluenceHeuristic(detect_filter_obb *tf,
-				     const filter_data::TrackedCardState &tc,
+				     filter_data::TrackedCardState &tc,
 				     int player_idx, bool in_crypt,
 				     int64_t now_ns)
 {
@@ -3418,6 +3632,10 @@ static void updateInfluenceHeuristic(detect_filter_obb *tf,
 		applyPoolDeltaLocked(tf, player_idx, -capacity, now_ns);
 	pl.influence_count++;
 	pl.influence_cost += charged < 0 ? -charged : 0;
+	// La influencia completa convierte el pool gastado en la sangre con la
+	// que entra el vampiro. La camara no puede leer contadores posteriores;
+	// este es el valor inicial conocido y se puede corregir en /game.
+	tc.blood = capacity;
 	mark_influenced(track_key);
 	mark_influenced(card_key);
 
@@ -4276,8 +4494,10 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				PlayerZoneHit zone = resolvePlayerZone(tf, tc.last_position, fw, fh);
 				tc.player_idx = zone.player_idx;
 				tc.in_crypt = zone.in_crypt;
+				initializeTrackedResources(tf, tc);
 				updateInfluenceHeuristic(tf, tc, zone.player_idx,
 							 zone.in_crypt, now_ns);
+				maybeChargeLibraryPoolCost(tf, tc, now_ns);
 
 				tf->tracked_cards[obj.id] = std::move(tc);
 			} else {
@@ -4332,6 +4552,8 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				// frame, incluso cuando SORT ha cambiado el track_id.
 				updateInfluenceHeuristic(tf, tc, tc.player_idx,
 							 tc.in_crypt, now_ns);
+				initializeTrackedResources(tf, tc);
+				maybeChargeLibraryPoolCost(tf, tc, now_ns);
 
 				// ── Estado de giro: evaluación continua (una carta puede
 				//    girarse/enderezarse en cualquier momento) y relativa a

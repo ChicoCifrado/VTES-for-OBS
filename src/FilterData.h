@@ -263,12 +263,13 @@ struct filter_data {
 	// --- Registro de eventos de partida (historial para la web) ---
 	struct GameEvent {
 		int64_t ts_ns = 0;
-		std::string type; // lock | unlock | zone | influence | pool | ousted | revived
+		std::string type; // lock | unlock | zone | influence | pool | ousted | revived | cost | resource
 		int player_idx = -1;
 		std::string card_name;
 		int from = 0;     // pool anterior / zona: 1 cripta, 0 minion
 		int to = 0;       // pool nuevo / zona; influence: pool gastado
 		int capacity = 0; // influencia inferida: capacidad de la carta
+		std::string resource; // blood | life | conviction (eventos de recurso)
 	};
 	std::deque<GameEvent> game_events; // max 100; el mas reciente al final
 
@@ -370,6 +371,21 @@ struct filter_data {
 		int  player_idx = -1;   // -1 = unassigned
 		bool in_crypt   = false; // false = minion zone
 
+		// Recursos del minion. La camara no puede leer los contadores, asi
+		// que se inicializan con el valor conocido de la carta y se ajustan
+		// a mano desde /game. -1 = desconocido/no aplica.
+		int blood = -1;      // vampire: sangre actual (capacidad al influir)
+		int life = -1;       // ally/retainer: vida
+		int conviction = -1; // Imbued: conviccion
+		std::string resource_card_id; // identidad a la que pertenecen esos valores
+
+		// Evita cobrar dos veces el coste en pool de una carta de
+		// biblioteca que permanece en la mesa con el mismo track. Los
+		// costes en sangre/vida se ajustan aparte porque la camara no
+		// sabe que vampiro paga.
+		bool library_pool_cost_paid = false;
+		std::string library_pool_cost_paid_id;
+
 		// Lifecycle
 		cv::Point2f last_position;
 		int64_t     last_seen_ns  = 0;
@@ -406,6 +422,10 @@ struct filter_data {
 	std::unordered_map<int, TrackedCardState> tracked_cards;
 	// Historial cripta/minion por carta, independiente del track_id.
 	std::unordered_map<std::string, InfluenceMemory> influence_memory;
+	// Anti-duplicado del coste de biblioteca: SORT puede cambiar el track_id
+	// de una carta que sigue en la mesa. Se recuerda el ultimo cobro por
+	// jugador+carta durante unos segundos para no descontar dos veces el pool.
+	std::unordered_map<std::string, int64_t> library_cost_memory;
 	std::mutex                                game_state_lock;
 
 	// Overlay background (loaded from data/obs-plugins/…/overlay-bg.png)
