@@ -13,6 +13,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/geometry.hpp>
 #include <opencv2/dnn.hpp>
+#include <algorithm>
 #include <cstring>
 #include <cctype>
 
@@ -116,6 +117,30 @@ struct detect_filter_obb : public filter_data {};
 // mucho antes de la implementación que está junto al video tick.
 static int activeAutoZonePlayers(const detect_filter_obb *tf);
 static int committedAutoZonePlayers(const detect_filter_obb *tf);
+
+// Resultado del encuadre calculado por el modo inicializacion. Guarda los
+// valores en el mismo formato que los ajustes del filtro (zoom en % y
+// desplazamientos en pixeles de diseno).
+struct SetupCameraFit {
+	bool   ok = false;
+	double zoom_percent = 100.0;
+	int    off_x = 0;
+	int    off_y = 0;
+	bool   full_frame = false;
+	int    frame_w = 0;
+	int    frame_h = 0;
+};
+
+static SetupCameraFit calculateSetupCameraFit(
+	detect_filter_obb *tf,
+	const std::vector<filter_data::AutoZoneView> &views,
+	bool full_frame);
+static nlohmann::json setupStatusJson(detect_filter_obb *tf);
+static bool loadZoneQuadString(const std::string &str,
+			       filter_data::PlayerZone &z);
+static nlohmann::json setupActionJson(detect_filter_obb *tf,
+				      const std::string &action,
+				      const std::string &query);
 
 // El OCR necesita bastantes pixeles por letra para ser fiable. En una mesa de
 // juego la carta completa suele ocupar 50-150 px de alto y el nombre queda en
@@ -917,6 +942,7 @@ const char *tf_property_key(const char *name)
 		{"detection_interval_seconds", "DetectionInterval"},
 		{"rulings_scroll", "RulingsScroll"},
 		{"click_to_overlay", "ClickToOverlay"},
+		{"setup_btn", "OpenSetup"},
 		{"card_search_btn", "OpenCardSearch"},
 		{"player_count", "PlayerCount"},
 		{"show_zones", "ShowZones"},
@@ -1048,6 +1074,38 @@ void tf_refresh_property_labels(obs_properties_t *properties)
 
 } // namespace
 
+// Abre una pagina del servidor web del filtro, arrancandolo si hace falta.
+// Se usa tanto para la busqueda de cartas como para el modo inicializacion.
+static void openWebServerPage(detect_filter_obb *tf, const std::string &path)
+{
+	if (!tf)
+		return;
+	if (!tf->web_server || !tf->web_server->is_running()) {
+		tf->web_server = std::make_unique<WebServer>();
+		tf->web_server->start(tf->web_server_port, &tf->vtes_db);
+	}
+	if (!tf->web_server || !tf->web_server->is_running())
+		return;
+
+	std::string url = "http://localhost:" +
+			  std::to_string(tf->web_server->port()) + path;
+#ifdef _WIN32
+	int len = MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, nullptr, 0);
+	if (len <= 0)
+		return;
+	std::wstring wurl(len, L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, &wurl[0], len);
+	HINSTANCE result = ShellExecuteW(NULL, L"open", wurl.c_str(), NULL, NULL,
+					SW_SHOWNORMAL);
+	if ((INT_PTR)result <= 32)
+		obs_log(LOG_WARNING, "Failed to open browser (error %d)",
+			(INT_PTR)result);
+#else
+	std::string cmd = "xdg-open " + url;
+	std::thread([cmd]() { system(cmd.c_str()); }).detach();
+#endif
+}
+
 const char *detect_filter_obb_getname(void *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -1122,30 +1180,16 @@ obs_properties_t *detect_filter_obb_properties(void *data)
 	// OBS 32 marca obs_properties_add_button como desusado: button2 con priv
 	// nullptr es identico (si priv es nulo, el callback recibe el data de la
 	// fuente, que es lo que hacia la version antigua).
+	obs_properties_add_button2(props, "setup_btn", tf_text("OpenSetup"),
+		[](obs_properties_t *, obs_property_t *, void *data) {
+			openWebServerPage(
+				reinterpret_cast<detect_filter_obb *>(data), "/setup");
+			return true;
+		}, nullptr);
 	obs_properties_add_button2(props, "card_search_btn", tf_text("OpenCardSearch"),
 		[](obs_properties_t *, obs_property_t *, void *data) {
-			struct detect_filter_obb *tf = reinterpret_cast<detect_filter_obb *>(data);
-			if (!tf->web_server || !tf->web_server->is_running()) {
-				tf->web_server = std::make_unique<WebServer>();
-				tf->web_server->start(tf->web_server_port, &tf->vtes_db);
-			}
-			if (tf->web_server && tf->web_server->is_running()) {
-				std::string url = "http://localhost:" + std::to_string(tf->web_server->port());
-#ifdef _WIN32
-				int len = MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, nullptr, 0);
-				if (len > 0) {
-					std::wstring wurl(len, L'\0');
-					MultiByteToWideChar(CP_UTF8, 0, url.c_str(), -1, &wurl[0], len);
-					HINSTANCE result = ShellExecuteW(NULL, L"open", wurl.c_str(), NULL, NULL, SW_SHOWNORMAL);
-					if ((INT_PTR)result <= 32) {
-						obs_log(LOG_WARNING, "Failed to open browser (error %d)", (INT_PTR)result);
-					}
-				}
-#else
-				std::string cmd = "xdg-open " + url;
-				std::thread([cmd]() { system(cmd.c_str()); }).detach();
-#endif
-			}
+			openWebServerPage(
+				reinterpret_cast<detect_filter_obb *>(data), "/");
 			return true;
 		}, nullptr);
 
@@ -1260,8 +1304,9 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 
 	// Game state defaults
 	obs_data_set_default_int(settings, "player_count", 5);
-	obs_data_set_default_bool(settings, "show_zones", true);
+	obs_data_set_default_bool(settings, "show_zones", false);
 	obs_data_set_default_bool(settings, "auto_zones", false);
+	obs_data_set_default_bool(settings, "setup_done", false);
 	obs_data_set_default_bool(settings, "big_card", false);
 	obs_data_set_default_string(settings, "overlay_font", "cinzel");
 	obs_data_set_default_bool(settings, "cam_full_frame", false);
@@ -1379,6 +1424,7 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 		const bool count_changed = (new_count != tf->player_count);
 		tf->player_count = new_count;
 		tf->show_zones = obs_data_get_bool(settings, "show_zones");
+		tf->setup_done = obs_data_get_bool(settings, "setup_done");
 		tf->big_card = obs_data_get_bool(settings, "big_card");
 
 		// La detección automática se reinicia al activarla/desactivarla o
@@ -1448,6 +1494,16 @@ void detect_filter_obb_update(void *data, obs_data_t *settings)
 				tf->players[i].crypt_zone.nh = (float)obs_data_get_double(settings, (p + "_crypt_h").c_str());
 				tf->players[i].minion_zone.angle = (float)obs_data_get_int(settings, (p + "_minion_angle").c_str());
 				tf->players[i].crypt_zone.angle = (float)obs_data_get_int(settings, (p + "_crypt_angle").c_str());
+				tf->players[i].minion_zone.quad = false;
+				tf->players[i].crypt_zone.quad = false;
+				loadZoneQuadString(
+					obs_data_get_string(settings,
+						(p + "_minion_quad").c_str()),
+					tf->players[i].minion_zone);
+				loadZoneQuadString(
+					obs_data_get_string(settings,
+						(p + "_crypt_quad").c_str()),
+					tf->players[i].crypt_zone);
 				tf->players[i].minion_zone.lock_angle = tf->players[i].minion_zone.angle;
 				tf->players[i].crypt_zone.lock_angle = tf->players[i].crypt_zone.angle;
 				if (!tf->auto_zones) {
@@ -2062,6 +2118,16 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 		return out;
 	};
 
+	// Modo inicializacion: la web consulta el estado y envia acciones.
+	tf->web_server->get_setup_fn = [tf]() -> nlohmann::json {
+		return setupStatusJson(tf);
+	};
+	tf->web_server->on_setup_action_fn =
+		[tf](const std::string &action, const std::string &query)
+			-> nlohmann::json {
+		return setupActionJson(tf, action, query);
+	};
+
 	// Carpeta de datos de feedback del realizador (entrenamiento futuro),
 	// bajo la config del plugin: .../plugin_config/vtes-card-scanner/feedback
 	{
@@ -2171,7 +2237,9 @@ void *detect_filter_obb_create(obs_data_t *settings, obs_source_t *source)
 #ifdef _WIN32
 			std::string msg = std::string(tf_text("PopupAdded")) + "\n\n" +
 				tf_text("PopupServer") + " http://localhost:" +
-				std::to_string(tf->web_server_port) + "\n\n" +
+				std::to_string(tf->web_server_port) + "\n" +
+				tf_text("PopupSetup") + " http://localhost:" +
+				std::to_string(tf->web_server_port) + "/setup\n\n" +
 				tf_text("PopupSearch") + "\n" +
 				tf_text("PopupAlwaysActive") + "\n" +
 				tf_text("PopupInterval") + "\n" +
@@ -2968,6 +3036,52 @@ static void drawCardIconRow(cv::Mat& img, const std::vector<VtesIcon>& icons,
 // Una carta está "girada" (tapped) cuando su ángulo difiere ~90° del de
 // la zona minion de su jugador. Las cartas de la cripta no se giran.
 
+// Devuelve las cuatro esquinas normalizadas de una zona en orden
+// TL, TR, BR, BL. Para las zonas rectangulares se reconstruyen con el mismo
+// giro que usa la asignacion de cartas; para las zonas con perspectiva se
+// usan los puntos guardados.
+static bool playerZoneCorners(const filter_data::PlayerZone &z,
+			      cv::Point2f out[4])
+{
+	if (z.quad) {
+		for (int i = 0; i < 4; i++)
+			out[i] = z.corners[i];
+		return true;
+	}
+	if (z.nw <= 0.0f || z.nh <= 0.0f)
+		return false;
+
+	const float cx = z.nx + z.nw * 0.5f;
+	const float cy = z.ny + z.nh * 0.5f;
+	const float hw = z.nw * 0.5f;
+	const float hh = z.nh * 0.5f;
+	const float ra = z.angle * kPI / 180.0f;
+	const float ca = std::cos(ra), sa = std::sin(ra);
+	const float lx[4] = {-hw, hw, hw, -hw};
+	const float ly[4] = {-hh, -hh, hh, hh};
+	for (int i = 0; i < 4; i++) {
+		out[i].x = cx + ca * lx[i] - sa * ly[i];
+		out[i].y = cy + sa * lx[i] + ca * ly[i];
+	}
+	return true;
+}
+
+static bool playerZoneBounds(const filter_data::PlayerZone &z, cv::Rect2f &out)
+{
+	cv::Point2f p[4];
+	if (!playerZoneCorners(z, p))
+		return false;
+	float x0 = p[0].x, y0 = p[0].y, x1 = p[0].x, y1 = p[0].y;
+	for (int i = 1; i < 4; i++) {
+		x0 = std::min(x0, p[i].x);
+		y0 = std::min(y0, p[i].y);
+		x1 = std::max(x1, p[i].x);
+		y1 = std::max(y1, p[i].y);
+	}
+	out = cv::Rect2f(x0, y0, x1 - x0, y1 - y0);
+	return out.width > 0.0f && out.height > 0.0f;
+}
+
 struct PlayerZoneHit {
 	int  player_idx = -1; // -1 = fuera de toda zona
 	bool in_crypt   = false;
@@ -2988,24 +3102,73 @@ static PlayerZoneHit resolvePlayerZone(const struct detect_filter_obb *tf,
 	// vecino por orden de índice.
 	auto checkZone = [&](const filter_data::PlayerZone &z, bool crypt,
 			     int player_idx) {
-		const float zw = z.nw * fw, zh = z.nh * fh;
+		cv::Point2f corners[4];
+		if (!playerZoneCorners(z, corners))
+			return false;
+
+		float zx, zy, zw, zh;
+		if (z.quad) {
+			float zx1 = corners[0].x * fw;
+			float zy1 = corners[0].y * fh;
+			zx = zx1;
+			zy = zy1;
+			for (int i = 1; i < 4; i++) {
+				const float px = corners[i].x * fw;
+				const float py = corners[i].y * fh;
+				zx = std::min(zx, px);
+				zy = std::min(zy, py);
+				zx1 = std::max(zx1, px);
+				zy1 = std::max(zy1, py);
+			}
+			zw = zx1 - zx;
+			zh = zy1 - zy;
+		} else {
+			zx = z.nx * fw;
+			zy = z.ny * fh;
+			zw = z.nw * fw;
+			zh = z.nh * fh;
+		}
 		if (zw <= 0.0f || zh <= 0.0f)
 			return false;
-		const float zx = z.nx * fw, zy = z.ny * fh;
-		float dx = c.x - (zx + zw * 0.5f);
-		float dy = c.y - (zy + zh * 0.5f);
-		if (z.angle != 0.0f) {
-			// Zona rotada (positivo = horario): se pasa el punto
-			// al sistema de la zona aplicando el giro inverso.
-			const float ra = z.angle * kPI / 180.0f;
-			const float ca = std::cos(ra), sa = std::sin(ra);
-			const float rx = ca * dx + sa * dy;
-			const float ry = -sa * dx + ca * dy;
-			dx = rx;
-			dy = ry;
+
+		// Para un cuadrilatero, el centro de la caja envolvente puede
+		// quedar desplazado respecto al centro real. La media de las
+		// esquinas es una referencia mejor para decidir que zona contiene
+		// la carta cuando varias se solapan.
+		cv::Point2f zc(zx + zw * 0.5f, zy + zh * 0.5f);
+		if (z.quad) {
+			zc = cv::Point2f(0.0f, 0.0f);
+			for (int i = 0; i < 4; i++)
+				zc += cv::Point2f(corners[i].x * fw,
+						  corners[i].y * fh);
+			zc *= 0.25f;
 		}
-		if (std::fabs(dx) > zw * 0.5f || std::fabs(dy) > zh * 0.5f)
-			return false;
+		float dx = c.x - zc.x;
+		float dy = c.y - zc.y;
+		if (z.quad) {
+			std::vector<cv::Point2f> poly;
+			poly.reserve(4);
+			for (int i = 0; i < 4; i++)
+				poly.emplace_back(corners[i].x * fw,
+						  corners[i].y * fh);
+			if (cv::pointPolygonTest(poly, c, false) < 0.0)
+				return false;
+		} else {
+			if (z.angle != 0.0f) {
+				// Zona rotada (positivo = horario): se pasa el
+				// punto al sistema de la zona aplicando el giro
+				// inverso.
+				const float ra = z.angle * kPI / 180.0f;
+				const float ca = std::cos(ra), sa = std::sin(ra);
+				const float rx = ca * dx + sa * dy;
+				const float ry = -sa * dx + ca * dy;
+				dx = rx;
+				dy = ry;
+			}
+			if (std::fabs(dx) > zw * 0.5f ||
+			    std::fabs(dy) > zh * 0.5f)
+				return false;
+		}
 		// Distancia normalizada por el tamaño de la zona: 0 en el centro
 		// y 1 en el borde. Favorece la zona más pequeña y específica.
 		const float nx = dx / (zw * 0.5f);
@@ -3678,6 +3841,179 @@ static filter_data::PlayerZone playerZoneFromRect(
 	return z;
 }
 
+static filter_data::PlayerZone playerZoneFromQuad(
+	const cv::Point2f corners[4], float lock_angle)
+{
+	filter_data::PlayerZone z;
+	z.quad = true;
+	float x0 = corners[0].x, y0 = corners[0].y;
+	float x1 = x0, y1 = y0;
+	for (int i = 0; i < 4; i++) {
+		z.corners[i] = corners[i];
+		x0 = std::min(x0, corners[i].x);
+		y0 = std::min(y0, corners[i].y);
+		x1 = std::max(x1, corners[i].x);
+		y1 = std::max(y1, corners[i].y);
+	}
+	z.nx = x0;
+	z.ny = y0;
+	z.nw = std::max(0.0f, x1 - x0);
+	z.nh = std::max(0.0f, y1 - y0);
+	z.angle = 0.0f;
+	z.lock_angle = lock_angle;
+	return z;
+}
+
+// ─── Perspectiva global del conjunto de zonas ────────────────────────
+// La mesa se modela como un cuadrilatero normalizado. `source` es el
+// rectangulo que envuelve las zonas detectadas y `base` el cuadrilatero que
+// dibuja el operador; `size` y `angle` se aplican despues alrededor de su
+// centro. Las zonas se transforman con una homografia source -> target.
+
+static bool setupPerspectiveBounds(
+	const std::vector<filter_data::AutoZoneView> &views, cv::Point2f out[4])
+{
+	float x0 = 1.0f, y0 = 1.0f, x1 = 0.0f, y1 = 0.0f;
+	bool any = false;
+	for (const auto &v : views) {
+		for (const auto *z : {&v.crypt, &v.minion}) {
+			cv::Point2f p[4];
+			if (!playerZoneCorners(*z, p))
+				continue;
+			for (int i = 0; i < 4; i++) {
+				x0 = std::min(x0, p[i].x);
+				y0 = std::min(y0, p[i].y);
+				x1 = std::max(x1, p[i].x);
+				y1 = std::max(y1, p[i].y);
+				any = true;
+			}
+		}
+	}
+	if (!any || x1 - x0 < 0.01f || y1 - y0 < 0.01f)
+		return false;
+	out[0] = cv::Point2f(x0, y0);
+	out[1] = cv::Point2f(x1, y0);
+	out[2] = cv::Point2f(x1, y1);
+	out[3] = cv::Point2f(x0, y1);
+	return true;
+}
+
+static void setupPerspectiveInit(
+	detect_filter_obb *tf,
+	const std::vector<filter_data::AutoZoneView> &views)
+{
+	cv::Point2f source[4];
+	if (!setupPerspectiveBounds(views, source))
+		return;
+	std::lock_guard<std::mutex> lock(tf->setup_perspective_lock);
+	if (tf->setup_perspective.active)
+		return;
+	tf->setup_perspective.active = true;
+	for (int i = 0; i < 4; i++) {
+		tf->setup_perspective.source[i] = source[i];
+		tf->setup_perspective.base[i] = source[i];
+	}
+	tf->setup_perspective.size = 1.0f;
+	tf->setup_perspective.angle = 0.0f;
+}
+
+static void setupPerspectiveReset(detect_filter_obb *tf)
+{
+	std::lock_guard<std::mutex> lock(tf->setup_perspective_lock);
+	tf->setup_perspective.active = false;
+	tf->setup_perspective.size = 1.0f;
+	tf->setup_perspective.angle = 0.0f;
+	for (int i = 0; i < 4; i++) {
+		tf->setup_perspective.source[i] = cv::Point2f();
+		tf->setup_perspective.base[i] = cv::Point2f();
+	}
+}
+
+static void setupPerspectiveTargetLocked(
+	const filter_data::SetupPerspective &p, cv::Point2f out[4])
+{
+	cv::Point2f c(0.0f, 0.0f);
+	for (int i = 0; i < 4; i++)
+		c += p.base[i] * 0.25f;
+	const float ra = p.angle * kPI / 180.0f;
+	const float ca = std::cos(ra), sa = std::sin(ra);
+	for (int i = 0; i < 4; i++) {
+		const float dx = p.base[i].x - c.x;
+		const float dy = p.base[i].y - c.y;
+		out[i].x = c.x + (ca * dx - sa * dy) * p.size;
+		out[i].y = c.y + (sa * dx + ca * dy) * p.size;
+		out[i].x = std::max(0.0f, std::min(1.0f, out[i].x));
+		out[i].y = std::max(0.0f, std::min(1.0f, out[i].y));
+	}
+}
+
+static bool setupPerspectiveGet(
+	detect_filter_obb *tf, cv::Point2f source[4], cv::Point2f target[4])
+{
+	std::lock_guard<std::mutex> lock(tf->setup_perspective_lock);
+	if (!tf->setup_perspective.active)
+		return false;
+	for (int i = 0; i < 4; i++)
+		source[i] = tf->setup_perspective.source[i];
+	setupPerspectiveTargetLocked(tf->setup_perspective, target);
+	return true;
+}
+
+static cv::Mat setupPerspectiveHomography(detect_filter_obb *tf)
+{
+	cv::Point2f source[4], target[4];
+	if (!setupPerspectiveGet(tf, source, target))
+		return {};
+	std::vector<cv::Point2f> src(source, source + 4);
+	std::vector<cv::Point2f> dst(target, target + 4);
+	cv::Mat h = cv::getPerspectiveTransform(src, dst);
+	if (h.empty())
+		return {};
+	const cv::Mat identity = cv::Mat::eye(3, 3, CV_64F);
+	if (cv::norm(h, identity, cv::NORM_INF) < 1e-6)
+		return {};
+	return h;
+}
+
+static cv::Point2f perspectiveApply(const cv::Mat &h, cv::Point2f p)
+{
+	const double w = h.at<double>(2, 0) * p.x +
+			 h.at<double>(2, 1) * p.y + h.at<double>(2, 2);
+	if (std::fabs(w) < 1e-9)
+		return p;
+	const double x = (h.at<double>(0, 0) * p.x +
+			  h.at<double>(0, 1) * p.y + h.at<double>(0, 2)) / w;
+	const double y = (h.at<double>(1, 0) * p.x +
+			  h.at<double>(1, 1) * p.y + h.at<double>(1, 2)) / w;
+	return cv::Point2f((float)x, (float)y);
+}
+
+static filter_data::PlayerZone setupPerspectiveWarpZone(
+	const filter_data::PlayerZone &z, const cv::Mat &h)
+{
+	cv::Point2f in[4], out[4];
+	if (!playerZoneCorners(z, in))
+		return z;
+	for (int i = 0; i < 4; i++)
+		out[i] = perspectiveApply(h, in[i]);
+	filter_data::PlayerZone q = playerZoneFromQuad(out, z.lock_angle);
+	q.angle = z.angle;
+	return q;
+}
+
+static void setupPerspectiveWarpViews(
+	detect_filter_obb *tf,
+	std::vector<filter_data::AutoZoneView> &views)
+{
+	const cv::Mat h = setupPerspectiveHomography(tf);
+	if (h.empty())
+		return;
+	for (auto &v : views) {
+		v.crypt = setupPerspectiveWarpZone(v.crypt, h);
+		v.minion = setupPerspectiveWarpZone(v.minion, h);
+	}
+}
+
 static int activeAutoZonePlayers(const detect_filter_obb *tf)
 {
 	int n = 0;
@@ -3844,29 +4180,93 @@ static bool autoZoneNearCommitted(
 		const filter_data::PlayerState &pl = tf->players[i];
 		if (!pl.active || !pl.auto_zone)
 			continue;
-		const cv::Point2f zc(
-			(pl.crypt_zone.nx + pl.crypt_zone.nw * 0.5f) * frame.width,
-			(pl.crypt_zone.ny + pl.crypt_zone.nh * 0.5f) * frame.height);
-		const float span = std::max(pl.crypt_zone.nw * frame.width,
-					    pl.crypt_zone.nh * frame.height);
+		cv::Rect2f b;
+		if (!playerZoneBounds(pl.crypt_zone, b))
+			continue;
+		const cv::Point2f zc((b.x + b.width * 0.5f) * frame.width,
+				     (b.y + b.height * 0.5f) * frame.height);
+		const float span = std::max(b.width * frame.width,
+					    b.height * frame.height);
 		if (cv::norm(center - zc) < 0.55f * span)
 			return true;
 	}
 	return false;
 }
 
+// Construye la lista ordenada de zonas para el asistente. A diferencia de
+// las zonas automaticas normales, no toca players[] ni asigna cartas: solo
+// prepara la propuesta que el operador revisara y guardara.
+static void updateSetupViews(
+	detect_filter_obb *tf,
+	const std::vector<vtes_detection::AutoZoneCluster> &stable,
+	const AutoZoneLayout &layout, const cv::Size &frame)
+{
+	std::vector<vtes_detection::AutoZoneCluster> ordered = stable;
+	sortAutoZoneClusters(ordered, layout);
+
+	int expected = tf->setup_expected.load();
+	if (expected <= 0)
+		expected = tf->player_count;
+	expected = std::max(1, std::min(expected, filter_data::MAX_PLAYERS));
+
+	std::vector<int> slots;
+	for (int i = 0; i < expected; i++)
+		slots.push_back(i);
+
+	std::vector<filter_data::AutoZoneView> views;
+	views.reserve(ordered.size());
+	for (size_t i = 0; i < ordered.size() && i < slots.size(); ++i) {
+		const auto &c = ordered[i];
+		vtes_detection::AutoZoneGeometry g =
+			vtes_detection::AutoZoneDetector::deriveGeometry(
+				c, layout.table_center, frame, layout.line_layout);
+		if (!g.valid)
+			continue;
+
+		filter_data::AutoZoneView v;
+		v.crypt = playerZoneFromRect(g.crypt, frame, g.lock_angle_deg);
+		v.minion = playerZoneFromRect(g.minion, frame, g.lock_angle_deg);
+		v.stable = c.stable;
+		v.card_count = (int)c.cards.size();
+		v.score = c.score;
+		v.player_idx = slots[i];
+		views.push_back(std::move(v));
+	}
+
+	const bool ready = views.size() >= slots.size();
+	const size_t view_count = views.size();
+	if (ready)
+		setupPerspectiveInit(tf, views);
+	{
+		std::lock_guard<std::mutex> lock(tf->auto_zone_view_lock);
+		tf->auto_zone_views = std::move(views);
+	}
+	tf->setup_ready.store(ready);
+	if (ready) {
+		obs_log(LOG_INFO, "[Setup] Zonas listas: %zu/%d",
+			view_count, (int)slots.size());
+	}
+}
+
 static void runAutoZoneDetection(detect_filter_obb *tf,
 				 const cv::Mat &bgra, int64_t now_ns)
 {
-	if (!tf->auto_zones)
+	if (!tf->auto_zones && !tf->setup_mode)
 		return;
 
 	std::lock_guard<std::mutex> auto_lock(tf->auto_zone_lock);
 	if (!tf->auto_zone_detector)
 		return;
+	if (tf->setup_mode && tf->setup_ready)
+		return;
 
 	int expected = 0;
-	{
+	if (tf->setup_mode) {
+		expected = tf->setup_expected.load();
+		if (expected <= 0)
+			expected = tf->player_count;
+		expected = std::max(1, std::min(expected, filter_data::MAX_PLAYERS));
+	} else {
 		std::lock_guard<std::mutex> lock(tf->game_state_lock);
 		expected = activeAutoZonePlayers(tf);
 		if (expected <= 0)
@@ -3908,6 +4308,24 @@ static void runAutoZoneDetection(detect_filter_obb *tf,
 		if (c.stable)
 			stable.push_back(c);
 	AutoZoneLayout layout = computeAutoZoneLayout(stable, bgr.size());
+
+	if (tf->setup_mode) {
+		// En inicializacion no se confirma nada automaticamente. Se
+		// muestran las propuestas y, cuando estan todas y han pasado unos
+		// segundos para que el operador coloque los grupos, se ordenan por
+		// asiento y se dejan listas para revisar.
+		const bool settle_done =
+			tf->setup_started_ns.load() > 0 &&
+			now_ns - tf->setup_started_ns.load() >= 1500000000LL;
+		if ((int)stable.size() < expected || !settle_done) {
+			updateAutoZoneViews(tf, clusters, layout, bgr.size());
+			tf->setup_ready.store(false);
+			return;
+		}
+
+		updateSetupViews(tf, stable, layout, bgr.size());
+		return;
+	}
 
 	int committed = 0;
 	{
@@ -4018,6 +4436,571 @@ static void runAutoZoneDetection(detect_filter_obb *tf,
 	}
 }
 
+// ─── Modo inicializacion: estado y acciones ─────────────────────────
+
+static nlohmann::json setupZoneJson(const filter_data::PlayerZone &z)
+{
+	nlohmann::json quad = nlohmann::json::array();
+	if (z.quad) {
+		for (int i = 0; i < 4; i++)
+			quad.push_back({z.corners[i].x, z.corners[i].y});
+	}
+	return {
+		{"x", z.nx}, {"y", z.ny}, {"w", z.nw}, {"h", z.nh},
+		{"angle", z.angle},
+		{"quad", std::move(quad)}
+	};
+}
+
+static nlohmann::json setupCameraJson(const detect_filter_obb *tf)
+{
+	return {
+		{"zoom", tf->cam_zoom * 100.0},
+		{"offset_x", tf->cam_off_x},
+		{"offset_y", tf->cam_off_y},
+		{"full_frame", tf->cam_full_frame}
+	};
+}
+
+static nlohmann::json setupStatusJson(detect_filter_obb *tf)
+{
+	nlohmann::json out;
+	std::vector<filter_data::AutoZoneView> views;
+	{
+		std::lock_guard<std::mutex> lock(tf->auto_zone_view_lock);
+		views = tf->auto_zone_views;
+	}
+
+	std::vector<std::string> names;
+	std::vector<filter_data::PlayerState> players;
+	{
+		std::lock_guard<std::mutex> lock(tf->game_state_lock);
+		names.reserve(filter_data::MAX_PLAYERS);
+		for (int i = 0; i < filter_data::MAX_PLAYERS; i++)
+			names.push_back(tf->players[i].name);
+		for (int i = 0; i < tf->player_count; i++)
+			players.push_back(tf->players[i]);
+	}
+
+	out["active"] = tf->setup_mode.load();
+	out["ready"] = tf->setup_ready.load();
+	out["done"] = tf->setup_done.load();
+	out["player_count"] = tf->player_count;
+	out["expected"] = tf->setup_expected.load() > 0
+		? tf->setup_expected.load() : tf->player_count;
+	out["frame"] = {
+		{"w", tf->last_frame_width.load()},
+		{"h", tf->last_frame_height.load()}
+	};
+	out["camera"] = setupCameraJson(tf);
+
+	nlohmann::json persp;
+	{
+		std::lock_guard<std::mutex> lock(tf->setup_perspective_lock);
+		persp["active"] = tf->setup_perspective.active;
+		persp["size"] = tf->setup_perspective.size;
+		persp["angle"] = tf->setup_perspective.angle;
+		persp["source"] = nlohmann::json::array();
+		persp["base"] = nlohmann::json::array();
+		persp["target"] = nlohmann::json::array();
+		if (tf->setup_perspective.active) {
+			cv::Point2f target[4];
+			setupPerspectiveTargetLocked(tf->setup_perspective, target);
+			for (int i = 0; i < 4; i++) {
+				const auto &s = tf->setup_perspective.source[i];
+				const auto &b = tf->setup_perspective.base[i];
+				persp["source"].push_back({s.x, s.y});
+				persp["base"].push_back({b.x, b.y});
+				persp["target"].push_back(
+					{target[i].x, target[i].y});
+			}
+		}
+	}
+	out["perspective"] = std::move(persp);
+
+	nlohmann::json view_arr = nlohmann::json::array();
+	for (const auto &v : views) {
+		nlohmann::json vj;
+		vj["stable"] = v.stable;
+		vj["player"] = v.player_idx;
+		if (v.player_idx >= 0 &&
+		    v.player_idx < (int)names.size())
+			vj["name"] = names[v.player_idx];
+		else
+			vj["name"] = std::string();
+		vj["cards"] = v.card_count;
+		vj["score"] = v.score;
+		vj["crypt"] = setupZoneJson(v.crypt);
+		vj["minion"] = setupZoneJson(v.minion);
+		view_arr.push_back(std::move(vj));
+	}
+	out["views"] = std::move(view_arr);
+	out["detected"] = (int)views.size();
+
+	nlohmann::json player_arr = nlohmann::json::array();
+	for (int i = 0; i < (int)players.size(); i++) {
+		const auto &pl = players[i];
+		nlohmann::json pj;
+		pj["index"] = i;
+		pj["name"] = pl.name;
+		pj["active"] = pl.active;
+		pj["auto_zone"] = pl.auto_zone;
+		pj["crypt"] = setupZoneJson(pl.crypt_zone);
+		pj["minion"] = setupZoneJson(pl.minion_zone);
+		player_arr.push_back(std::move(pj));
+	}
+	out["players"] = std::move(player_arr);
+	return out;
+}
+
+static SetupCameraFit calculateSetupCameraFit(
+	detect_filter_obb *tf,
+	const std::vector<filter_data::AutoZoneView> &views,
+	bool full_frame)
+{
+	SetupCameraFit fit;
+	fit.full_frame = full_frame;
+	fit.frame_w = tf->last_frame_width.load();
+	fit.frame_h = tf->last_frame_height.load();
+	if (fit.frame_w < 32 || fit.frame_h < 32) {
+		fit.frame_w = 1920;
+		fit.frame_h = 1080;
+	}
+
+	float x0 = 1.0f, y0 = 1.0f, x1 = 0.0f, y1 = 0.0f;
+	bool has_zone = false;
+	auto include = [&](const filter_data::PlayerZone &z) {
+		cv::Rect2f b;
+		if (!playerZoneBounds(z, b))
+			return;
+		x0 = std::min(x0, b.x);
+		y0 = std::min(y0, b.y);
+		x1 = std::max(x1, b.x + b.width);
+		y1 = std::max(y1, b.y + b.height);
+		has_zone = true;
+	};
+	for (const auto &v : views) {
+		include(v.crypt);
+		include(v.minion);
+	}
+	if (!has_zone)
+		return fit;
+
+	// 4% de aire alrededor del conjunto de zonas.
+	const float pad_x = 0.04f;
+	const float pad_y = 0.04f;
+	x0 = std::max(0.0f, x0 - pad_x);
+	y0 = std::max(0.0f, y0 - pad_y);
+	x1 = std::min(1.0f, x1 + pad_x);
+	y1 = std::min(1.0f, y1 + pad_y);
+	const float bw = std::max(0.01f, (x1 - x0) * fit.frame_w);
+	const float bh = std::max(0.01f, (y1 - y0) * fit.frame_h);
+
+	const OverlayFit ofit = overlayFit(fit.frame_w, fit.frame_h);
+	const cv::Rect win_design =
+		tf->overlay_cam_window.width >= 8
+			? tf->overlay_cam_window
+			: cv::Rect(kWinX, kWinY, kWinW, kWinH);
+	const cv::Rect win = full_frame
+		? cv::Rect(0, 0, fit.frame_w, fit.frame_h)
+		: designRect(ofit, win_design.x, win_design.y,
+			     win_design.width, win_design.height);
+	if (win.width < 8 || win.height < 8)
+		return fit;
+
+	// Escala base de "cover": a zoom 1 la camara ya llena el hueco.
+	const double base = std::max((double)win.width / fit.frame_w,
+				     (double)win.height / fit.frame_h);
+	if (base <= 0.0)
+		return fit;
+
+	// Encajar el rectangulo de la mesa con un 8% de margen. El zoom no
+	// puede bajar de 1 porque dejaria barras negras.
+	double scale = std::min(win.width * 0.92 / bw,
+				win.height * 0.92 / bh);
+	scale = std::max(base, std::min(scale, base * 3.0));
+	const double zoom = scale / base;
+	if (zoom < 1.0 || zoom > 3.0)
+		return fit;
+
+	const double iw = fit.frame_w * scale;
+	const double ih = fit.frame_h * scale;
+	const double bcx = (x0 + x1) * 0.5 * fit.frame_w;
+	const double bcy = (y0 + y1) * 0.5 * fit.frame_h;
+	const double dx = iw * 0.5 - bcx * scale;
+	const double dy = ih * 0.5 - bcy * scale;
+	const double scale_design = ofit.esc > 0.0 ? ofit.esc : 1.0;
+
+	fit.zoom_percent = std::round(zoom * 100.0);
+	fit.off_x = (int)std::lround(dx / scale_design);
+	fit.off_y = (int)std::lround(dy / scale_design);
+	fit.off_x = std::max(-400, std::min(400, fit.off_x));
+	fit.off_y = std::max(-400, std::min(400, fit.off_y));
+	fit.ok = true;
+	obs_log(LOG_INFO,
+		"[Setup] Encuadre: mesa %.0fx%.0f px -> zoom %.0f%%, offset (%d,%d), %s",
+		bw, bh, fit.zoom_percent, fit.off_x, fit.off_y,
+		full_frame ? "a sangre" : "ventana");
+	return fit;
+}
+
+static void applySetupCameraFit(detect_filter_obb *tf,
+				const SetupCameraFit &fit)
+{
+	if (!fit.ok)
+		return;
+	tf->cam_zoom = fit.zoom_percent / 100.0;
+	tf->cam_off_x = fit.off_x;
+	tf->cam_off_y = fit.off_y;
+	tf->cam_full_frame = fit.full_frame;
+}
+
+static std::string zoneQuadString(const filter_data::PlayerZone &z)
+{
+	if (!z.quad)
+		return std::string();
+	char buf[256];
+	snprintf(buf, sizeof(buf), "%.7f,%.7f;%.7f,%.7f;%.7f,%.7f;%.7f,%.7f",
+		 z.corners[0].x, z.corners[0].y,
+		 z.corners[1].x, z.corners[1].y,
+		 z.corners[2].x, z.corners[2].y,
+		 z.corners[3].x, z.corners[3].y);
+	return std::string(buf);
+}
+
+static bool loadZoneQuadString(const std::string &str,
+			       filter_data::PlayerZone &z)
+{
+	float v[8];
+	if (str.empty() ||
+	    std::sscanf(str.c_str(),
+			"%f,%f;%f,%f;%f,%f;%f,%f",
+			&v[0], &v[1], &v[2], &v[3],
+			&v[4], &v[5], &v[6], &v[7]) != 8)
+		return false;
+	cv::Point2f q[4];
+	for (int i = 0; i < 4; i++)
+		q[i] = cv::Point2f(v[i * 2], v[i * 2 + 1]);
+	filter_data::PlayerZone n = playerZoneFromQuad(q, z.lock_angle);
+	n.angle = z.angle;
+	// Si el operador ha cambiado a mano la caja (x/y/w/h) desde las
+	// propiedades, los valores ya no coinciden con la perspectiva guardada:
+	// se descarta la perspectiva y se respeta la edicion manual.
+	const float tol = 0.002f;
+	if (std::fabs(n.nx - z.nx) > tol ||
+	    std::fabs(n.ny - z.ny) > tol ||
+	    std::fabs(n.nw - z.nw) > tol ||
+	    std::fabs(n.nh - z.nh) > tol)
+		return false;
+	z = n;
+	return true;
+}
+
+static bool saveSetupSettings(detect_filter_obb *tf)
+{
+	if (!tf->source)
+		return false;
+
+	std::vector<filter_data::PlayerState> players;
+	{
+		std::lock_guard<std::mutex> lock(tf->game_state_lock);
+		players.assign(tf->players, tf->players + filter_data::MAX_PLAYERS);
+	}
+	const int player_count = tf->player_count;
+	const int cam_off_x = tf->cam_off_x;
+	const int cam_off_y = tf->cam_off_y;
+	const double cam_zoom = tf->cam_zoom * 100.0;
+	const bool cam_full_frame = tf->cam_full_frame;
+
+	obs_data_t *settings = obs_source_get_settings(tf->source);
+	if (!settings)
+		return false;
+
+	obs_data_set_int(settings, "player_count", player_count);
+	obs_data_set_bool(settings, "auto_zones", false);
+	obs_data_set_bool(settings, "setup_done", true);
+	obs_data_set_double(settings, "cam_zoom", cam_zoom);
+	obs_data_set_int(settings, "cam_offset_x", cam_off_x);
+	obs_data_set_int(settings, "cam_offset_y", cam_off_y);
+	obs_data_set_bool(settings, "cam_full_frame", cam_full_frame);
+
+	for (int i = 0; i < filter_data::MAX_PLAYERS; i++) {
+		const std::string p = "player_" + std::to_string(i);
+		const auto &pl = players[i];
+		obs_data_set_double(settings, (p + "_minion_x").c_str(),
+				    pl.minion_zone.nx);
+		obs_data_set_double(settings, (p + "_minion_y").c_str(),
+				    pl.minion_zone.ny);
+		obs_data_set_double(settings, (p + "_minion_w").c_str(),
+				    pl.minion_zone.nw);
+		obs_data_set_double(settings, (p + "_minion_h").c_str(),
+				    pl.minion_zone.nh);
+		obs_data_set_int(settings, (p + "_minion_angle").c_str(),
+				 (int)std::lround(pl.minion_zone.angle));
+		obs_data_set_string(settings, (p + "_minion_quad").c_str(),
+				    zoneQuadString(pl.minion_zone).c_str());
+		obs_data_set_double(settings, (p + "_crypt_x").c_str(),
+				    pl.crypt_zone.nx);
+		obs_data_set_double(settings, (p + "_crypt_y").c_str(),
+				    pl.crypt_zone.ny);
+		obs_data_set_double(settings, (p + "_crypt_w").c_str(),
+				    pl.crypt_zone.nw);
+		obs_data_set_double(settings, (p + "_crypt_h").c_str(),
+				    pl.crypt_zone.nh);
+		obs_data_set_int(settings, (p + "_crypt_angle").c_str(),
+				 (int)std::lround(pl.crypt_zone.angle));
+		obs_data_set_string(settings, (p + "_crypt_quad").c_str(),
+				    zoneQuadString(pl.crypt_zone).c_str());
+	}
+	obs_source_update(tf->source, settings);
+	obs_data_release(settings);
+	obs_log(LOG_INFO,
+		"[Setup] Configuracion guardada (%d jugadores, zoom %.0f%%)",
+		player_count, cam_zoom);
+	return true;
+}
+
+static nlohmann::json setupActionJson(detect_filter_obb *tf,
+				      const std::string &action,
+				      const std::string &query)
+{
+	nlohmann::json out;
+	auto value = [&](const char *key) -> std::string {
+		const std::string k = std::string(key) + "=";
+		size_t pos = query.find(k);
+		if (pos == std::string::npos)
+			return std::string();
+		const size_t start = pos + k.size();
+		const size_t end = query.find('&', start);
+		return query.substr(start, end == std::string::npos
+					   ? std::string::npos
+					   : end - start);
+	};
+
+	if (action == "perspective") {
+		{
+			std::lock_guard<std::mutex> lock(tf->setup_perspective_lock);
+			if (!tf->setup_perspective.active) {
+				out["ok"] = false;
+				out["error"] = "perspective_not_ready";
+				return out;
+			}
+			if (value("reset") == "1") {
+				for (int i = 0; i < 4; i++)
+					tf->setup_perspective.base[i] =
+						tf->setup_perspective.source[i];
+				tf->setup_perspective.size = 1.0f;
+				tf->setup_perspective.angle = 0.0f;
+			} else {
+				const std::string corners = value("corners");
+				if (!corners.empty()) {
+					std::vector<float> nums;
+					size_t pos = 0;
+					while (pos <= corners.size() &&
+					       nums.size() < 8) {
+						const size_t sep =
+							corners.find_first_of(",;", pos);
+						const std::string part = corners.substr(
+							pos,
+							sep == std::string::npos
+								? std::string::npos
+								: sep - pos);
+						try {
+							nums.push_back(std::stof(part));
+						} catch (...) {
+							break;
+						}
+						if (sep == std::string::npos)
+							break;
+						pos = sep + 1;
+					}
+					if (nums.size() == 8) {
+						for (int i = 0; i < 4; i++) {
+							tf->setup_perspective.base[i].x =
+								std::clamp(nums[i * 2],
+									   0.0f, 1.0f);
+							tf->setup_perspective.base[i].y =
+								std::clamp(nums[i * 2 + 1],
+									   0.0f, 1.0f);
+						}
+					}
+				}
+				const std::string sz = value("size");
+				if (!sz.empty()) {
+					try {
+						tf->setup_perspective.size =
+							std::clamp(std::stof(sz),
+								   0.5f, 1.5f);
+					} catch (...) {
+					}
+				}
+				const std::string ang = value("angle");
+				if (!ang.empty()) {
+					try {
+						tf->setup_perspective.angle =
+							std::clamp(std::stof(ang),
+								   -45.0f, 45.0f);
+					} catch (...) {
+					}
+				}
+			}
+		}
+		out = setupStatusJson(tf);
+		out["ok"] = true;
+		return out;
+	}
+
+	if (action == "start") {
+		int players = 0;
+		try {
+			players = std::stoi(value("players"));
+		} catch (...) {
+			players = tf->player_count;
+		}
+		if (players < 4 || players > filter_data::MAX_PLAYERS)
+			players = tf->player_count;
+		players = std::max(4, std::min(players, filter_data::MAX_PLAYERS));
+		tf->setup_expected.store(players);
+		tf->setup_started_ns.store(
+			std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now().time_since_epoch())
+				.count());
+		tf->setup_ready.store(false);
+		tf->setup_mode.store(true);
+		setupPerspectiveReset(tf);
+		{
+			std::lock_guard<std::mutex> lock(tf->auto_zone_lock);
+			if (!tf->auto_zone_detector)
+				tf->auto_zone_detector =
+					std::make_unique<vtes_detection::AutoZoneDetector>();
+			else
+				tf->auto_zone_detector->reset();
+			tf->auto_zone_last_run_ns = 0;
+			tf->auto_zone_batch_start_ns = 0;
+		}
+		{
+			std::lock_guard<std::mutex> lock(tf->auto_zone_view_lock);
+			tf->auto_zone_views.clear();
+		}
+		obs_log(LOG_INFO, "[Setup] Iniciado para %d jugadores", players);
+		out = setupStatusJson(tf);
+		out["ok"] = true;
+		return out;
+	}
+
+	if (action == "reset") {
+		tf->setup_mode.store(false);
+		tf->setup_ready.store(false);
+		tf->setup_expected.store(0);
+		tf->setup_started_ns.store(0);
+		setupPerspectiveReset(tf);
+		{
+			std::lock_guard<std::mutex> lock(tf->auto_zone_lock);
+			if (tf->auto_zone_detector)
+				tf->auto_zone_detector->reset();
+			tf->auto_zone_last_run_ns = 0;
+		}
+		{
+			std::lock_guard<std::mutex> lock(tf->auto_zone_view_lock);
+			tf->auto_zone_views.clear();
+		}
+		out = setupStatusJson(tf);
+		out["ok"] = true;
+		return out;
+	}
+
+	if (action == "camera" || action == "apply") {
+		std::vector<filter_data::AutoZoneView> views;
+		{
+			std::lock_guard<std::mutex> lock(tf->auto_zone_view_lock);
+			views = tf->auto_zone_views;
+		}
+		if (views.empty()) {
+			out["ok"] = false;
+			out["error"] = "no_zones";
+			return out;
+		}
+		setupPerspectiveWarpViews(tf, views);
+		bool full_frame = tf->cam_full_frame;
+		const std::string ff = value("full_frame");
+		if (!ff.empty())
+			full_frame = ff == "1" || ff == "true";
+
+		SetupCameraFit fit =
+			calculateSetupCameraFit(tf, views, full_frame);
+		if (action == "camera") {
+			applySetupCameraFit(tf, fit);
+			out = setupStatusJson(tf);
+			out["ok"] = fit.ok;
+			if (!fit.ok)
+				out["error"] = "camera_not_ready";
+			return out;
+		}
+
+		int expected = tf->setup_expected.load();
+		if (expected <= 0)
+			expected = tf->player_count;
+		expected = std::max(4, std::min(expected, filter_data::MAX_PLAYERS));
+		if (!tf->setup_mode.load() || !tf->setup_ready.load() ||
+		    views.size() < (size_t)expected) {
+			out["ok"] = false;
+			out["error"] = "not_ready";
+			return out;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(tf->game_state_lock);
+			tf->player_count = expected;
+			tf->influence_memory.clear();
+			for (int i = 0; i < (int)views.size(); ++i) {
+				const auto &v = views[i];
+				if (v.player_idx < 0 ||
+				    v.player_idx >= expected)
+					continue;
+				auto &pl = tf->players[v.player_idx];
+				pl.crypt_zone = v.crypt;
+				pl.minion_zone = v.minion;
+				pl.auto_zone = false;
+				pl.auto_zone_id = -1;
+			}
+			for (auto &kv : tf->tracked_cards) {
+				kv.second.player_idx = -1;
+				kv.second.in_crypt = false;
+				kv.second.lock_votes = 0;
+			}
+		}
+
+		applySetupCameraFit(tf, fit);
+		tf->auto_zones = false;
+		tf->setup_done.store(true);
+		tf->setup_mode.store(false);
+		tf->setup_ready.store(false);
+		tf->setup_expected.store(0);
+		tf->setup_started_ns.store(0);
+		setupPerspectiveReset(tf);
+		{
+			std::lock_guard<std::mutex> lock(tf->auto_zone_lock);
+			if (tf->auto_zone_detector)
+				tf->auto_zone_detector->reset();
+			tf->auto_zone_last_run_ns = 0;
+		}
+		{
+			std::lock_guard<std::mutex> lock(tf->auto_zone_view_lock);
+			tf->auto_zone_views.clear();
+		}
+		const bool saved = saveSetupSettings(tf);
+		out = setupStatusJson(tf);
+		out["ok"] = saved;
+		if (!saved)
+			out["error"] = "save_failed";
+		return out;
+	}
+
+	out["ok"] = false;
+	out["error"] = "unknown_action";
+	return out;
+}
+
 void detect_filter_obb_video_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
@@ -4061,6 +5044,8 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 		}
 		imageBGRA = tf->inputBGRA.clone();
 	}
+	tf->last_frame_width.store(imageBGRA.cols);
+	tf->last_frame_height.store(imageBGRA.rows);
 
 	try {
 
@@ -4801,7 +5786,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 			// camara para poder ajustar X/Y/W/H/angulo viendo donde caen. Las
 			// zonas van en coordenadas de camara (0..1); un jugador fuera de
 			// partida (ousted) se dibuja en gris y su zona no asigna cartas.
-			if (tf->show_zones) {
+			if (tf->show_zones || tf->setup_mode.load()) {
 				const cv::Scalar palette[5] = {
 					cv::Scalar(60, 220, 60),   // verde
 					cv::Scalar(255, 160, 0),   // azul
@@ -4813,46 +5798,64 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				// Zonas propuestas por el detector de 4 cartas boca abajo
 				// que todavía no se han asignado a un jugador. Se dibujan
 				// en blanco para distinguirlas de las zonas manuales.
-				if (tf->auto_zones) {
+				if (tf->auto_zones || tf->setup_mode.load()) {
 					std::vector<filter_data::AutoZoneView> views;
 					{
 						std::lock_guard<std::mutex> lock(
 							tf->auto_zone_view_lock);
 						views = tf->auto_zone_views;
 					}
+					const cv::Mat persp = setupPerspectiveHomography(tf);
 					for (const auto &v : views) {
-						if (v.player_idx >= 0)
+						if (v.player_idx >= 0 && !tf->setup_mode.load())
 							continue;
 						const cv::Scalar col = v.stable
 							? cv::Scalar(255, 255, 255)
 							: cv::Scalar(180, 180, 180);
 						auto drawProposal = [&](const filter_data::PlayerZone &z) {
-							const cv::Point2f zc(
-								(float)(cam.ox + (z.nx + z.nw * 0.5) * fw * cam.scale),
-								(float)(cam.oy + (z.ny + z.nh * 0.5) * fh * cam.scale));
-							const cv::Size2f zs(
-								(float)(z.nw * fw * cam.scale),
-								(float)(z.nh * fh * cam.scale));
-							if (zs.width < 4.0f || zs.height < 4.0f)
+							filter_data::PlayerZone wz = z;
+							if (!persp.empty())
+								wz = setupPerspectiveWarpZone(z, persp);
+							cv::Point2f np[4];
+							if (!playerZoneCorners(wz, np))
 								return;
-							cv::RotatedRect rr(zc, zs, z.angle);
-							cv::Point2f pts[4];
-							rr.points(pts);
+							cv::Point pts[4];
+							int minx = fw, miny = fh, maxx = 0, maxy = 0;
+							for (int i = 0; i < 4; i++) {
+								pts[i].x = (int)std::lround(
+									cam.ox + np[i].x * fw * cam.scale);
+								pts[i].y = (int)std::lround(
+									cam.oy + np[i].y * fh * cam.scale);
+								minx = std::min(minx, pts[i].x);
+								miny = std::min(miny, pts[i].y);
+								maxx = std::max(maxx, pts[i].x);
+								maxy = std::max(maxy, pts[i].y);
+							}
+							if (maxx - minx < 4 || maxy - miny < 4)
+								return;
 							std::vector<std::vector<cv::Point>> poly = {{
-								cv::Point((int)(pts[0].x + 0.5f), (int)(pts[0].y + 0.5f)),
-								cv::Point((int)(pts[1].x + 0.5f), (int)(pts[1].y + 0.5f)),
-								cv::Point((int)(pts[2].x + 0.5f), (int)(pts[2].y + 0.5f)),
-								cv::Point((int)(pts[3].x + 0.5f), (int)(pts[3].y + 0.5f))}};
+								pts[0], pts[1], pts[2], pts[3]}};
 							cv::polylines(display, poly, true, col, 1);
 						};
 						drawProposal(v.crypt);
 						drawProposal(v.minion);
 						std::string label = tf_text("AutoZoneCards");
+						if (v.player_idx >= 0) {
+							label = std::string(tf_text("Player")) + " " +
+								std::to_string(v.player_idx + 1) +
+								" - " + label;
+						}
 						if (!v.stable)
 							label += "...";
+						filter_data::PlayerZone cw = v.crypt;
+						if (!persp.empty())
+							cw = setupPerspectiveWarpZone(v.crypt, persp);
+						cv::Rect2f cb;
+						if (!playerZoneBounds(cw, cb))
+							continue;
 						const cv::Point2f top(
-							(float)(v.crypt.nx * fw * cam.scale + cam.ox),
-							(float)(v.crypt.ny * fh * cam.scale + cam.oy));
+							(float)(cb.x * fw * cam.scale + cam.ox),
+							(float)(cb.y * fh * cam.scale + cam.oy));
 						cv::putText(display, label,
 							cv::Point((int)top.x + 3, (int)top.y + 14),
 							cv::FONT_HERSHEY_SIMPLEX, 0.42,
@@ -4861,29 +5864,38 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 				}
 
 				for (int pi = 0; pi < tf->player_count; pi++) {
+					if (tf->setup_mode.load())
+						break;
 					auto& pl = tf->players[pi];
 					const cv::Scalar col = pl.active ? palette[pi % 5]
 					                                 : cv::Scalar(140, 140, 140);
 					auto drawZone = [&](const filter_data::PlayerZone& z, const char* tag) {
-						const cv::Point2f zc(
-							(float)(cam.ox + (z.nx + z.nw * 0.5) * fw * cam.scale),
-							(float)(cam.oy + (z.ny + z.nh * 0.5) * fh * cam.scale));
-						const cv::Size2f zs((float)(z.nw * fw * cam.scale),
-						                    (float)(z.nh * fh * cam.scale));
-						if (zs.width < 4.0f || zs.height < 4.0f)
+						cv::Point2f np[4];
+						if (!playerZoneCorners(z, np))
 							return;
-						cv::RotatedRect rr(zc, zs, z.angle);
 						cv::Point2f pts[4];
-						rr.points(pts);
+						int minx = fw, miny = fh, maxx = 0, maxy = 0;
+						for (int i = 0; i < 4; i++) {
+							pts[i].x = (float)(cam.ox + np[i].x * fw * cam.scale);
+							pts[i].y = (float)(cam.oy + np[i].y * fh * cam.scale);
+							minx = std::min(minx, (int)std::lround(pts[i].x));
+							miny = std::min(miny, (int)std::lround(pts[i].y));
+							maxx = std::max(maxx, (int)std::lround(pts[i].x));
+							maxy = std::max(maxy, (int)std::lround(pts[i].y));
+						}
+						if (maxx - minx < 4 || maxy - miny < 4)
+							return;
 
-						// Relleno translucido dentro del poligono rotado
-						cv::Rect br = rr.boundingRect() & cv::Rect(0, 0, fw, fh);
+						// Relleno translucido dentro del poligono
+						cv::Rect br = cv::Rect(minx, miny, maxx - minx,
+								       maxy - miny) &
+							      cv::Rect(0, 0, fw, fh);
 						if (br.width < 4 || br.height < 4)
 							return;
 						cv::Point ap[4], lp[4];
 						for (int i = 0; i < 4; i++) {
-							ap[i] = cv::Point((int)(pts[i].x + 0.5f),
-							                  (int)(pts[i].y + 0.5f));
+							ap[i] = cv::Point((int)std::lround(pts[i].x),
+									  (int)std::lround(pts[i].y));
 							lp[i] = cv::Point(ap[i].x - br.x, ap[i].y - br.y);
 						}
 						cv::Mat mask(display(br).size(), CV_8UC1, cv::Scalar(0));
@@ -4899,7 +5911,7 @@ void detect_filter_obb_video_tick(void *data, float seconds)
 							{ap[0], ap[1], ap[2], ap[3]}};
 						cv::polylines(display, poly, true, col, 2);
 
-						// Etiqueta junto al vertice superior del rectangulo
+						// Etiqueta junto al vertice superior del poligono
 						std::string label = pl.name + " - " + tag;
 						if (pl.auto_zone)
 							label += std::string(" [") +

@@ -63,6 +63,11 @@ public:
     std::function<nlohmann::json()> on_pending_clear_fn;
     std::function<std::string(uint64_t)> get_pending_crop_fn;
 
+    // Modo inicializacion: estado del asistente y acciones start/reset/apply.
+    std::function<nlohmann::json()> get_setup_fn;
+    std::function<nlohmann::json(const std::string &, const std::string &)>
+        on_setup_action_fn;
+
     bool start(int port, const VTESCardDatabase *db) {
         if (running_) stop();
         db_ = db;
@@ -199,6 +204,20 @@ private:
             serveMinionResourceSet(client, query);
         } else if (uri == "/api/game/status") {
             serveGameStatus(client);
+        } else if (uri == "/api/setup/status") {
+            serveSetupStatus(client);
+        } else if (uri == "/api/setup/start") {
+            serveSetupAction(client, "start", query);
+        } else if (uri == "/api/setup/reset") {
+            serveSetupAction(client, "reset", query);
+        } else if (uri == "/api/setup/perspective") {
+            serveSetupAction(client, "perspective", query);
+        } else if (uri == "/api/setup/camera") {
+            serveSetupAction(client, "camera", query);
+        } else if (uri == "/api/setup/apply") {
+            serveSetupAction(client, "apply", query);
+        } else if (uri == "/setup" || uri == "/inicio") {
+            serveSetupPage(client);
         } else if (uri == "/game") {
             serveGamePage(client);
         } else if (uri == "/api/pending") {
@@ -641,6 +660,7 @@ private:
           << "</style></head><body><div class=\"container\">"
           << "<div class=\"nav-bar\">"
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
+          << "<a href=\"/setup\">" << tf_text("WebSetup") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
           << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
@@ -872,6 +892,7 @@ private:
           << "<h1>" << tf_text("WebPoolControl") << "</h1>"
           << "<div class=\"nav-bar\">"
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
+          << "<a href=\"/setup\">" << tf_text("WebSetup") << "</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
           << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
           << "<a href=\"/pending\">" << tf_text("WebPending") << "</a>"
@@ -958,6 +979,32 @@ private:
             "\r\n";
         sendAll(client, header);
         sendAll(client, body);
+    }
+
+    void serveSetupStatus(SOCKET client) {
+        nlohmann::json j;
+        if (get_setup_fn)
+            j = get_setup_fn();
+        else {
+            j["active"] = false;
+            j["ready"] = false;
+            j["done"] = false;
+            j["views"] = nlohmann::json::array();
+            j["players"] = nlohmann::json::array();
+        }
+        sendJsonResponse(client, j);
+    }
+
+    void serveSetupAction(SOCKET client, const std::string &action,
+                          const std::string &query) {
+        nlohmann::json j;
+        if (on_setup_action_fn)
+            j = on_setup_action_fn(action, urlDecode(query));
+        else {
+            j["ok"] = false;
+            j["error"] = "setup_unavailable";
+        }
+        sendJsonResponse(client, j);
     }
 
     // ─── Modo realizador: API + pagina de pendientes ─────────────────
@@ -1066,6 +1113,7 @@ private:
           << "<h1>" << tf_text("WebPending") << "</h1>"
           << "<div class=\"nav-bar\">"
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
+          << "<a href=\"/setup\">" << tf_text("WebSetup") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
           << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
@@ -1130,6 +1178,212 @@ private:
         sendAll(client, body);
     }
 
+    void serveSetupPage(SOCKET client) {
+        std::ostringstream h;
+        h << "<!DOCTYPE html><html lang=\"" << tf_i18n_code() << "\"><head><meta charset=\"UTF-8\">"
+          << "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+          << "<title>VTES — " << tf_text("WebSetupTitle") << "</title><style>"
+          << PAGE_CSS
+          << "</style></head><body><div class=\"container\">"
+          << "<h1>" << tf_text("WebSetupTitle") << "</h1>"
+          << "<div class=\"nav-bar\">"
+          << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
+          << "<a href=\"/setup\" class=\"active\">" << tf_text("WebSetup") << "</a>"
+          << "<a href=\"/pool\">Pool</a>"
+          << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
+          << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
+          << "<a href=\"/pending\">" << tf_text("WebPending") << "</a>"
+          << "<span class=\"status\" id=\"status\">" << tf_text("WebConnected") << "</span>"
+          << "</div>"
+          << "<div class=\"setup-intro\">" << tf_text("WebSetupIntro") << "</div>"
+          << "<div class=\"setup-grid\">"
+
+          << "<section class=\"setup-card\"><h2>" << tf_text("WebSetupStepPlayers") << "</h2>"
+          << "<p>" << tf_text("WebSetupPlayersHint") << "</p>"
+          << "<label class=\"setup-label\">" << tf_text("WebSetupPlayerCount")
+          << "<select id=\"players\"><option value=\"4\">4</option><option value=\"5\">5</option></select></label>"
+          << "<button id=\"startBtn\" class=\"setup-primary\">" << tf_text("WebSetupStart") << "</button>"
+          << "<div class=\"setup-hint\">" << tf_text("WebSetupStepPlayersHint") << "</div></section>"
+
+          << "<section class=\"setup-card\"><h2>" << tf_text("WebSetupStepZones") << "</h2>"
+          << "<p>" << tf_text("WebSetupZonesHint") << "</p>"
+          << "<div id=\"setupStatus\" class=\"setup-status\"></div>"
+          << "<div id=\"perspWrap\" class=\"setup-persp\" style=\"display:none\">"
+          << "<div class=\"setup-persp-head\"><span>" << tf_text("WebSetupPerspective")
+          << "</span><button id=\"perspResetBtn\" type=\"button\" class=\"setup-small\">"
+          << tf_text("WebSetupResetPerspective") << "</button></div>"
+          << "<canvas id=\"perspCanvas\" width=\"720\" height=\"405\"></canvas>"
+          << "<div class=\"setup-persp-sliders\">"
+          << "<label><span>" << tf_text("WebSetupSize") << "</span>"
+          << "<input type=\"range\" id=\"perspSize\" min=\"50\" max=\"150\" step=\"1\" value=\"100\"><b id=\"perspSizeVal\">100%</b></label>"
+          << "<label><span>" << tf_text("WebSetupAngle") << "</span>"
+          << "<input type=\"range\" id=\"perspAngle\" min=\"-30\" max=\"30\" step=\"1\" value=\"0\"><b id=\"perspAngleVal\">0°</b></label>"
+          << "</div>"
+          << "<div class=\"setup-persp-guide\">"
+          << "<label><span>" << tf_text("WebSetupGuideShape") << "</span>"
+          << "<select id=\"guideShape\">"
+          << "<option value=\"rect\">" << tf_text("WebSetupGuideRect") << "</option>"
+          << "<option value=\"square\">" << tf_text("WebSetupGuideSquare") << "</option>"
+          << "<option value=\"circle\">" << tf_text("WebSetupGuideCircle") << "</option>"
+          << "<option value=\"oval\">" << tf_text("WebSetupGuideOval") << "</option>"
+          << "</select></label>"
+          << "<label><span>" << tf_text("WebSetupGuideSize") << "</span>"
+          << "<input type=\"range\" id=\"guideSize\" min=\"40\" max=\"180\" step=\"1\" value=\"100\"><b id=\"guideSizeVal\">100%</b></label>"
+          << "<label><span>" << tf_text("WebSetupGuideAngle") << "</span>"
+          << "<input type=\"range\" id=\"guideAngle\" min=\"-45\" max=\"45\" step=\"1\" value=\"0\"><b id=\"guideAngleVal\">0°</b></label>"
+          << "<label><span>" << tf_text("WebSetupGuideDepth") << "</span>"
+          << "<input type=\"range\" id=\"guideDepth\" min=\"0\" max=\"60\" step=\"1\" value=\"0\"><b id=\"guideDepthVal\">0°</b></label>"
+          << "</div>"
+          << "<div class=\"setup-hint\">" << tf_text("WebSetupPerspectiveHint")
+          << "</div></div>"
+          << "<div id=\"zoneList\" class=\"setup-zones\"></div>"
+          << "<div class=\"setup-actions\"><button id=\"resetBtn\" class=\"setup-secondary\">"
+          << tf_text("WebSetupRestart") << "</button></div></section>"
+
+          << "<section class=\"setup-card\"><h2>" << tf_text("WebSetupStepCamera") << "</h2>"
+          << "<p>" << tf_text("WebSetupCameraHint") << "</p>"
+          << "<label class=\"setup-check\"><input type=\"checkbox\" id=\"fullFrame\"> "
+          << tf_text("WebSetupFullFrame") << "</label>"
+          << "<div id=\"cameraInfo\" class=\"setup-camera\"></div>"
+          << "<button id=\"cameraBtn\" class=\"setup-secondary\">" << tf_text("WebSetupFitCamera")
+          << "</button></section>"
+
+          << "<section class=\"setup-card\"><h2>" << tf_text("WebSetupStepApply") << "</h2>"
+          << "<p>" << tf_text("WebSetupApplyHint") << "</p>"
+          << "<div id=\"applyMsg\" class=\"setup-message\"></div>"
+          << "<button id=\"applyBtn\" class=\"setup-primary\">" << tf_text("WebSetupApply")
+          << "</button>"
+          << "<div class=\"setup-hint\">" << tf_text("WebSetupAutoOff") << "</div>"
+          << "<a class=\"setup-back\" href=\"/game\">" << tf_text("WebSetupBackGame") << "</a>"
+          << "</section></div>"
+          << "<div class=\"footer\">VTES Card Scanner — " << tf_text("WebSetupTitle") << "</div>"
+          << "<script>"
+          << "const I18N={detecting:\"" << tf_text("WebSetupDetecting") << "\","
+          << "ready:\"" << tf_text("WebSetupReady") << "\","
+          << "saved:\"" << tf_text("WebSetupApplied") << "\","
+          << "idle:\"" << tf_text("WebSetupIdle") << "\","
+          << "notready:\"" << tf_text("WebSetupNotReady") << "\","
+          << "nozones:\"" << tf_text("WebSetupNoZones") << "\","
+          << "cards:\"" << tf_text("AutoZoneCards") << "\","
+          << "player:\"" << tf_text("Player") << "\","
+          << "crypt:\"" << tf_text("ZoneCrypt") << "\","
+          << "minion:\"" << tf_text("ZoneMinions") << "\","
+          << "cameraerror:\"" << tf_text("WebSetupCameraError") << "\","
+          << "saveerror:\"" << tf_text("WebSetupSaveError") << "\","
+          << "zoom:\"" << tf_text("WebSetupCameraValue") << "\"};"
+          << "const $=id=>document.getElementById(id);"
+          << "let lastStatus=null;let ffTouched=false;"
+          << "let persp={active:false,source:[],base:[],target:[],size:1,angle:0};"
+          << "let perspTouched=false,perspDrag=-1,perspTimer=null;"
+          << "function fmt(t,o){for(const k in o)t=t.split('{'+k+'}').join(o[k]);return t;}"
+          << "function clamp01(v){return Math.max(0,Math.min(1,v));}"
+          << "function zoneCorners(z){if(!z)return [];if(z.quad&&z.quad.length===4)return z.quad.map(p=>[p[0],p[1]]);"
+          << "if(!(z.w>0)||!(z.h>0))return [];const cx=z.x+z.w/2,cy=z.y+z.h/2,hw=z.w/2,hh=z.h/2;"
+          << "const a=(z.angle||0)*Math.PI/180,ca=Math.cos(a),sa=Math.sin(a);"
+          << "return [[-hw,-hh],[hw,-hh],[hw,hh],[-hw,hh]].map(p=>[cx+ca*p[0]-sa*p[1],cy+sa*p[0]+ca*p[1]]);}"
+          << "function solve8(A,b){for(let i=0;i<8;i++){let p=i;for(let r=i+1;r<8;r++)if(Math.abs(A[r][i])>Math.abs(A[p][i]))p=r;if(Math.abs(A[p][i])<1e-12)return null;if(p!==i){const t=A[p];A[p]=A[i];A[i]=t;const tb=b[p];b[p]=b[i];b[i]=tb;}const piv=A[i][i];for(let j=i;j<8;j++)A[i][j]/=piv;b[i]/=piv;for(let r=0;r<8;r++){if(r===i)continue;const f=A[r][i];if(!f)continue;for(let j=i;j<8;j++)A[r][j]-=f*A[i][j];b[r]-=f*b[i];}}return b;}"
+          << "function homography(src,dst){if(!src||!dst||src.length<4||dst.length<4)return null;const A=[],b=[];for(let i=0;i<4;i++){const x=src[i][0],y=src[i][1],u=dst[i][0],v=dst[i][1];A.push([x,y,1,0,0,0,-u*x,-u*y]);b.push(u);A.push([0,0,0,x,y,1,-v*x,-v*y]);b.push(v);}const h=solve8(A,b);return h?[...h,1]:null;}"
+          << "function applyH(h,p){if(!h)return p;const w=h[6]*p[0]+h[7]*p[1]+h[8];if(Math.abs(w)<1e-9)return p;return [(h[0]*p[0]+h[1]*p[1]+h[2])/w,(h[3]*p[0]+h[4]*p[1]+h[5])/w];}"
+          << "function targetOf(base,size,angle){if(!base||base.length<4)return [];let cx=0,cy=0;for(const p of base){cx+=p[0]/4;cy+=p[1]/4;}const a=angle*Math.PI/180,ca=Math.cos(a),sa=Math.sin(a);return base.map(p=>{const dx=p[0]-cx,dy=p[1]-cy;return [clamp01(cx+(ca*dx-sa*dy)*size),clamp01(cy+(sa*dx+ca*dy)*size)];});}"
+          << "let guide={type:'rect',size:1,angle:0,depth:0};let canvasOrigin={x:0,y:0,w:0,h:0};"
+          << "function applyGuideTransform(){const cv=$('perspCanvas');if(!cv)return;const d=guide.depth||0;cv.style.transform=d?('perspective(900px) rotateX('+d+'deg) rotateY('+(d*0.35).toFixed(1)+'deg)'):'';cv.style.transformOrigin='center center';}"
+          // Cachea el centro del canvas sin transformar: con inclinacion 3D el
+          // bounding box no coincide con el origen real de la transformacion.
+          << "function updateCanvasOrigin(){const cv=$('perspCanvas');if(!cv)return;const saved=cv.style.transform;cv.style.transform='none';const r=cv.getBoundingClientRect();canvasOrigin={x:r.left+window.scrollX+r.width/2,y:r.top+window.scrollY+r.height/2,w:r.width,h:r.height};cv.style.transform=saved;}"
+          << "function guidePoints(W,H){const cx=0.5,cy=0.5,s=guide.size,a=guide.angle*Math.PI/180,ca=Math.cos(a),sa=Math.sin(a),out=[];const add=(dx,dy)=>{const rx=ca*dx-sa*dy,ry=sa*dx+ca*dy;out.push([cx+rx/W,cy+ry/H]);};if(guide.type==='circle'||guide.type==='oval'){const rx=guide.type==='circle'?Math.min(0.16*s*W,0.45*H):0.20*s*W;const ry=guide.type==='circle'?rx:0.14*s*H;for(let i=0;i<48;i++){const t=i*Math.PI*2/48;add(rx*Math.cos(t),ry*Math.sin(t));}}else{const hw=guide.type==='square'?Math.min(0.14*s*W,0.45*H):0.17*s*W;const hh=guide.type==='square'?hw:0.12*s*H;add(-hw,-hh);add(hw,-hh);add(hw,hh);add(-hw,hh);}return out;}"
+          << "function drawGuide(ctx,W,H,h){const pts=guidePoints(W,H).map(p=>h?applyH(h,p):p);ctx.save();ctx.strokeStyle='#6ea8fe';ctx.lineWidth=2;ctx.globalAlpha=0.75;ctx.beginPath();pts.forEach((p,i)=>{const x=p[0]*W,y=p[1]*H;if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});ctx.closePath();ctx.stroke();ctx.globalAlpha=1;ctx.restore();}"
+          << "function drawPlaneGrid(ctx,W,H,h){if(!h)return;ctx.save();ctx.strokeStyle='#243a66';ctx.lineWidth=1;ctx.globalAlpha=0.45;for(let i=0;i<=6;i++){const t=i/6;ctx.beginPath();for(let j=0;j<=6;j++){const p=applyH(h,[t,j/6]);const x=p[0]*W,y=p[1]*H;if(j===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);}ctx.stroke();ctx.beginPath();for(let j=0;j<=6;j++){const p=applyH(h,[j/6,t]);const x=p[0]*W,y=p[1]*H;if(j===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);}ctx.stroke();}ctx.globalAlpha=1;ctx.restore();}"
+          << "function drawPersp(){const wrap=$('perspWrap'),cv=$('perspCanvas');if(!wrap||!cv)return;const d=lastStatus;"
+          << "if(!d||!d.active||!d.ready||!persp.active||!persp.source.length){wrap.style.display='none';canvasOrigin.w=0;return;}wrap.style.display='block';if(!canvasOrigin.w)updateCanvasOrigin();"
+          << "const fw=(d.frame&&d.frame.w)||16,fh=(d.frame&&d.frame.h)||9;const cw=720,ch=Math.max(200,Math.round(cw*fh/Math.max(1,fw)));if(cv.width!==cw||cv.height!==ch){cv.width=cw;cv.height=ch;}"
+          << "const W=cv.width,H=cv.height,ctx=cv.getContext('2d');ctx.clearRect(0,0,W,H);ctx.fillStyle='#050b18';ctx.fillRect(0,0,W,H);"
+          << "ctx.strokeStyle='#14213d';ctx.lineWidth=1;for(let i=1;i<6;i++){ctx.beginPath();ctx.moveTo(W*i/6,0);ctx.lineTo(W*i/6,H);ctx.stroke();ctx.beginPath();ctx.moveTo(0,H*i/6);ctx.lineTo(W,H*i/6);ctx.stroke();}"
+          << "const tgt=targetOf(persp.base,persp.size,persp.angle);persp.target=tgt;const h=homography(persp.source,tgt);"
+          << "drawPlaneGrid(ctx,W,H,h);"
+          << "drawGuide(ctx,W,H,h);"
+          << "const palette=['#3cdc3c','#ffa000','#ff3c3c','#00dcdc','#dc3cdc'];"
+          << "const views=d.views||[];views.forEach((v,vi)=>{const pc=palette[(v.player>=0?v.player:vi)%5];"
+          << "[['crypt',pc],['minion','#ffd166']].forEach(([key,col])=>{let pts=zoneCorners(v[key]);if(!pts.length)return;if(h)pts=pts.map(p=>applyH(h,p));"
+          << "ctx.beginPath();ctx.moveTo(pts[0][0]*W,pts[0][1]*H);for(let i=1;i<4;i++)ctx.lineTo(pts[i][0]*W,pts[i][1]*H);ctx.closePath();ctx.fillStyle=col;ctx.globalAlpha=0.14;ctx.fill();ctx.globalAlpha=1;ctx.strokeStyle=col;ctx.lineWidth=(key==='crypt'?2:1.3);ctx.stroke();});"
+          << "let cp=zoneCorners(v.crypt);if(cp.length){if(h)cp=cp.map(p=>applyH(h,p));const lx=(cp[0][0]+cp[1][0]+cp[2][0]+cp[3][0])/4*W,ly=(cp[0][1]+cp[1][1]+cp[2][1]+cp[3][1])/4*H;ctx.fillStyle=pc;ctx.font='bold 12px sans-serif';ctx.textAlign='center';ctx.fillText(String((v.player>=0?v.player:vi)+1),lx,ly+4);}});"
+          << "if(persp.source.length===4){ctx.setLineDash([5,4]);ctx.strokeStyle='#465b88';ctx.lineWidth=1;ctx.beginPath();persp.source.forEach((p,i)=>{if(i===0)ctx.moveTo(p[0]*W,p[1]*H);else ctx.lineTo(p[0]*W,p[1]*H);});ctx.closePath();ctx.stroke();ctx.setLineDash([]);}"
+          << "if(tgt.length===4){ctx.beginPath();tgt.forEach((p,i)=>{if(i===0)ctx.moveTo(p[0]*W,p[1]*H);else ctx.lineTo(p[0]*W,p[1]*H);});ctx.closePath();ctx.fillStyle='#c9a84c';ctx.globalAlpha=0.08;ctx.fill();ctx.globalAlpha=1;ctx.strokeStyle='#c9a84c';ctx.lineWidth=2;ctx.stroke();tgt.forEach((p,i)=>{const x=p[0]*W,y=p[1]*H;ctx.beginPath();ctx.arc(x,y,9,0,Math.PI*2);ctx.fillStyle='#c9a84c';ctx.fill();ctx.strokeStyle='#081126';ctx.lineWidth=2;ctx.stroke();ctx.fillStyle='#081126';ctx.font='bold 10px sans-serif';ctx.textAlign='center';ctx.fillText(String(i+1),x,y+3);});}"
+          << "}"
+          << "function loadPersp(d){const p=d&&d.perspective;if(!p||!p.active){persp.active=false;return;}persp.active=true;persp.source=(p.source||[]).map(q=>[q[0],q[1]]);persp.base=(p.base||[]).map(q=>[q[0],q[1]]);persp.size=p.size||1;persp.angle=p.angle||0;persp.target=(p.target||[]).map(q=>[q[0],q[1]]);$('perspSize').value=String(Math.round(persp.size*100));$('perspAngle').value=String(Math.round(persp.angle));$('perspSizeVal').textContent=Math.round(persp.size*100)+'%';$('perspAngleVal').textContent=Math.round(persp.angle)+'°';}"
+          // Desproyecta el puntero resolviendo la interseccion con el plano
+          // z=0 del canvas inclinado; una inversa 2D no basta con perspectiva.
+          << "function canvasNorm(ev){const cv=$('perspCanvas');if(!cv)return [0,0];const d=guide.depth||0;const r=cv.getBoundingClientRect();if(!d)return [Math.max(0,Math.min(1,(ev.clientX-r.left)/r.width)),Math.max(0,Math.min(1,(ev.clientY-r.top)/r.height))];if(!canvasOrigin.w)updateCanvasOrigin();const u=ev.clientX-(canvasOrigin.x-window.scrollX),v=ev.clientY-(canvasOrigin.y-window.scrollY);const m=new DOMMatrix(getComputedStyle(cv).transform);const A=m.m11-u*m.m14,B=m.m21-u*m.m24,C=m.m12-v*m.m14,D=m.m22-v*m.m24;const det=A*D-B*C;if(Math.abs(det)<1e-9)return [Math.max(0,Math.min(1,(ev.clientX-r.left)/r.width)),Math.max(0,Math.min(1,(ev.clientY-r.top)/r.height))];const rx=u*m.m44-m.m41,ry=v*m.m44-m.m42;const lx=(rx*D-B*ry)/det,ly=(A*ry-rx*C)/det;return [Math.max(0,Math.min(1,(lx+canvasOrigin.w/2)/canvasOrigin.w)),Math.max(0,Math.min(1,(ly+canvasOrigin.h/2)/canvasOrigin.h))];}"
+          << "function perspQuery(){const c=persp.base.map(p=>p[0].toFixed(6)+','+p[1].toFixed(6)).join(';');return 'corners='+encodeURIComponent(c)+'&size='+persp.size.toFixed(3)+'&angle='+persp.angle.toFixed(2);}"
+          << "async function syncPersp(){if(!persp.active)return;try{await fetch('/api/setup/perspective?'+perspQuery());}catch(e){}}"
+          << "function queuePersp(){if(!persp.active)return;clearTimeout(perspTimer);perspTimer=setTimeout(syncPersp,180);}"
+          << "const perspCanvas=$('perspCanvas');"
+          << "perspCanvas.addEventListener('pointerdown',ev=>{if(!persp.active)return;if(guide.depth)updateCanvasOrigin();const p=canvasNorm(ev);const tgt=targetOf(persp.base,persp.size,persp.angle);const r=perspCanvas.getBoundingClientRect();const thr=24/Math.max(1,perspCanvas.clientWidth||r.width);let best=-1,bd=thr;tgt.forEach((q,i)=>{const d=Math.hypot(q[0]-p[0],q[1]-p[1]);if(d<bd){bd=d;best=i;}});if(best<0)return;persp.base=tgt.map(q=>[q[0],q[1]]);persp.size=1;persp.angle=0;$('perspSize').value='100';$('perspAngle').value='0';$('perspSizeVal').textContent='100%';$('perspAngleVal').textContent='0°';perspDrag=best;perspTouched=true;perspCanvas.setPointerCapture(ev.pointerId);drawPersp();ev.preventDefault();});"
+          << "perspCanvas.addEventListener('pointermove',ev=>{if(perspDrag<0)return;persp.base[perspDrag]=canvasNorm(ev);persp.target=targetOf(persp.base,persp.size,persp.angle);drawPersp();ev.preventDefault();});"
+          << "function endPerspDrag(){if(perspDrag>=0){perspDrag=-1;queuePersp();}}"
+          << "perspCanvas.addEventListener('pointerup',endPerspDrag);perspCanvas.addEventListener('pointercancel',endPerspDrag);"
+          << "$('perspSize').addEventListener('input',()=>{persp.size=(+$('perspSize').value)/100;$('perspSizeVal').textContent=Math.round(persp.size*100)+'%';perspTouched=true;drawPersp();});"
+          << "$('perspAngle').addEventListener('input',()=>{persp.angle=(+$('perspAngle').value);$('perspAngleVal').textContent=Math.round(persp.angle)+'°';perspTouched=true;drawPersp();});"
+          << "$('perspSize').addEventListener('change',queuePersp);$('perspAngle').addEventListener('change',queuePersp);"
+          << "$('guideShape').addEventListener('change',()=>{guide.type=$('guideShape').value;drawPersp();});"
+          << "$('guideSize').addEventListener('input',()=>{guide.size=(+$('guideSize').value)/100;$('guideSizeVal').textContent=Math.round(guide.size*100)+'%';drawPersp();});"
+          << "$('guideAngle').addEventListener('input',()=>{guide.angle=(+$('guideAngle').value);$('guideAngleVal').textContent=Math.round(guide.angle)+'°';drawPersp();});"
+          << "$('guideDepth').addEventListener('input',()=>{guide.depth=(+$('guideDepth').value);$('guideDepthVal').textContent=Math.round(guide.depth)+'°';applyGuideTransform();drawPersp();});"
+          << "window.addEventListener('resize',()=>{canvasOrigin.w=0;drawPersp();});"
+          << "$('perspResetBtn').onclick=()=>{if(!persp.source.length)return;persp.base=persp.source.map(p=>[p[0],p[1]]);persp.size=1;persp.angle=0;$('perspSize').value='100';$('perspAngle').value='0';$('perspSizeVal').textContent='100%';$('perspAngleVal').textContent='0°';perspTouched=true;drawPersp();queuePersp();};"
+          << "function zoneLine(z){if(!z||!z.w||!z.h)return '—';return Math.round(z.w*100)+'% × '+Math.round(z.h*100)+'% @ ('+Math.round(z.x*100)+'%,'+Math.round(z.y*100)+'%) '+Math.round(z.angle||0)+'°';}"
+          << "function zoneCard(v,index){const d=document.createElement('div');d.className='setup-zone';"
+          << "const t=document.createElement('div');t.className='setup-zone-title';"
+          << "t.textContent=(v.name||I18N.player+' '+(v.player+1))+' · '+(v.cards||0)+' '+I18N.cards;"
+          << "d.appendChild(t);"
+          << "const c=document.createElement('div');c.className='setup-zone-body';"
+          << "c.innerHTML='<span>'+I18N.crypt+': '+zoneLine(v.crypt)+'</span><span>'+I18N.minion+': '+zoneLine(v.minion)+'</span>';"
+          << "d.appendChild(c);return d;}"
+          << "function playerZoneCard(p){const d=document.createElement('div');d.className='setup-zone';"
+          << "const t=document.createElement('div');t.className='setup-zone-title';t.textContent=(p.name||I18N.player+' '+(p.index+1));"
+          << "d.appendChild(t);const c=document.createElement('div');c.className='setup-zone-body';"
+          << "c.innerHTML='<span>'+I18N.crypt+': '+zoneLine(p.crypt)+'</span><span>'+I18N.minion+': '+zoneLine(p.minion)+'</span>';"
+          << "d.appendChild(c);return d;}"
+          << "function render(d){lastStatus=d;"
+          << "if(!d.active){perspTouched=false;perspDrag=-1;persp.active=false;}"
+          << "if(d.perspective&&d.perspective.active&&!perspTouched)loadPersp(d);"
+          << "const ps=$('players');if(ps)ps.value=String(d.active?(d.expected||d.player_count||5):(d.player_count||5));"
+          << "const st=$('setupStatus');const zl=$('zoneList');zl.innerHTML='';"
+          << "if(d.active){st.textContent=d.ready?fmt(I18N.ready,{count:d.detected||0,total:d.expected||0}):fmt(I18N.detecting,{count:d.detected||0,total:d.expected||0});"
+          << "for(const v of (d.views||[]))zl.appendChild(zoneCard(v));}"
+          << "else if(d.done){st.textContent=I18N.saved;for(const p of (d.players||[]))zl.appendChild(playerZoneCard(p));}"
+          << "else{st.textContent=I18N.idle;}"
+          << "const cam=$('cameraInfo');if(cam){const c=d.camera||{};cam.textContent=fmt(I18N.zoom,{zoom:Math.round(c.zoom||100),x:Math.round(c.offset_x||0),y:Math.round(c.offset_y||0)});}"
+          << "if($('fullFrame')&&!ffTouched)$('fullFrame').checked=!!(d.camera&&d.camera.full_frame);"
+          << "$('startBtn').disabled=!!d.active;$('players').disabled=!!d.active;"
+          << "$('resetBtn').disabled=!d.active;"
+          << "$('cameraBtn').disabled=!(d.active&&d.ready);"
+          << "$('applyBtn').disabled=!(d.active&&d.ready);"
+          << "if(d.active&&!d.ready)$('applyMsg').textContent=I18N.notready;"
+          << "else if(d.active&&d.ready)$('applyMsg').textContent='';"
+          << "if(!d.active&&d.done)$('applyMsg').textContent=I18N.saved;"
+          << "drawPersp();"
+          << "}"
+          << "async function load(){try{const r=await fetch('/api/setup/status');const d=await r.json();render(d);}catch(e){$('setupStatus').textContent='Error';}}"
+          << "async function act(url){if(persp.active&&(url.indexOf('/camera')>=0||url.indexOf('/apply')>=0))await syncPersp();try{const r=await fetch(url);const d=await r.json();render(d);if(d.error==='not_ready')$('applyMsg').textContent=I18N.notready;else if(d.error==='no_zones')$('applyMsg').textContent=I18N.nozones;else if(d.error==='camera_not_ready')$('applyMsg').textContent=I18N.cameraerror;else if(d.error==='save_failed')$('applyMsg').textContent=I18N.saveerror;else if(d.error)$('applyMsg').textContent=d.error;}catch(e){$('applyMsg').textContent='Error';}}"
+          << "$('fullFrame').onchange=()=>{ffTouched=true;};"
+          << "$('startBtn').onclick=()=>{perspTouched=false;persp.active=false;perspDrag=-1;act('/api/setup/start?players='+encodeURIComponent($('players').value));};"
+          << "$('resetBtn').onclick=()=>{perspTouched=false;persp.active=false;perspDrag=-1;act('/api/setup/reset');};"
+          << "$('cameraBtn').onclick=()=>act('/api/setup/camera?full_frame='+($('fullFrame').checked?'1':'0'));"
+          << "$('applyBtn').onclick=()=>act('/api/setup/apply?full_frame='+($('fullFrame').checked?'1':'0'));"
+          << "applyGuideTransform();load();setInterval(load,1000);"
+          << "</script></div></body></html>";
+        std::string body = h.str();
+        std::string header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Cache-Control: no-store, no-cache, must-revalidate\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        sendAll(client, header);
+        sendAll(client, body);
+    }
+
     void serveGamePage(SOCKET client) {
         std::ostringstream h;
         h << "<!DOCTYPE html><html lang=\"" << tf_i18n_code() << "\"><head><meta charset=\"UTF-8\">"
@@ -1140,6 +1394,7 @@ private:
           << "<h1>" << tf_text("WebGame") << "</h1>"
           << "<div class=\"nav-bar\">"
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
+          << "<a href=\"/setup\">" << tf_text("WebSetup") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
           << "<a href=\"/game\" class=\"active\">" << tf_text("WebGame") << "</a>"
@@ -1267,6 +1522,7 @@ private:
           << "<h1>" << tf_text("WebLiveDetections") << "</h1>"
           << "<div class=\"nav-bar\">"
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
+          << "<a href=\"/setup\">" << tf_text("WebSetup") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\" class=\"active\">" << tf_text("WebDetections") << "</a>"
           << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
@@ -1356,6 +1612,7 @@ private:
           << "<button type=\"submit\">" << tf_text("WebSearch") << "</button></form>"
           << "<div class=\"nav-bar\">"
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
+          << "<a href=\"/setup\">" << tf_text("WebSetup") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
           << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
@@ -1396,6 +1653,7 @@ private:
           << "<button type=\"submit\">" << tf_text("WebSearch") << "</button></form>"
           << "<div class=\"nav-bar\">"
           << "<a href=\"/\">" << tf_text("WebSearch") << "</a>"
+          << "<a href=\"/setup\">" << tf_text("WebSetup") << "</a>"
           << "<a href=\"/pool\">Pool</a>"
           << "<a href=\"/detections\">" << tf_text("WebDetections") << "</a>"
           << "<a href=\"/game\">" << tf_text("WebGame") << "</a>"
@@ -1651,7 +1909,45 @@ private:
         ".badge.out{color:#ff6b6b;border-color:#7a1f1f}"
         ".empty{text-align:center;color:#666;padding:40px;font-size:1.1rem}"
         ".error{text-align:center;color:#ff5722;padding:40px;font-size:1.1rem}"
-        ".footer{text-align:center;color:#444;font-size:.75rem;margin-top:40px}";
+        ".footer{text-align:center;color:#444;font-size:.75rem;margin-top:40px}"
+        ".setup-intro{padding:14px 16px;margin-bottom:16px;background:#0d1b3e;border-left:3px solid #c9a84c;border-radius:6px;line-height:1.5}"
+        ".setup-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px}"
+        ".setup-card{padding:16px;background:#0d1b3e;border:1px solid #1d2d55;border-radius:8px}"
+        ".setup-card h2{color:#c9a84c;font-size:1rem;margin-bottom:8px}"
+        ".setup-card p{color:#aaa;font-size:.86rem;line-height:1.45;margin-bottom:12px}"
+        ".setup-label{display:flex;align-items:center;gap:8px;font-size:.9rem;margin-bottom:12px}"
+        ".setup-label select{padding:6px 8px;border-radius:5px;border:1px solid #333;background:#16213e;color:#e0e0e0;font:inherit}"
+        ".setup-check{display:flex;align-items:center;gap:8px;font-size:.86rem;color:#bbb;margin-bottom:12px}"
+        ".setup-primary,.setup-secondary{padding:9px 15px;border:none;border-radius:6px;font:inherit;font-size:.9rem;font-weight:600;cursor:pointer}"
+        ".setup-primary{background:#c9a84c;color:#1a1a2e}"
+        ".setup-primary:disabled,.setup-secondary:disabled{opacity:.35;cursor:not-allowed}"
+        ".setup-secondary{background:#0f3460;color:#c9a84c;margin-top:10px}"
+        ".setup-primary:hover:not(:disabled){background:#dbb58c}"
+        ".setup-secondary:hover:not(:disabled){background:#1a4a80}"
+        ".setup-status{min-height:24px;font-size:.86rem;color:#9cc7ff;margin-bottom:10px}"
+        ".setup-zones{display:grid;gap:8px}"
+        ".setup-persp{margin:0 0 12px;padding:9px;background:#081126;border:1px solid #26375d;border-radius:7px}"
+        ".setup-persp-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px;color:#c9a84c;font-size:.84rem;font-weight:600}"
+        ".setup-persp canvas{display:block;width:100%;height:auto;border-radius:5px;background:#050b18;touch-action:none;cursor:crosshair}"
+        ".setup-persp-sliders{display:grid;gap:6px;margin-top:8px}"
+        ".setup-persp-sliders label{display:grid;grid-template-columns:auto 1fr 48px;align-items:center;gap:7px;font-size:.76rem;color:#bbb}"
+        ".setup-persp-sliders input{width:100%;accent-color:#c9a84c}"
+        ".setup-persp-sliders b{font-size:.72rem;color:#ddd;text-align:right;font-weight:500}"
+        ".setup-persp-guide{display:grid;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid #1f2b4a}"
+        ".setup-persp-guide label{display:grid;grid-template-columns:auto 1fr 48px;align-items:center;gap:7px;font-size:.76rem;color:#bbb}"
+        ".setup-persp-guide input,.setup-persp-guide select{width:100%;accent-color:#c9a84c;background:#0a1226;color:#ddd;border:1px solid #2a3a5e;border-radius:4px;padding:2px 4px;font-size:.76rem}"
+        ".setup-persp-guide b{font-size:.72rem;color:#ddd;text-align:right;font-weight:500}"
+        ".setup-small{padding:4px 8px;border:1px solid #26375d;border-radius:5px;background:#101f47;color:#c9a84c;font:inherit;font-size:.72rem;cursor:pointer}"
+        ".setup-small:hover{background:#1a4a80}"
+        ".setup-zone{padding:8px 10px;background:#16213e;border:1px solid #26375d;border-radius:6px}"
+        ".setup-zone-title{font-size:.84rem;color:#c9a84c;margin-bottom:5px;font-weight:600}"
+        ".setup-zone-body{display:flex;flex-direction:column;gap:3px;font-size:.76rem;color:#aaa}"
+        ".setup-camera{font-size:.85rem;color:#e0e0e0;padding:8px 0 2px}"
+        ".setup-actions{display:flex;justify-content:flex-end}"
+        ".setup-message{min-height:22px;font-size:.82rem;color:#7ee787;margin-bottom:8px}"
+        ".setup-hint{font-size:.75rem;color:#777;line-height:1.4;margin-top:10px}"
+        ".setup-back{display:inline-block;margin-top:14px;color:#c9a84c;font-size:.82rem;text-decoration:none}"
+        ".setup-back:hover{text-decoration:underline}";
 
     std::atomic<bool> running_;
     int port_;

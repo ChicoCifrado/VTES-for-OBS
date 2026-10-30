@@ -232,6 +232,10 @@ struct filter_data {
 	// --- Performance: minimum detection interval ---
 	std::atomic<int> detection_interval_ms{0}; // 0 = process every frame
 	uint64_t last_detection_time_ns = 0;
+	// Ultimo tamano de frame visto. Lo usa el modo inicializacion para
+	// calcular el encuadre sin tener que consultar la fuente desde la web.
+	std::atomic<int> last_frame_width{0};
+	std::atomic<int> last_frame_height{0};
 
 	// --- Cooldown: skip detection for N ns after successful identification ---
 	int64_t cooldown_until_time_ns = 0;
@@ -296,6 +300,11 @@ struct filter_data {
 		// manuales coincide con `angle`; en las automáticas se toma de la
 		// orientación real de las cuatro cartas de cripta.
 		float lock_angle = 0.0f;
+		// Zona con perspectiva (modo inicializacion). Si `quad` es true,
+		// `corners` contiene cuatro puntos normalizados en orden TL, TR, BR,
+		// BL. Las zonas rectangulares siguen usando nx/ny/nw/nh + angle.
+		bool quad = false;
+		cv::Point2f corners[4];
 	};
 
 	// Per-player persistent state
@@ -417,6 +426,29 @@ struct filter_data {
 	std::mutex             auto_zone_lock;
 	std::vector<AutoZoneView> auto_zone_views;
 	std::mutex             auto_zone_view_lock;
+
+	// Modo inicializacion: detecta las zonas una sola vez para que el
+	// operador las revise y las guarde como zonas manuales. No modifica
+	// players[] ni asigna cartas hasta que se pulsa "Aplicar y guardar".
+	std::atomic<bool>      setup_mode{false};
+	std::atomic<bool>      setup_ready{false};
+	std::atomic<bool>      setup_done{false};
+	std::atomic<int>       setup_expected{0};
+	std::atomic<int64_t>   setup_started_ns{0};
+
+	// Perspectiva global del conjunto de zonas. `source` es el rectangulo
+	// que envuelve las zonas detectadas y `base` el cuadrilatero que dibuja
+	// el operador. `size` y `angle` se aplican despues alrededor del centro
+	// de `base`; asi los sliders no acumulan errores al moverlos.
+	struct SetupPerspective {
+		bool active = false;
+		cv::Point2f source[4];
+		cv::Point2f base[4];
+		float size = 1.0f;
+		float angle = 0.0f;
+	};
+	SetupPerspective setup_perspective;
+	std::mutex setup_perspective_lock;
 
 	// Per-track state (track_id → TrackedCardState)
 	std::unordered_map<int, TrackedCardState> tracked_cards;
