@@ -34,6 +34,21 @@
 #define closesocket close
 #endif
 
+// Literal de cadena JavaScript seguro a partir de un texto traducido. Un
+// literal JSON es tambien un literal JS valido: las comillas, barras
+// invertidas y saltos de linea no rompen el bloque <script>. Se escapa
+// tambien "</" para que una traduccion no pueda cerrar el script.
+inline std::string webJsString(const std::string &text)
+{
+    std::string out = nlohmann::json(text).dump();
+    size_t pos = 0;
+    while ((pos = out.find("</", pos)) != std::string::npos) {
+        out.replace(pos, 2, "<\\/");
+        pos += 3;
+    }
+    return out;
+}
+
 struct DetectionEntry {
     std::string card_name;
     std::string card_id;
@@ -1258,19 +1273,19 @@ private:
           << "</section></div>"
           << "<div class=\"footer\">VTES Card Scanner — " << tf_text("WebSetupTitle") << "</div>"
           << "<script>"
-          << "const I18N={detecting:\"" << tf_text("WebSetupDetecting") << "\","
-          << "ready:\"" << tf_text("WebSetupReady") << "\","
-          << "saved:\"" << tf_text("WebSetupApplied") << "\","
-          << "idle:\"" << tf_text("WebSetupIdle") << "\","
-          << "notready:\"" << tf_text("WebSetupNotReady") << "\","
-          << "nozones:\"" << tf_text("WebSetupNoZones") << "\","
-          << "cards:\"" << tf_text("AutoZoneCards") << "\","
-          << "player:\"" << tf_text("Player") << "\","
-          << "crypt:\"" << tf_text("ZoneCrypt") << "\","
-          << "minion:\"" << tf_text("ZoneMinions") << "\","
-          << "cameraerror:\"" << tf_text("WebSetupCameraError") << "\","
-          << "saveerror:\"" << tf_text("WebSetupSaveError") << "\","
-          << "zoom:\"" << tf_text("WebSetupCameraValue") << "\"};"
+          << "const I18N={detecting:" << webJsString(tf_text("WebSetupDetecting")) << ","
+          << "ready:" << webJsString(tf_text("WebSetupReady")) << ","
+          << "saved:" << webJsString(tf_text("WebSetupApplied")) << ","
+          << "idle:" << webJsString(tf_text("WebSetupIdle")) << ","
+          << "notready:" << webJsString(tf_text("WebSetupNotReady")) << ","
+          << "nozones:" << webJsString(tf_text("WebSetupNoZones")) << ","
+          << "cards:" << webJsString(tf_text("AutoZoneCards")) << ","
+          << "player:" << webJsString(tf_text("Player")) << ","
+          << "crypt:" << webJsString(tf_text("ZoneCrypt")) << ","
+          << "minion:" << webJsString(tf_text("ZoneMinions")) << ","
+          << "cameraerror:" << webJsString(tf_text("WebSetupCameraError")) << ","
+          << "saveerror:" << webJsString(tf_text("WebSetupSaveError")) << ","
+          << "zoom:" << webJsString(tf_text("WebSetupCameraValue")) << "};"
           << "const $=id=>document.getElementById(id);"
           << "let lastStatus=null;let ffTouched=false;"
           << "let persp={active:false,source:[],base:[],target:[],size:1,angle:0};"
@@ -1410,25 +1425,25 @@ private:
           << "<h2 class=\"game-log-title\">" << tf_text("WebGameLog") << "</h2>"
           << "<div id=\"log\" class=\"game-log\"></div>"
           << "<script>"
-          << "const I18N={locked:\"" << tf_text("WebEvLocked") << "\","
-          << "unlocked:\"" << tf_text("WebEvUnlocked") << "\","
-          << "zoneminion:\"" << tf_text("WebEvZoneMinion") << "\","
-          << "zonecrypt:\"" << tf_text("WebEvZoneCrypt") << "\","
-          << "influence:\"" << tf_text("WebEvInfluence") << "\","
-          << "influencebadge:\"" << tf_text("WebInfluenceBadge") << "\","
-          << "pool:\"" << tf_text("WebEvPool") << "\","
-          << "ousted:\"" << tf_text("WebEvOusted") << "\","
-          << "revived:\"" << tf_text("WebEvRevived") << "\","
-          << "poolstat:\"" << tf_text("WebMethuselahPool") << "\","
-          << "cost:\"" << tf_text("WebCostLabel") << "\","
-          << "costpool:\"" << tf_text("WebCostPool") << "\","
-          << "costblood:\"" << tf_text("WebCostBlood") << "\","
-          << "costconv:\"" << tf_text("WebCostConviction") << "\","
-          << "blood:\"" << tf_text("WebBlood") << "\","
-          << "life:\"" << tf_text("WebLife") << "\","
-          << "conviction:\"" << tf_text("WebConviction") << "\","
-          << "costevent:\"" << tf_text("WebEvCost") << "\","
-          << "resourceevent:\"" << tf_text("WebEvResource") << "\"};"
+          << "const I18N={locked:" << webJsString(tf_text("WebEvLocked")) << ","
+          << "unlocked:" << webJsString(tf_text("WebEvUnlocked")) << ","
+          << "zoneminion:" << webJsString(tf_text("WebEvZoneMinion")) << ","
+          << "zonecrypt:" << webJsString(tf_text("WebEvZoneCrypt")) << ","
+          << "influence:" << webJsString(tf_text("WebEvInfluence")) << ","
+          << "influencebadge:" << webJsString(tf_text("WebInfluenceBadge")) << ","
+          << "pool:" << webJsString(tf_text("WebEvPool")) << ","
+          << "ousted:" << webJsString(tf_text("WebEvOusted")) << ","
+          << "revived:" << webJsString(tf_text("WebEvRevived")) << ","
+          << "poolstat:" << webJsString(tf_text("WebMethuselahPool")) << ","
+          << "cost:" << webJsString(tf_text("WebCostLabel")) << ","
+          << "costpool:" << webJsString(tf_text("WebCostPool")) << ","
+          << "costblood:" << webJsString(tf_text("WebCostBlood")) << ","
+          << "costconv:" << webJsString(tf_text("WebCostConviction")) << ","
+          << "blood:" << webJsString(tf_text("WebBlood")) << ","
+          << "life:" << webJsString(tf_text("WebLife")) << ","
+          << "conviction:" << webJsString(tf_text("WebConviction")) << ","
+          << "costevent:" << webJsString(tf_text("WebEvCost")) << ","
+          << "resourceevent:" << webJsString(tf_text("WebEvResource")) << "};"
           << "function evFmt(t,c,f,to,cap){return t.split('{card}').join(c||'?').split('{from}').join(f).split('{to}').join(to).split('{cap}').join(cap==null?'?':cap);}"
           << "async function adjustResource(p,t,r,d){try{await fetch('/api/game/resource?player='+p+'&track='+t+'&resource='+r+'&delta='+d);loadGame();}catch(e){}}"
           << "function resBadge(p,t,r,label,val){return '<span class=\"badge '+r+'\">'+label+' '+val+"

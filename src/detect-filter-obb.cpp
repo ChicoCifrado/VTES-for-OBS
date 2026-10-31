@@ -14,6 +14,7 @@
 #include <opencv2/geometry.hpp>
 #include <opencv2/dnn.hpp>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cctype>
 
@@ -1264,7 +1265,6 @@ void detect_filter_obb_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "always_active", true);
 	obs_data_set_default_double(settings, "threshold", 0.5);
 	obs_data_set_default_string(settings, "detection_mode", DETECT_MODE_ONNX);
-	obs_data_set_default_bool(settings, "temporal_smoothing", true);
 
 	// Contour detection defaults
 	obs_data_set_default_int(settings, "contour_edge_low", 50);
@@ -3093,6 +3093,12 @@ static PlayerZoneHit resolvePlayerZone(const struct detect_filter_obb *tf,
 				       const cv::Point2f &c, int fw, int fh)
 {
 	PlayerZoneHit hit;
+	// Durante la inicializacion las zonas del filtro son las de la partida
+	// anterior (o las que haya guardadas). No deben asignar cartas ni
+	// disparar influencia: el asistente solo propone zonas y espera a que
+	// el operador pulse "Aplicar y guardar".
+	if (tf->setup_mode.load())
+		return hit;
 	float best_dist = std::numeric_limits<float>::max();
 
 	// Las zonas automáticas de cinco jugadores convergen en el centro de la
@@ -3929,6 +3935,38 @@ static void setupPerspectiveReset(detect_filter_obb *tf)
 	}
 }
 
+// Un cuadrilatero de perspectiva debe tener coordenadas finitas, area
+// suficiente y los cuatro giros en el mismo sentido. Si se cruzan dos
+// esquinas, getPerspectiveTransform produce una homografia valida pero el
+// conjunto de zonas se deforma de forma impredecible.
+static bool setupPerspectiveValidQuad(const cv::Point2f q[4])
+{
+	double area = 0.0;
+	int turn = 0;
+	for (int i = 0; i < 4; i++) {
+		const cv::Point2f &a = q[i];
+		const cv::Point2f &b = q[(i + 1) % 4];
+		const cv::Point2f &c = q[(i + 2) % 4];
+		if (!std::isfinite(a.x) || !std::isfinite(a.y))
+			return false;
+
+		area += (double)a.x * b.y - (double)b.x * a.y;
+		const double cross =
+			(double)(b.x - a.x) * (c.y - b.y) -
+			(double)(b.y - a.y) * (c.x - b.x);
+		if (!std::isfinite(cross))
+			return false;
+		const int side = cross > 0.0 ? 1 : (cross < 0.0 ? -1 : 0);
+		if (side == 0)
+			return false;
+		if (turn == 0)
+			turn = side;
+		else if (side != turn)
+			return false;
+	}
+	return std::isfinite(area) && std::fabs(area) * 0.5 >= 1e-4;
+}
+
 static void setupPerspectiveTargetLocked(
 	const filter_data::SetupPerspective &p, cv::Point2f out[4])
 {
@@ -3963,6 +4001,9 @@ static cv::Mat setupPerspectiveHomography(detect_filter_obb *tf)
 {
 	cv::Point2f source[4], target[4];
 	if (!setupPerspectiveGet(tf, source, target))
+		return {};
+	if (!setupPerspectiveValidQuad(source) ||
+	    !setupPerspectiveValidQuad(target))
 		return {};
 	std::vector<cv::Point2f> src(source, source + 4);
 	std::vector<cv::Point2f> dst(target, target + 4);
@@ -4681,6 +4722,8 @@ static bool loadZoneQuadString(const std::string &str,
 	cv::Point2f q[4];
 	for (int i = 0; i < 4; i++)
 		q[i] = cv::Point2f(v[i * 2], v[i * 2 + 1]);
+	if (!setupPerspectiveValidQuad(q))
+		return false;
 	filter_data::PlayerZone n = playerZoneFromQuad(q, z.lock_angle);
 	n.angle = z.angle;
 	// Si el operador ha cambiado a mano la caja (x/y/w/h) desde las
@@ -4719,6 +4762,9 @@ static bool saveSetupSettings(detect_filter_obb *tf)
 	obs_data_set_int(settings, "player_count", player_count);
 	obs_data_set_bool(settings, "auto_zones", false);
 	obs_data_set_bool(settings, "setup_done", true);
+	// Las guias y zonas solo se muestran durante la configuracion. Al
+	// guardar se ocultan aunque el toggle de depuracion siguiera activo.
+	obs_data_set_bool(settings, "show_zones", false);
 	obs_data_set_double(settings, "cam_zoom", cam_zoom);
 	obs_data_set_int(settings, "cam_offset_x", cam_off_x);
 	obs_data_set_int(settings, "cam_offset_y", cam_off_y);
@@ -4793,7 +4839,11 @@ static nlohmann::json setupActionJson(detect_filter_obb *tf,
 				tf->setup_perspective.angle = 0.0f;
 			} else {
 				const std::string corners = value("corners");
-				if (!corners.empty()) {
+				cv::Point2f next_base[4];
+				for (int i = 0; i < 4; i++)
+					next_base[i] = tf->setup_perspective.base[i];
+				const bool has_corners = !corners.empty();
+				if (has_corners) {
 					std::vector<float> nums;
 					size_t pos = 0;
 					while (pos <= corners.size() &&
@@ -4814,34 +4864,53 @@ static nlohmann::json setupActionJson(detect_filter_obb *tf,
 							break;
 						pos = sep + 1;
 					}
-					if (nums.size() == 8) {
-						for (int i = 0; i < 4; i++) {
-							tf->setup_perspective.base[i].x =
-								std::clamp(nums[i * 2],
-									   0.0f, 1.0f);
-							tf->setup_perspective.base[i].y =
-								std::clamp(nums[i * 2 + 1],
-									   0.0f, 1.0f);
+					if (nums.size() != 8) {
+						out["ok"] = false;
+						out["error"] = "invalid_corners";
+						return out;
+					}
+					for (int i = 0; i < 4; i++) {
+						if (!std::isfinite(nums[i * 2]) ||
+						    !std::isfinite(nums[i * 2 + 1])) {
+							out["ok"] = false;
+							out["error"] = "invalid_corners";
+							return out;
 						}
+						next_base[i].x = std::clamp(
+							nums[i * 2], 0.0f, 1.0f);
+						next_base[i].y = std::clamp(
+							nums[i * 2 + 1], 0.0f, 1.0f);
+					}
+					if (!setupPerspectiveValidQuad(next_base)) {
+						out["ok"] = false;
+						out["error"] = "invalid_corners";
+						return out;
 					}
 				}
 				const std::string sz = value("size");
 				if (!sz.empty()) {
 					try {
-						tf->setup_perspective.size =
-							std::clamp(std::stof(sz),
-								   0.5f, 1.5f);
+						const float v = std::stof(sz);
+						if (std::isfinite(v))
+							tf->setup_perspective.size =
+								std::clamp(v, 0.5f, 1.5f);
 					} catch (...) {
 					}
 				}
 				const std::string ang = value("angle");
 				if (!ang.empty()) {
 					try {
-						tf->setup_perspective.angle =
-							std::clamp(std::stof(ang),
-								   -45.0f, 45.0f);
+						const float v = std::stof(ang);
+						if (std::isfinite(v))
+							tf->setup_perspective.angle =
+								std::clamp(v, -45.0f, 45.0f);
 					} catch (...) {
 					}
+				}
+				if (has_corners) {
+					for (int i = 0; i < 4; i++)
+						tf->setup_perspective.base[i] =
+							next_base[i];
 				}
 			}
 		}

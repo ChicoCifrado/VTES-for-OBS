@@ -33,6 +33,20 @@ data/vtes.json
 data/card-hash-index.json
 vtes.json
 
+# Artefactos locales de pruebas y modelos generados (no se distribuyen)
+/Anotación*.png
+/best*.png
+/scroll2*.png
+/vtes.engine
+/ort_deps.txt
+
+# Assets y datos de entrenamiento OCR locales
+data/fonts/
+data/ocr_training/
+scripts/fine_tune_tesseract.ps1
+scripts/generate_lstmf.py
+scripts/generate_ocr_training_data.py
+
 # Old scripts (replaced by vtes-grimoire.ps1)
 build-windows.ps1
 build.ps1
